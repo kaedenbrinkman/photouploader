@@ -3,6 +3,7 @@ package com.photopipeline.app.mtp
 import android.mtp.MtpConstants
 import android.mtp.MtpDevice
 import android.mtp.MtpObjectInfo as AndroidMtpObjectInfo
+import com.photopipeline.app.core.PipelineLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -35,13 +36,14 @@ class CanonMtpRepository(
     }
 
     override suspend fun listCr3Objects(): List<MtpObjectInfo> = withContext(Dispatchers.IO) {
+        PipelineLog.d("mtp", "listCr3Objects() begin")
         val mtp = usb.openMtpDevice() ?: run {
-            UsbDebugLog.log("listCr3Objects: could not open MTP")
+            PipelineLog.w("mtp", "listCr3Objects: could not open MTP")
             return@withContext emptyList()
         }
         try {
             val list = enumerateMedia(mtp)
-            UsbDebugLog.log("listCr3Objects: found ${list.size} media files")
+            PipelineLog.d("mtp", "listCr3Objects: found ${list.size} media files")
             list
         } finally {
             mtp.close()

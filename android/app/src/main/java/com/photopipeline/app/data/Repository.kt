@@ -6,8 +6,10 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.workDataOf
 import com.photopipeline.app.api.ApiClient
-import com.photopipeline.app.api.EstimateResponse
+import com.photopipeline.app.api.NotSignedInException
+import com.photopipeline.app.core.PipelineLog
 import com.photopipeline.app.core.fileIdentityKey
+import com.photopipeline.app.pricing.LocalPricingEstimator
 import com.photopipeline.app.mtp.MtpConnectionState
 import com.photopipeline.app.mtp.MtpRepository
 import com.photopipeline.app.mtp.MtpObjectInfo
@@ -28,6 +30,7 @@ class Repository(
     context: Context,
     mtpOverride: MtpRepository? = null,
     private val usb: UsbCameraManager? = null,
+    private val localPricing: LocalPricingEstimator,
 ) {
     private val appContext = context.applicationContext
     val mtp: MtpRepository = mtpOverride ?: error("MtpRepository required")
@@ -91,6 +94,23 @@ class Repository(
             .apply()
     }
 
+    fun isBackendConfigured(): Boolean {
+        val base = apiBaseUrl()
+        return base.startsWith("http") && !base.contains("example.execute-api")
+    }
+
+    fun canUseBackendApi(): Boolean = isBackendConfigured() && isGoogleAccountLinked()
+
+    fun backendGateMessage(): String = when {
+        !isBackendConfigured() -> "Backend not configured — set your API base URL in Settings."
+        !isGoogleAccountLinked() -> "Link Google account in Settings before upload or submit."
+        else -> ""
+    }
+
+    private fun requireBackendReady() {
+        if (!canUseBackendApi()) throw NotSignedInException()
+    }
+
     private suspend fun ensureUsbReady(): CameraImportResult.Error? {
         val manager = usb ?: return null
         manager.refreshProbe(log = true)
@@ -140,6 +160,7 @@ class Repository(
     }
 
     suspend fun listCameraMedia(): CameraImportResult {
+        PipelineLog.d("import", "listCameraMedia() begin")
         ensureUsbReady()?.let { return it }
         val objects = runCatching { mtp.listCr3Objects() }
             .getOrElse { e ->
@@ -242,25 +263,50 @@ class Repository(
         )
     }
 
-    suspend fun fetchAndStoreEstimate(shootId: String): EstimateResponse {
+    suspend fun fetchAndStoreEstimate(shootId: String): StoredEstimate {
         val files = db.fileDao().observeForShoot(shootId).first()
+        val imageCount = files.size.coerceAtLeast(1)
         val totalBytes = files.sumOf { it.sizeBytes }.coerceAtLeast(1)
-        val estimate = api.fetchEstimate(files.size.coerceAtLeast(1), totalBytes)
-        val shoot = getShoot(shootId) ?: return estimate
-        db.shootDao().upsert(
-            shoot.copy(
-                estimateJson = JSONObject(
-                    mapOf(
-                        "processingMinutes" to estimate.estimate.processingMinutes,
-                        "totalShootUsd" to estimate.estimate.totalShootUsd,
-                        "computeUsd" to estimate.estimate.computeUsd,
-                        "s3StandardMonthUsd" to estimate.estimate.s3StandardMonthUsd,
-                    ),
-                ).toString(),
-                phase = "ESTIMATE",
-            ),
-        )
-        return estimate
+        val stored = if (canUseBackendApi()) {
+            val remote = runCatching { api.fetchEstimate(imageCount, totalBytes) }
+            if (remote.isSuccess) {
+                StoredEstimate(remote.getOrThrow(), EstimateSource.BACKEND)
+            } else {
+                val err = remote.exceptionOrNull()
+                PipelineLog.w(
+                    "estimate",
+                    "Backend estimate failed (${err?.message}); using local pricing.json",
+                    err,
+                )
+                StoredEstimate(localPricing.estimateShoot(imageCount, totalBytes), EstimateSource.LOCAL)
+            }
+        } else {
+            PipelineLog.d(
+                "estimate",
+                "Using local pricing (signedIn=${isGoogleAccountLinked()} configured=${isBackendConfigured()})",
+            )
+            StoredEstimate(localPricing.estimateShoot(imageCount, totalBytes), EstimateSource.LOCAL)
+        }
+        val shoot = getShoot(shootId)
+        if (shoot != null) {
+            val notes = stored.response.notes.joinToString(" ")
+            db.shootDao().upsert(
+                shoot.copy(
+                    estimateJson = JSONObject(
+                        mapOf(
+                            "processingMinutes" to stored.response.estimate.processingMinutes,
+                            "totalShootUsd" to stored.response.estimate.totalShootUsd,
+                            "computeUsd" to stored.response.estimate.computeUsd,
+                            "s3StandardMonthUsd" to stored.response.estimate.s3StandardMonthUsd,
+                            "source" to stored.source.name,
+                            "notes" to notes,
+                        ),
+                    ).toString(),
+                    phase = "ESTIMATE",
+                ),
+            )
+        }
+        return stored
     }
 
     suspend fun uploadManifestIfReady(shootId: String) {
@@ -294,11 +340,13 @@ class Repository(
     }
 
     suspend fun submitShoot(shootId: String) {
+        requireBackendReady()
         uploadManifestIfReady(shootId)
         api.finalizeShoot(shootId)
     }
 
     suspend fun refreshBackendStatus(shootId: String) {
+        if (!canUseBackendApi()) return
         val status = api.fetchStatus(shootId)
         val shoot = getShoot(shootId) ?: return
         status.progress?.let { p ->

@@ -24,8 +24,9 @@ class ApiClient(
         val body = JSONObject().put("imageCount", imageCount).put("totalBytesRaw", totalBytesRaw).toString()
         val req = authorizedRequest("/shoots/estimate").post(body.toRequestBody(JSON)).build()
         return client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) error("estimate failed: ${resp.code}")
-            estimateAdapter.fromJson(resp.body!!.string())!!
+            if (!resp.isSuccessful) throw ApiRequestException("estimate failed: ${resp.code}", resp.code)
+            estimateAdapter.fromJson(resp.body!!.string())
+                ?: throw ApiRequestException("estimate parse failed")
         }
     }
 
@@ -144,7 +145,7 @@ class ApiClient(
     fun photosOAuthStartUrl(userId: String): String = "$baseUrl/oauth/photos/start?userId=$userId"
 
     private suspend fun authorizedRequest(path: String): Request.Builder {
-        val token = idTokenProvider() ?: error("not signed in")
+        val token = idTokenProvider() ?: throw NotSignedInException()
         return Request.Builder()
             .url("$baseUrl$path")
             .header("Authorization", "Bearer $token")

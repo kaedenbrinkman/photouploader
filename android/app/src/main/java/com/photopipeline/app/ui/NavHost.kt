@@ -293,6 +293,9 @@ fun ShootFlowScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            if (!ui.backendReady && ui.backendGateMessage.isNotBlank()) {
+                item { BackendGateCard(ui.backendGateMessage) }
+            }
             when (ui.step) {
                 ShootFlowStep.Connect -> item {
                     ConnectStep(
@@ -590,16 +593,36 @@ fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
 }
 
 @Composable
+fun BackendGateCard(message: String) {
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+    ) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("Cloud upload not ready", style = MaterialTheme.typography.titleSmall)
+            Text(message, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
+
+@Composable
 fun EstimateCard(json: String) {
     val o = remember(json) { JSONObject(json) }
+    val source = o.optString("source", "LOCAL")
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text("Estimated before you confirm", style = MaterialTheme.typography.titleSmall)
+            Text(
+                if (source == "BACKEND") "Estimated before you confirm (API)" else "On-device estimate (pricing.json)",
+                style = MaterialTheme.typography.titleSmall,
+            )
             Text("Processing ~${o.optDouble("processingMinutes")} min")
             Text(
                 "This shoot ~$${o.optDouble("totalShootUsd")} " +
                     "(compute $${o.optDouble("computeUsd")} + S3 ~$${o.optDouble("s3StandardMonthUsd")}/mo)",
             )
+            o.optString("notes").takeIf { it.isNotBlank() }?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
     }
 }
