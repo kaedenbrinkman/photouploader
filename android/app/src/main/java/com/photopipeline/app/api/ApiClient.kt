@@ -9,6 +9,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -43,6 +44,21 @@ class ApiClient(
         }
     }
 
+    suspend fun ensureServerShoot(shootId: String, albumTitle: String): Unit = onIo {
+        val body = JSONObject()
+            .put("action", "create_shoot")
+            .put("shootId", shootId)
+            .put("albumTitle", albumTitle)
+            .toString()
+        val req = authorizedRequest("/shoots").post(body.toRequestBody(JSON)).build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) {
+                failHttp("create_shoot", resp)
+            }
+            PipelineLog.i("api", "ensureServerShoot $shootId HTTP ${resp.code}")
+        }
+    }
+
     suspend fun createMultipart(
         shootId: String,
         sha256: String,
@@ -57,7 +73,7 @@ class ApiClient(
             .toString()
         val req = authorizedRequest("/shoots/$shootId/presign").post(body.toRequestBody(JSON)).build()
         client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) error("multipart failed")
+            if (!resp.isSuccessful) failHttp("create_multipart", resp)
             val json = JSONObject(resp.body!!.string())
             json.getString("uploadId") to json.getString("key")
         }
@@ -83,7 +99,7 @@ class ApiClient(
             .toString()
         val req = authorizedRequest("/shoots/$shootId/presign").post(body.toRequestBody(JSON)).build()
         client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) error("presign part failed")
+            if (!resp.isSuccessful) failHttp("presign_part", resp)
             val json = JSONObject(resp.body!!.string())
             PresignedPartUrl(
                 url = json.getString("url"),
@@ -106,7 +122,7 @@ class ApiClient(
             .toString()
         val req = authorizedRequest("/shoots/$shootId/presign").post(body.toRequestBody(JSON)).build()
         client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) error("list parts failed")
+            if (!resp.isSuccessful) failHttp("list_parts", resp)
             val arr = JSONObject(resp.body!!.string()).getJSONArray("parts")
             buildList {
                 for (i in 0 until arr.length()) {
@@ -140,7 +156,7 @@ class ApiClient(
             .toString()
         val req = authorizedRequest("/shoots/$shootId/presign").post(body.toRequestBody(JSON)).build()
         client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) error("complete multipart failed: ${resp.code}")
+            if (!resp.isSuccessful) failHttp("complete_multipart", resp)
         }
     }
 
@@ -151,7 +167,7 @@ class ApiClient(
             .toString()
         val presignReq = authorizedRequest("/shoots/$shootId/presign").post(presignBody.toRequestBody(JSON)).build()
         val url = client.newCall(presignReq).execute().use { resp ->
-            if (!resp.isSuccessful) error("presign manifest failed")
+            if (!resp.isSuccessful) failHttp("presign_manifest", resp)
             JSONObject(resp.body!!.string()).getString("url")
         }
         val put = Request.Builder()
@@ -159,21 +175,21 @@ class ApiClient(
             .put(manifestJson.toRequestBody(MANIFEST_JSON))
             .build()
         client.newCall(put).execute().use { resp ->
-            if (!resp.isSuccessful) error("manifest PUT failed: ${resp.code}")
+            if (!resp.isSuccessful) failHttp("manifest PUT", resp)
         }
     }
 
     suspend fun finalizeShoot(shootId: String) = onIo {
         val req = authorizedRequest("/shoots/$shootId/finalize").post("{}".toRequestBody(JSON)).build()
         client.newCall(req).execute().use { resp ->
-            if (resp.code !in 200..202) error("finalize failed: ${resp.code}")
+            if (resp.code !in 200..202) failHttp("finalize", resp)
         }
     }
 
     suspend fun fetchStatus(shootId: String): ShootStatusResponse = onIo {
         val req = authorizedRequest("/shoots/$shootId/status").get().build()
         client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) error("status failed")
+            if (!resp.isSuccessful) failHttp("status", resp)
             statusAdapter.fromJson(resp.body!!.string())!!
         }
     }
@@ -215,6 +231,13 @@ class ApiClient(
     private fun JSONObject.putTransferAcceleration(enabled: Boolean): JSONObject {
         if (enabled) put("transferAcceleration", true)
         return this
+    }
+
+    private fun failHttp(route: String, resp: Response): Nothing {
+        val snippet = resp.body?.string()?.take(240)?.replace('\n', ' ') ?: ""
+        val msg = "$route HTTP ${resp.code}${if (snippet.isNotBlank()) ": $snippet" else ""}"
+        PipelineLog.w("api", msg)
+        throw ApiRequestException(msg, resp.code)
     }
 
     companion object {

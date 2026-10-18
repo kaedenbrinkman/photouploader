@@ -38,4 +38,7 @@ interface FileDao {
 
     @Query("SELECT * FROM files WHERE identityKey = :key LIMIT 1")
     suspend fun getFile(key: String): FileEntity?
+
+    @Query("DELETE FROM files WHERE identityKey = :key")
+    suspend fun delete(key: String)
 }

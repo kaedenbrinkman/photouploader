@@ -7,11 +7,14 @@ import androidx.work.CoroutineWorker
 import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 import com.photopipeline.app.PhotoPipelineApp
+import com.photopipeline.app.api.ApiRequestException
 import com.photopipeline.app.core.PipelineLog
 import com.photopipeline.app.data.FileEntity
+import com.photopipeline.app.data.PrepareCameraResult
 import com.photopipeline.app.mtp.UsbAccessState
 import kotlinx.coroutines.delay
 import java.io.File
+import java.io.IOException
 import java.io.RandomAccessFile
 import kotlin.math.min
 import okhttp3.MediaType.Companion.toMediaType
@@ -32,7 +35,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         get() = inputData.getBoolean(KEY_USES_CAMERA_STREAM, true)
 
     override suspend fun doWork(): Result {
-        val shootId = inputData.getString("shootId") ?: return Result.failure()
+        val shootId = inputData.getString("shootId") ?: return failWorker("missing shootId in work input")
         val files = repo.getPendingFiles(shootId)
         if (files.isEmpty()) return Result.success()
         val usesCameraStream = files.any { it.isCameraStreamUpload() }
@@ -42,35 +45,37 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 filesTotal = files.size,
                 network = network.snapshot(),
                 transferAccelerationActive = prefs.transferAcceleration,
+                lastError = null,
+                pausedReason = null,
             )
         }
+        promoteToForeground(usesCameraStream)
+
+        when (val prep = repo.prepareCameraForUpload(shootId)) {
+            is PrepareCameraResult.Error -> return failWorker(prep.message, usesCameraStream)
+            PrepareCameraResult.Ready -> Unit
+        }
+
         if (!network.canUpload(prefs.wifiOnly, prefs.allowCellular)) {
-            UploadMetricsStore.update {
-                it.copy(
-                    pausedReason = pausedMessage(network.snapshot()),
-                    network = network.snapshot(),
-                )
-            }
-            promoteToForeground(usesCameraStream)
-            return Result.retry()
+            val reason = pausedMessage(network.snapshot())
+            return retryWorker(reason, usesCameraStream, retryable = !usesCameraStream)
         }
         if (network.snapshot().captivePortal) {
-            UploadMetricsStore.update {
-                it.copy(pausedReason = "Captive portal — sign in to hotel Wi-Fi", network = network.snapshot())
-            }
-            promoteToForeground(usesCameraStream)
-            return Result.retry()
+            return retryWorker(
+                "Captive portal — sign in to hotel Wi-Fi",
+                usesCameraStream,
+                retryable = !usesCameraStream,
+            )
         }
-        promoteToForeground(usesCameraStream)
+
         var filesDone = repo.countUploadedFiles(shootId)
         for (file in files) {
             if (file.isCameraStreamUpload()) {
+                usb.refreshProbe(log = false)
                 if (usb.accessState.value != UsbAccessState.READY) {
-                    repo.markFilePaused(file.identityKey, "Reconnect camera to continue upload")
-                    UploadMetricsStore.update {
-                        it.copy(pausedReason = "Reconnect camera to continue upload", network = network.snapshot())
-                    }
-                    return Result.retry()
+                    val reason = "Camera not open for MTP (USB state=${usb.accessState.value})"
+                    repo.markFileFailed(file.identityKey, reason)
+                    return failWorker(reason, usesCameraStream)
                 }
             }
             try {
@@ -82,21 +87,25 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 repo.markFileUploaded(file.identityKey)
                 filesDone++
             } catch (e: StreamingCameraUploader.PresignExpiredException) {
-                repo.incrementRetry(file.identityKey, e.message ?: "presign expired")
-                return Result.retry()
+                val reason = e.message ?: "presign expired"
+                repo.incrementRetry(file.identityKey, reason)
+                return retryWorker(reason, usesCameraStream, retryable = true)
             } catch (e: Exception) {
-                repo.markFileFailed(file.identityKey, e.message ?: "upload failed")
+                val reason = uploadFailureMessage(e)
+                PipelineLog.e("upload", "File ${file.originalName} failed: $reason", e)
+                repo.markFileFailed(file.identityKey, reason)
                 UploadMetricsStore.update {
                     it.copy(
                         retries = it.retries + 1,
-                        lastError = e.message,
+                        lastError = reason,
                         network = network.snapshot(),
                     )
                 }
-                if (runAttemptCount < 8) {
-                    delay(RetryPolicy.backoffMs(runAttemptCount))
-                    return Result.retry()
+                if (usesCameraStream || runAttemptCount >= 8) {
+                    return failWorker(reason, usesCameraStream)
                 }
+                delay(RetryPolicy.backoffMs(runAttemptCount))
+                return retryWorker(reason, usesCameraStream, retryable = true)
             }
             UploadMetricsStore.update { it.copy(filesDone = filesDone, network = network.snapshot()) }
         }
@@ -104,6 +113,42 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         repo.uploadManifestIfReady(shootId)
         UploadMetricsStore.clear()
         return Result.success()
+    }
+
+    private suspend fun retryWorker(reason: String, usesCameraStream: Boolean, retryable: Boolean): Result {
+        PipelineLog.w("upload", "RETRY attempt=$runAttemptCount reason=$reason")
+        UploadMetricsStore.update {
+            it.copy(
+                pausedReason = reason,
+                lastError = reason,
+                network = network.snapshot(),
+            )
+        }
+        promoteToForeground(usesCameraStream)
+        return if (retryable && runAttemptCount < 8) {
+            Result.retry()
+        } else {
+            failWorker(reason, usesCameraStream)
+        }
+    }
+
+    private suspend fun failWorker(reason: String, usesCameraStream: Boolean = enqueueUsesCamera): Result {
+        PipelineLog.e("upload", "FAIL reason=$reason")
+        UploadMetricsStore.update {
+            it.copy(
+                pausedReason = reason,
+                lastError = reason,
+                network = network.snapshot(),
+            )
+        }
+        promoteToForeground(usesCameraStream)
+        return Result.failure()
+    }
+
+    private fun uploadFailureMessage(e: Exception): String = when (e) {
+        is ApiRequestException -> e.message ?: "API error"
+        is IOException -> e.message ?: "network I/O error"
+        else -> e.message ?: e.javaClass.simpleName
     }
 
     private suspend fun uploadStreaming(shootId: String, file: FileEntity) {
@@ -175,7 +220,12 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 client.newCall(
                     Request.Builder().url(presigned.url).put(buf.toRequestBody(OCTET)).build(),
                 ).execute().use { resp ->
-                    if (!resp.isSuccessful) error("part upload failed")
+                    if (!resp.isSuccessful) {
+                        throw ApiRequestException(
+                            "S3 part PUT HTTP ${resp.code}",
+                            resp.code,
+                        )
+                    }
                     val eTag = resp.header("ETag")?.trim()?.trim('"') ?: error("missing ETag")
                     parts = UploadParts.merge(parts, UploadPart(plan.partNumber, eTag))
                 }

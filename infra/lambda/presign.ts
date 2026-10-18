@@ -1,5 +1,5 @@
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { ConditionalCheckFailedException, DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import {
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
@@ -35,23 +35,36 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
   const accelerated = wantsTransferAcceleration(body);
 
   if (action === 'create_shoot') {
-    await ddb.send(
-      new PutCommand({
-        TableName: process.env.TABLE_NAME,
-        Item: {
-          pk: `SHOOT#${shootId}`,
-          sk: 'META',
-          shootId,
-          userId,
-          state: 'UPLOADING',
-          phase: 'UPLOAD',
-          albumTitle: body.albumTitle ?? shootId,
-          settingsHash: body.settingsHash ?? 'develop.auto-longEdge0-q90',
-          createdAt: Date.now(),
-        },
-        ConditionExpression: 'attribute_not_exists(pk)',
-      }),
-    );
+    try {
+      await ddb.send(
+        new PutCommand({
+          TableName: process.env.TABLE_NAME,
+          Item: {
+            pk: `SHOOT#${shootId}`,
+            sk: 'META',
+            shootId,
+            userId,
+            state: 'UPLOADING',
+            phase: 'UPLOAD',
+            albumTitle: body.albumTitle ?? shootId,
+            settingsHash: body.settingsHash ?? 'develop.auto-longEdge0-q90',
+            createdAt: Date.now(),
+          },
+          ConditionExpression: 'attribute_not_exists(pk)',
+        }),
+      );
+    } catch (e) {
+      if (!(e instanceof ConditionalCheckFailedException)) throw e;
+      const existing = await ddb.send(
+        new GetCommand({
+          TableName: process.env.TABLE_NAME,
+          Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
+        }),
+      );
+      if (!existing.Item || existing.Item.userId !== userId) {
+        return json(409, { error: 'shoot_exists', shootId });
+      }
+    }
     return json(200, { shootId, state: 'UPLOADING' });
   }
 

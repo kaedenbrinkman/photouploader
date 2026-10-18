@@ -329,7 +329,9 @@ fun ShootFlowScreen(
     val snackbarHost = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
-    LaunchedEffect(shootId) { vm.startPolling() }
+    LaunchedEffect(ui.step) {
+        if (ui.step == ShootFlowStep.Upload) vm.ensureCameraForUpload()
+    }
     LaunchedEffect(ui.snackbar) {
         ui.snackbar?.let { msg ->
             snackbarHost.showSnackbar(msg)
@@ -410,6 +412,7 @@ fun ShootFlowScreen(
                         UploadStep(
                             files = files,
                             metrics = uploadMetrics,
+                            estimateJson = shoot?.estimateJson,
                             onUpload = { vm.startUpload() },
                             onRetry = { vm.retryFailedUploads() },
                         )
@@ -576,6 +579,7 @@ private fun EstimateStep(
 private fun UploadStep(
     files: List<com.photopipeline.app.data.FileEntity>,
     metrics: LiveUploadMetrics,
+    estimateJson: String?,
     onUpload: () -> Unit,
     onRetry: () -> Unit,
 ) {
@@ -584,6 +588,7 @@ private fun UploadStep(
         if (files.isEmpty()) {
             Text("Queue files from the camera before uploading.", color = MaterialTheme.colorScheme.error)
         } else {
+            estimateJson?.let { EstimateCard(it) }
             TransferMetricsCard(metrics) {
                 context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
             }
@@ -828,23 +833,31 @@ fun BackendGateCard(message: String) {
 fun EstimateCard(json: String) {
     val o = remember(json) { JSONObject(json) }
     val source = o.optString("source", "LOCAL")
+    val imageCount = o.optInt("imageCount", 0).coerceAtLeast(1)
+    val perFile = o.optDouble("perFileUsd", o.optDouble("totalShootUsd") / imageCount)
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(
-                if (source == "BACKEND") "Estimated before you confirm (API)" else "On-device estimate (pricing.json)",
+                if (source == "BACKEND") "Cost estimate (API)" else "Cost estimate (on-device pricing.json)",
                 style = MaterialTheme.typography.titleSmall,
             )
-            Text("Processing ~${o.optDouble("processingMinutes")} min")
+            Text("~$%.4f per file × $imageCount files".format(perFile), style = MaterialTheme.typography.bodyMedium)
+            Text("Processing (compute): ~${o.optDouble("processingMinutes")} min · $${o.optDouble("computeUsd")}")
+            Text("S3 storage (standard / month): $${o.optDouble("s3StandardMonthUsd")}")
+            if (o.has("s3DeepArchiveMonthUsd")) {
+                Text(
+                    "S3 deep archive (reference / month): $${o.optDouble("s3DeepArchiveMonthUsd")}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Text("API & request overhead: $${o.optDouble("requestsUsd")}")
             val accelUsd = o.optDouble("transferAccelerationUsd", 0.0)
+            if (accelUsd > 0) {
+                Text("S3 Transfer Acceleration surcharge: $${accelUsd}")
+            }
             Text(
-                buildString {
-                    append(
-                        "This shoot ~$${o.optDouble("totalShootUsd")} " +
-                            "(compute $${o.optDouble("computeUsd")} + S3 ~$${o.optDouble("s3StandardMonthUsd")}/mo",
-                    )
-                    if (accelUsd > 0) append(" + accel ~$$accelUsd")
-                    append(")")
-                },
+                "Estimated shoot total: $${o.optDouble("totalShootUsd")}",
+                style = MaterialTheme.typography.titleSmall,
             )
             o.optString("notes").takeIf { it.isNotBlank() }?.let {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

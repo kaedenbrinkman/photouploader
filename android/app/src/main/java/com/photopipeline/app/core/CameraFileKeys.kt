@@ -24,3 +24,10 @@ fun cameraFileIdentityKey(
     return MessageDigest.getInstance("SHA-256").digest(raw.toByteArray())
         .joinToString("") { "%02x".format(it) }.take(32)
 }
+
+/** Match camera files across USB sessions when MTP object handles change. */
+fun cameraFileMatchKey(originalName: String, sizeBytes: Long, captureTimeEpochMs: Long): String {
+    val raw = "match:${originalName.lowercase()}:$sizeBytes:$captureTimeEpochMs"
+    return MessageDigest.getInstance("SHA-256").digest(raw.toByteArray())
+        .joinToString("") { "%02x".format(it) }.take(32)
+}

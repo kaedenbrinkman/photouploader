@@ -4,7 +4,9 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.photopipeline.app.api.ApiRequestException
 import com.photopipeline.app.api.NotSignedInException
+import com.photopipeline.app.data.PrepareCameraResult
 import com.photopipeline.app.core.PipelineLog
 import com.photopipeline.app.data.CameraImportResult
 import com.photopipeline.app.data.EstimateSource
@@ -96,6 +98,12 @@ class ShootViewModel(
                 )
             }
             recomputeStep()
+            val loaded = repo.getShoot(shootId)
+            if (loaded != null &&
+                (loaded.backendState != null || loaded.state !in LOCAL_ONLY_STATES || loaded.albumId != null)
+            ) {
+                startPolling()
+            }
         }
     }
 
@@ -215,6 +223,30 @@ class ShootViewModel(
         }
     }
 
+    /** Re-open MTP and rematch handles when returning to upload with the camera already attached. */
+    fun ensureCameraForUpload() {
+        safeScope.launch {
+            if (files.value.none { it.uploadState != "UPLOADED" }) return@launch
+            when (val prep = repo.prepareCameraForUpload(shootId)) {
+                is PrepareCameraResult.Error -> {
+                    _ui.value = _ui.value.copy(
+                        statusLine = prep.message,
+                        snackbar = prep.message,
+                    )
+                }
+                PrepareCameraResult.Ready -> {
+                    if (_ui.value.step == ShootFlowStep.Upload &&
+                        _ui.value.statusLine.startsWith("Reconnect")
+                    ) {
+                        _ui.value = _ui.value.copy(
+                            statusLine = "Camera ready — review cost and start upload.",
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     fun loadEstimate() {
         safeScope.launch {
             PipelineLog.d("ui", "Get estimate tapped")
@@ -235,6 +267,7 @@ class ShootViewModel(
                         snackbar = if (local && !repo.canUseBackendApi()) repo.backendGateMessage() else null,
                     )
                     refreshBackendGate()
+                    ensureCameraForUpload()
                 }
                 .onFailure { e ->
                     PipelineLog.e("estimate", "Estimate failed", e)
@@ -253,9 +286,25 @@ class ShootViewModel(
             return
         }
         safeScope.launch {
-            repo.enqueueUploads(shootId)
-            _ui.value = _ui.value.copy(step = ShootFlowStep.Processing, statusLine = "Uploading to S3…")
-            startPolling()
+            _ui.value = _ui.value.copy(busy = true, statusLine = "Preparing camera and server shoot…")
+            runCatching { repo.enqueueUploads(shootId) }
+                .onSuccess {
+                    _ui.value = _ui.value.copy(
+                        busy = false,
+                        step = ShootFlowStep.Upload,
+                        statusLine = "Uploading to S3 — keep USB connected.",
+                    )
+                }
+                .onFailure { e ->
+                    val msg = e.message ?: "Upload could not start"
+                    PipelineLog.e("upload", "enqueue failed: $msg", e)
+                    _ui.value = _ui.value.copy(
+                        busy = false,
+                        step = ShootFlowStep.Upload,
+                        statusLine = msg,
+                        snackbar = msg,
+                    )
+                }
         }
     }
 
@@ -298,11 +347,23 @@ class ShootViewModel(
     }
 
     fun startPolling() {
+        if (!shouldPollBackend()) return
         pollJob?.cancel()
         pollJob = safeScope.launch {
             while (isActive) {
+                if (!shouldPollBackend()) break
+                var stopPolling = false
                 runCatching { repo.refreshBackendStatus(shootId) }
-                    .onFailure { PipelineLog.w("status", "poll failed", it) }
+                    .onFailure { e ->
+                        val detail = when (e) {
+                            is ApiRequestException ->
+                                "poll failed HTTP ${e.httpCode ?: "?"}: ${e.message}"
+                            else -> "poll failed: ${e.message}"
+                        }
+                        PipelineLog.w("status", detail, e)
+                        if (e is ApiRequestException && e.httpCode == 404) stopPolling = true
+                    }
+                if (stopPolling) break
                 val progress = repo.processingProgressJson(shootId)
                 _ui.value = _ui.value.copy(processingProgress = progress)
                 recomputeStep()
@@ -311,6 +372,18 @@ class ShootViewModel(
                 delay(10_000)
             }
         }
+    }
+
+    private fun shouldPollBackend(): Boolean {
+        if (!repo.canUseBackendApi()) return false
+        val s = shoot.value
+        if (s != null) {
+            if (s.backendState != null || s.albumId != null) return true
+            if (s.state !in LOCAL_ONLY_STATES) return true
+        }
+        return repo.isServerShootRegistered(shootId) &&
+            files.value.isNotEmpty() &&
+            files.value.all { it.uploadState == "UPLOADED" }
     }
 
     private fun recomputeStep() {
@@ -333,6 +406,7 @@ class ShootViewModel(
 
     companion object {
         private val TERMINAL = setOf("DONE", "FAILED", "PARTIAL")
+        private val LOCAL_ONLY_STATES = setOf("LOCAL", "IMPORTING")
 
         fun factory(
             repo: Repository,

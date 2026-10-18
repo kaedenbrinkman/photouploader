@@ -9,7 +9,9 @@ import com.photopipeline.app.api.ApiClient
 import com.photopipeline.app.api.NotSignedInException
 import com.photopipeline.app.core.AppDefaults
 import com.photopipeline.app.core.PipelineLog
+import com.photopipeline.app.api.ApiRequestException
 import com.photopipeline.app.core.cameraFileIdentityKey
+import com.photopipeline.app.core.cameraFileMatchKey
 import com.photopipeline.app.core.metadataUploadSha256
 import com.photopipeline.app.pricing.LocalPricingEstimator
 import com.photopipeline.app.mtp.MtpRepository
@@ -158,6 +160,118 @@ class Repository(
     private fun requireBackendReady() {
         if (!canUseBackendApi()) throw NotSignedInException()
     }
+
+    private fun serverShootRegisteredKey(shootId: String) = "server_shoot_$shootId"
+
+    fun isServerShootRegistered(shootId: String): Boolean =
+        prefs.getBoolean(serverShootRegisteredKey(shootId), false)
+
+    suspend fun ensureServerShoot(shootId: String) {
+        requireBackendReady()
+        if (isServerShootRegistered(shootId)) return
+        val shoot = getShoot(shootId) ?: error("shoot missing")
+        runCatching { api.ensureServerShoot(shootId, shoot.albumTitle) }
+            .onSuccess {
+                prefs.edit().putBoolean(serverShootRegisteredKey(shootId), true).apply()
+            }
+            .onFailure { e ->
+                if (e is ApiRequestException && e.httpCode == 409) {
+                    prefs.edit().putBoolean(serverShootRegisteredKey(shootId), true).apply()
+                    return
+                }
+                throw e
+            }
+    }
+
+    /**
+     * USB permission, MTP open, and rematch of camera-stream files when object handles change between sessions.
+     */
+    suspend fun prepareCameraForUpload(shootId: String): PrepareCameraResult {
+        val pending = getPendingFiles(shootId)
+        val needsCamera = pending.any { it.isCameraStreamPending() }
+        if (!needsCamera) return PrepareCameraResult.Ready
+
+        ensureUsbReady()?.let { err ->
+            return PrepareCameraResult.Error(err.userMessage)
+        }
+        if (usb?.openMtpDevice() == null) {
+            val state = usb?.accessState?.value
+            val msg = when (state) {
+                UsbAccessState.PERMISSION_REQUIRED ->
+                    "USB permission required — tap Connect on the camera step or allow access when prompted."
+                UsbAccessState.PERMISSION_DENIED -> "USB permission denied for the camera."
+                UsbAccessState.NO_DEVICE -> "No camera detected — reconnect USB."
+                else -> "Could not open MTP session (state=$state)."
+            }
+            PipelineLog.w("upload", "prepareCameraForUpload: $msg")
+            return PrepareCameraResult.Error(msg)
+        }
+        this.mtp.refreshConnection()
+        val onCamera = runCatching { this.mtp.listCr3Objects() }.getOrElse { e ->
+            PipelineLog.w("upload", "prepareCameraForUpload list failed", e)
+            return PrepareCameraResult.Error("Failed to list camera files: ${e.message ?: "unknown"}")
+        }
+        if (onCamera.isEmpty()) {
+            return PrepareCameraResult.Error("Camera connected but no media files found to match.")
+        }
+        val byMatchKey = onCamera.groupBy { cameraFileMatchKey(it.filename, it.sizeBytes, it.captureTimeEpochMs) }
+        var rematched = 0
+        for (file in pending.filter { it.isCameraStreamPending() }) {
+            val key = cameraFileMatchKey(file.originalName, file.sizeBytes, file.captureTimeEpochMs)
+            val candidates = byMatchKey[key].orEmpty()
+            val obj = when {
+                candidates.size == 1 -> candidates.first()
+                candidates.isEmpty() -> {
+                    val byNameSize = onCamera.filter {
+                        it.filename.equals(file.originalName, ignoreCase = true) && it.sizeBytes == file.sizeBytes
+                    }
+                    byNameSize.singleOrNull()
+                }
+                else -> candidates.firstOrNull {
+                    it.filename.equals(file.originalName, ignoreCase = true)
+                } ?: candidates.first()
+            } ?: return PrepareCameraResult.Error(
+                "Camera file not found: ${file.originalName} (${file.sizeBytes} bytes). Re-import from the camera.",
+            )
+            val handleChanged = obj.handle != file.objectHandle || obj.storageId != file.storageId
+            val newIdentity = cameraFileIdentityKey(
+                obj.storageId,
+                obj.handle,
+                obj.sizeBytes,
+                obj.captureTimeEpochMs,
+            )
+            val newUploadRef = metadataUploadSha256(
+                obj.storageId,
+                obj.handle,
+                obj.sizeBytes,
+                obj.captureTimeEpochMs,
+            )
+            val updated = file.copy(
+                storageId = obj.storageId,
+                objectHandle = obj.handle,
+                sha256 = if (handleChanged || file.sha256.isBlank()) newUploadRef else file.sha256,
+                s3UploadId = if (handleChanged) null else file.s3UploadId,
+                s3Key = if (handleChanged) null else file.s3Key,
+                uploadPartsJson = if (handleChanged) "[]" else file.uploadPartsJson,
+                uploadState = if (file.uploadState == "PAUSED") "PENDING" else file.uploadState,
+                lastError = null,
+            )
+            if (newIdentity != file.identityKey) {
+                db.fileDao().delete(file.identityKey)
+                db.fileDao().upsert(updated.copy(identityKey = newIdentity))
+            } else {
+                db.fileDao().upsert(updated)
+            }
+            if (handleChanged) rematched++
+        }
+        if (rematched > 0) {
+            PipelineLog.i("upload", "Rematched $rematched camera file(s) after MTP handle change")
+        }
+        return PrepareCameraResult.Ready
+    }
+
+    private fun FileEntity.isCameraStreamPending(): Boolean =
+        uploadSource == "CAMERA_STREAM" || localPath.isNullOrBlank()
 
     private suspend fun ensureUsbReady(): CameraImportResult.Error? {
         val manager = usb ?: return null
@@ -361,11 +475,15 @@ class Repository(
                 shoot.copy(
                     estimateJson = JSONObject(
                         mapOf(
+                            "imageCount" to stored.response.estimate.imageCount,
                             "processingMinutes" to stored.response.estimate.processingMinutes,
                             "totalShootUsd" to stored.response.estimate.totalShootUsd,
                             "computeUsd" to stored.response.estimate.computeUsd,
                             "s3StandardMonthUsd" to stored.response.estimate.s3StandardMonthUsd,
+                            "s3DeepArchiveMonthUsd" to stored.response.estimate.s3DeepArchiveMonthUsd,
+                            "requestsUsd" to stored.response.estimate.requestsUsd,
                             "transferAccelerationUsd" to stored.response.estimate.transferAccelerationUsd,
+                            "perFileUsd" to stored.response.estimate.totalShootUsd / imageCount,
                             "source" to stored.source.name,
                             "notes" to notes,
                             "uploadMinutesMeasured" to uploadMinutes,
@@ -420,6 +538,7 @@ class Repository(
 
     suspend fun submitShoot(shootId: String) {
         requireBackendReady()
+        ensureServerShoot(shootId)
         uploadManifestIfReady(shootId)
         api.finalizeShoot(shootId)
     }
@@ -458,6 +577,12 @@ class Repository(
         prefs.getString("shoot_progress_$shootId", null)
 
     suspend fun enqueueUploads(shootId: String) {
+        requireBackendReady()
+        ensureServerShoot(shootId)
+        when (val prep = prepareCameraForUpload(shootId)) {
+            is PrepareCameraResult.Error -> error(prep.message)
+            PrepareCameraResult.Ready -> Unit
+        }
         val pending = getPendingFiles(shootId)
         val usesCameraStream = pending.any {
             it.uploadSource == "CAMERA_STREAM" || it.localPath.isNullOrBlank()
@@ -473,7 +598,7 @@ class Repository(
             .build()
         WorkManager.getInstance(appContext).enqueueUniqueWork(
             "upload-$shootId",
-            ExistingWorkPolicy.KEEP,
+            ExistingWorkPolicy.REPLACE,
             req,
         )
     }
@@ -495,4 +620,9 @@ class Repository(
         }
         return md.digest().joinToString("") { "%02x".format(it) }
     }
+}
+
+sealed class PrepareCameraResult {
+    data object Ready : PrepareCameraResult()
+    data class Error(val message: String) : PrepareCameraResult()
 }
