@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -16,6 +17,7 @@ import boto3
 from worker.config import WorkerConfig
 from worker.dynamo_store import DynamoStore
 from worker.gphotos_client import upload_shoot_jpegs
+from worker.failure_report import format_last_error
 from worker.lightcraft_runner import (
     LightcraftRenderError,
     PreviewOnlyError,
@@ -23,8 +25,26 @@ from worker.lightcraft_runner import (
     validate_jpeg,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("worker")
+
+
+def worker_log_path() -> Path:
+    install_root = os.environ.get("INSTALL_ROOT", "/opt/photopipeline")
+    return Path(install_root) / "worker.log"
+
+
+def setup_logging(log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+    root.addHandler(stream)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
 
 
 def load_manifest(s3, bucket: str, shoot_id: str) -> dict:
@@ -73,6 +93,8 @@ def manage_shutdown_backstop(*, cancel: bool, arm_idle_minutes: int | None = Non
 
 
 def run() -> int:
+    log_path = worker_log_path()
+    setup_logging(log_path)
     cfg = WorkerConfig.from_env()
     s3 = boto3.client("s3", region_name=cfg.region)
     store = DynamoStore(cfg.dynamodb_table, cfg.region)
@@ -213,7 +235,7 @@ def run() -> int:
             cfg.shoot_id,
             state="FAILED",
             phase="FAILED",
-            error=str(e),
+            lastError=format_last_error(str(e), log_path),
             workerFinishedAt=int(time.time() * 1000),
         )
         return 1

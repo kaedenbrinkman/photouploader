@@ -29,6 +29,11 @@ test -d "$VENDOR" && test -n "$(ls -A "$VENDOR")"
   -r "${INSTALL_ROOT}/photopipeline-worker/requirements.txt"
 
 "${VENV}/bin/python" -c "import boto3, requests, google.auth; print('deps ok', requests.__version__)"
+test -d "${INSTALL_ROOT}/photopipeline-worker/gphotos"
+(
+  cd "${INSTALL_ROOT}/photopipeline-worker"
+  "${VENV}/bin/python" -c "import worker.main"
+)
 
 bash -n "${ROOT}/infra/lambda/ec2-userdata-bootstrap.sh"
 bash -n "${ROOT}/worker/ami/ec2-install-from-s3.sh"

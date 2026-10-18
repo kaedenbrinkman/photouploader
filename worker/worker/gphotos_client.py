@@ -10,9 +10,17 @@ import boto3
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+def _gphotos_sys_path_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in (here.parents[1], here.parents[2]):
+        if (parent / "gphotos").is_dir():
+            return parent
+    return here.parents[1]
+
+
+_GPHOTOS_ROOT = _gphotos_sys_path_root()
+if str(_GPHOTOS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_GPHOTOS_ROOT))
 
 from gphotos.gphotos_upload import SCOPES, upload_album  # noqa: E402
 

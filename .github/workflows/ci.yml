@@ -44,6 +44,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
       - name: Bootstrap script syntax
         run: bash -n worker/ami/bootstrap.sh
       - name: EC2 install script syntax
@@ -51,7 +54,11 @@ jobs:
       - name: Build worker bundle (artifact only, not uploaded)
         run: |
           chmod +x scripts/build-worker-bundle.sh
-          scripts/build-worker-bundle.sh
+          TARGET_PY=3.9 scripts/build-worker-bundle.sh
+      - name: Verify worker bundle offline import (Python 3.9)
+        run: |
+          chmod +x scripts/verify-worker-bundle.sh
+          TARGET_PY=3.9 scripts/verify-worker-bundle.sh
       - name: Bootstrap docker verify (stub LightCraft)
         run: docker build -f worker/ami/Dockerfile.verify .
       - name: AL2023 user-data venv and vendored pip
