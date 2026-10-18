@@ -10,7 +10,6 @@ import com.photopipeline.app.api.NotSignedInException
 import com.photopipeline.app.core.PipelineLog
 import com.photopipeline.app.core.fileIdentityKey
 import com.photopipeline.app.pricing.LocalPricingEstimator
-import com.photopipeline.app.mtp.MtpConnectionState
 import com.photopipeline.app.mtp.MtpRepository
 import com.photopipeline.app.mtp.MtpObjectInfo
 import com.photopipeline.app.mtp.UsbAccessState
@@ -149,13 +148,13 @@ class Repository(
                 )
             UsbAccessState.READY -> Unit
         }
-        val mtpState = mtp.refreshConnection()
-        if (mtpState == MtpConnectionState.ERROR) {
+        if (manager.accessState.value == UsbAccessState.OPEN_FAILED) {
             return CameraImportResult.Error(
                 stage = "mtp",
                 userMessage = "Camera found but MTP session failed. See debug log for interface details.",
             )
         }
+        mtp.refreshConnection()
         return null
     }
 

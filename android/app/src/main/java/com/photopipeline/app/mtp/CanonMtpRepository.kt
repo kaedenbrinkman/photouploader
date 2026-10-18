@@ -1,8 +1,6 @@
 package com.photopipeline.app.mtp
 
-import android.mtp.MtpConstants
 import android.mtp.MtpDevice
-import android.mtp.MtpObjectInfo as AndroidMtpObjectInfo
 import com.photopipeline.app.core.PipelineLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -22,9 +20,7 @@ class CanonMtpRepository(
     override val usbAccessState: StateFlow<UsbAccessState> = usb.accessState
 
     override fun refreshConnection(): MtpConnectionState {
-        _state.value = MtpConnectionState.CONNECTING
-        val access = usb.refreshProbe(log = true)
-        val mapped = when (access) {
+        val mapped = when (usb.accessState.value) {
             UsbAccessState.READY -> MtpConnectionState.CONNECTED
             UsbAccessState.PERMISSION_REQUIRED -> MtpConnectionState.ERROR
             UsbAccessState.PERMISSION_DENIED -> MtpConnectionState.ERROR
@@ -41,22 +37,14 @@ class CanonMtpRepository(
             PipelineLog.w("mtp", "listCr3Objects: could not open MTP")
             return@withContext emptyList()
         }
-        try {
-            val list = enumerateMedia(mtp)
-            PipelineLog.d("mtp", "listCr3Objects: found ${list.size} media files")
-            list
-        } finally {
-            mtp.close()
-        }
+        val list = MtpMediaEnumerator.enumerateMedia(mtp)
+        PipelineLog.d("mtp", "listCr3Objects: found ${list.size} media files")
+        list
     }
 
     override suspend fun getThumbnail(info: MtpObjectInfo): ByteArray? = withContext(Dispatchers.IO) {
         val mtp = usb.openMtpDevice() ?: return@withContext null
-        try {
-            mtp.getThumbnail(info.handle.toInt())
-        } finally {
-            mtp.close()
-        }
+        mtp.getThumbnail(info.handle.toInt())
     }
 
     override suspend fun importObject(
@@ -67,53 +55,8 @@ class CanonMtpRepository(
         val dest = File(destPath)
         dest.parentFile?.mkdirs()
         val mtp = usb.openMtpDevice() ?: throw IOException("MTP not connected — check USB permission")
-        try {
-            importWithResume(mtp, info, dest, onProgress)
-        } finally {
-            mtp.close()
-        }
+        importWithResume(mtp, info, dest, onProgress)
         sha256File(dest)
-    }
-
-    private fun enumerateMedia(device: MtpDevice): List<MtpObjectInfo> {
-        val out = mutableListOf<MtpObjectInfo>()
-        val storageIds = device.storageIds ?: return emptyList()
-        for (storageId in storageIds) {
-            val handles = device.getObjectHandles(
-                storageId,
-                MtpConstants.FORMAT_UNDEFINED,
-                PARENT_ROOT,
-            ) ?: continue
-            for (handle in handles) {
-                val objInfo = getObjectInfoWithRetry(device, handle) ?: continue
-                val name = objInfo.name ?: continue
-                if (!isMediaFile(name)) continue
-                val captureMs = objInfo.dateCreated.toLong() * 1000L
-                out += MtpObjectInfo(
-                    storageId = storageId.toLong(),
-                    handle = handle.toLong(),
-                    filename = name,
-                    sizeBytes = objInfo.compressedSize.toLong(),
-                    captureTimeEpochMs = captureMs,
-                )
-            }
-        }
-        return out
-    }
-
-    private fun getObjectInfoWithRetry(device: MtpDevice, handle: Int, attempts: Int = 3): AndroidMtpObjectInfo? {
-        repeat(attempts) { attempt ->
-            val info = device.getObjectInfo(handle)
-            if (info != null) return info
-            if (attempt < attempts - 1) Thread.sleep(50L * (attempt + 1))
-        }
-        return null
-    }
-
-    private fun isMediaFile(name: String): Boolean {
-        val u = name.uppercase()
-        return u.endsWith(".CR3") || u.endsWith(".CR2") || u.endsWith(".JPG") || u.endsWith(".JPEG") ||
-            u.endsWith(".MOV") || u.endsWith(".MP4")
     }
 
     private fun importWithResume(
@@ -204,6 +147,5 @@ class CanonMtpRepository(
 
     companion object {
         private const val PARTIAL_CHUNK_BYTES = 512 * 1024L
-        private const val PARENT_ROOT = 0xFFFFFFFF.toInt()
     }
 }

@@ -34,6 +34,11 @@ class UsbCameraManager(private val appContext: Context) {
     private val _selectedDevice = MutableStateFlow<UsbDevice?>(null)
     val selectedDevice: StateFlow<UsbDevice?> = _selectedDevice.asStateFlow()
 
+    private val sessionLock = Any()
+    private var sessionConnection: UsbDeviceConnection? = null
+    private var sessionMtp: MtpDevice? = null
+    private var sessionDevice: UsbDevice? = null
+
     private var permissionCallback: ((Boolean) -> Unit)? = null
 
     private val permissionReceiver =
@@ -58,15 +63,30 @@ class UsbCameraManager(private val appContext: Context) {
     private val attachReceiver =
         object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
-                val device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-                PipelineLog.d(
-                    "usb-attach",
-                    "ACTION_USB_DEVICE_ATTACHED ${device?.let { UsbDeviceInspector.describe(it) } ?: "no extra"}",
-                )
-                if (device != null && UsbDeviceInspector.isCanon(device)) {
-                    _selectedDevice.value = device
-                    refreshProbe(log = true)
+                when (intent?.action) {
+                    UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                        val device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                        PipelineLog.d(
+                            "usb-attach",
+                            "ACTION_USB_DEVICE_ATTACHED ${device?.let { UsbDeviceInspector.describe(it) } ?: "no extra"}",
+                        )
+                        if (device != null && UsbDeviceInspector.isCanon(device)) {
+                            _selectedDevice.value = device
+                            refreshProbe(log = true)
+                        }
+                    }
+                    UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                        val device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                        PipelineLog.d(
+                            "usb-detach",
+                            "ACTION_USB_DEVICE_DETACHED ${device?.deviceName ?: "?"} — closing MTP session",
+                        )
+                        closeMtpSession()
+                        if (device != null && device == _selectedDevice.value) {
+                            _selectedDevice.value = null
+                        }
+                        _accessState.value = UsbAccessState.NO_DEVICE
+                    }
                 }
             }
         }
@@ -77,7 +97,10 @@ class UsbCameraManager(private val appContext: Context) {
         if (receiversRegistered) return
         PipelineLog.d("usb", "UsbCameraManager.start() registering receivers")
         val permFilter = IntentFilter(ACTION_USB_PERMISSION)
-        val attachFilter = IntentFilter(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+        val attachFilter = IntentFilter().apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             appContext.registerReceiver(permissionReceiver, permFilter, Context.RECEIVER_NOT_EXPORTED)
             appContext.registerReceiver(attachReceiver, attachFilter, Context.RECEIVER_NOT_EXPORTED)
@@ -94,6 +117,7 @@ class UsbCameraManager(private val appContext: Context) {
 
     fun stop() {
         if (!receiversRegistered) return
+        closeMtpSession()
         appContext.unregisterReceiver(permissionReceiver)
         appContext.unregisterReceiver(attachReceiver)
         receiversRegistered = false
@@ -101,16 +125,23 @@ class UsbCameraManager(private val appContext: Context) {
 
     fun onUsbIntent(intent: Intent?) {
         PipelineLog.d("usb-intent", "onUsbIntent action=${intent?.action}")
-        if (intent?.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) {
-            val device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-            PipelineLog.d(
-                "usb-intent",
-                "Activity USB_DEVICE_ATTACHED ${device?.let { UsbDeviceInspector.describe(it) } ?: "?"}",
-            )
-            if (device != null) _selectedDevice.value = device
-            refreshProbe(log = true)
-            if (_accessState.value == UsbAccessState.PERMISSION_REQUIRED) {
-                requestPermission()
+        when (intent?.action) {
+            UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                val device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                PipelineLog.d(
+                    "usb-intent",
+                    "Activity USB_DEVICE_ATTACHED ${device?.let { UsbDeviceInspector.describe(it) } ?: "?"}",
+                )
+                if (device != null) _selectedDevice.value = device
+                refreshProbe(log = true)
+                if (_accessState.value == UsbAccessState.PERMISSION_REQUIRED) {
+                    requestPermission()
+                }
+            }
+            UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                closeMtpSession()
+                _selectedDevice.value = null
+                _accessState.value = UsbAccessState.NO_DEVICE
             }
         }
     }
@@ -150,9 +181,14 @@ class UsbCameraManager(private val appContext: Context) {
             if (log) PipelineLog.d("usb-probe", "state=PERMISSION_REQUIRED")
             return _accessState.value
         }
-        val opened = openConnection(canon)
-        _accessState.value = if (opened != null) {
-            opened.connection.close()
+        synchronized(sessionLock) {
+            if (sessionMtp != null && sessionDevice?.deviceName == canon.deviceName) {
+                _accessState.value = UsbAccessState.READY
+                if (log) PipelineLog.d("usb-probe", "state=READY (existing MTP session)")
+                return _accessState.value
+            }
+        }
+        _accessState.value = if (acquireMtpDevice() != null) {
             UsbAccessState.READY
         } else {
             UsbAccessState.OPEN_FAILED
@@ -190,33 +226,63 @@ class UsbCameraManager(private val appContext: Context) {
         }
     }
 
-    fun openMtpDevice(): MtpDevice? {
-        PipelineLog.d("mtp", "openMtpDevice()")
+    /** Returns an open [MtpDevice] tied to a single USB session; do not call [MtpDevice.close] from callers. */
+    fun openMtpDevice(): MtpDevice? = acquireMtpDevice()
+
+    fun acquireMtpDevice(): MtpDevice? = synchronized(sessionLock) {
         val device = findCanonDevice() ?: run {
-            PipelineLog.w("mtp", "openMtpDevice: no device")
+            PipelineLog.w("mtp", "acquireMtpDevice: no device")
             return null
         }
         if (!usbManager.hasPermission(device)) {
-            PipelineLog.w("mtp", "openMtpDevice: permission missing")
+            PipelineLog.w("mtp", "acquireMtpDevice: permission missing")
             _accessState.value = UsbAccessState.PERMISSION_REQUIRED
             return null
         }
+        if (sessionMtp != null && sessionDevice?.deviceName == device.deviceName) {
+            PipelineLog.d("mtp-session", "reuse open session for ${device.deviceName}")
+            return sessionMtp
+        }
+        closeMtpSessionLocked()
+        PipelineLog.d("mtp-session", "opening new session for ${device.deviceName}")
         val opened = openConnection(device) ?: run {
             _accessState.value = UsbAccessState.OPEN_FAILED
             return null
         }
         val mtp = MtpDevice(device)
-        return if (mtp.open(opened.connection)) {
-            _accessState.value = UsbAccessState.READY
-            val storageIds = mtp.storageIds
-            PipelineLog.d("mtp", "MtpDevice.open OK storageIds=${storageIds?.joinToString() ?: "null"}")
-            mtp
-        } else {
+        if (!mtp.open(opened.connection)) {
             PipelineLog.e("mtp", "MtpDevice.open returned false")
             opened.connection.close()
             _accessState.value = UsbAccessState.OPEN_FAILED
-            null
+            return null
         }
+        sessionConnection = opened.connection
+        sessionMtp = mtp
+        sessionDevice = device
+        _accessState.value = UsbAccessState.READY
+        val storageIds = mtp.storageIds
+        PipelineLog.d("mtp", "MtpDevice.open OK storageIds=${storageIds?.joinToString() ?: "null"}")
+        mtp
+    }
+
+    fun closeMtpSession() = synchronized(sessionLock) {
+        closeMtpSessionLocked()
+    }
+
+    private fun closeMtpSessionLocked() {
+        try {
+            sessionMtp?.close()
+        } catch (e: Exception) {
+            PipelineLog.w("mtp-session", "MtpDevice.close: ${e.message}")
+        }
+        sessionMtp = null
+        try {
+            sessionConnection?.close()
+        } catch (e: Exception) {
+            PipelineLog.w("mtp-session", "connection.close: ${e.message}")
+        }
+        sessionConnection = null
+        sessionDevice = null
     }
 
     private data class OpenedConnection(val connection: UsbDeviceConnection)
