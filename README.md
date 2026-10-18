@@ -73,7 +73,13 @@ Reproducible bootstrap: `worker/ami/bootstrap.sh` (LightCraft **31a677fe**, Rust
 
 1. **Google Cloud:** Follow `gphotos/SETUP.md` — Photos Library API, OAuth client (Web type for redirect), testers, scopes `appendonly` + `readonly.appcreateddata`.
 2. **AWS:** `cd infra && npm install && npx cdk bootstrap && npx cdk deploy`
-   - Set parameters **`WorkerVpcId`** and **`WorkerPublicSubnetId`** to your **default VPC** public subnet (worker needs outbound internet; **no inbound** SG rules).
+   - **`WorkerVpcId`** and **`WorkerPublicSubnetId`** are **required** CloudFormation parameters (no in-stack default). Use your account’s default VPC and a **public** subnet (worker needs outbound internet; worker security group has no inbound rules). Example discovery:
+     ```bash
+     VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+     SUBNET=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC" Name=map-public-ip-on-launch,Values=true \
+       --query 'Subnets[0].SubnetId' --output text)
+     npx cdk deploy --parameters WorkerVpcId="$VPC" --parameters WorkerPublicSubnetId="$SUBNET"
+     ```
    - Create the Google OAuth client JSON in SSM (not managed by CDK — CloudFormation cannot create `SecureString` parameters):
      ```bash
      aws ssm put-parameter \

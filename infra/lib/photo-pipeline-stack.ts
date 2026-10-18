@@ -35,13 +35,11 @@ export class PhotoPipelineStack extends cdk.Stack {
 
     const workerSubnetId = new cdk.CfnParameter(this, 'WorkerPublicSubnetId', {
       type: 'String',
-      default: 'subnet-PLACEHOLDER',
       description: 'Default VPC public subnet ID for ephemeral workers (no NAT required)',
     });
 
     const workerVpcId = new cdk.CfnParameter(this, 'WorkerVpcId', {
       type: 'String',
-      default: 'vpc-PLACEHOLDER',
       description: 'Default VPC ID for worker security group',
     });
 
@@ -99,7 +97,7 @@ export class PhotoPipelineStack extends cdk.Stack {
     const workerSecurityGroup = new ec2.SecurityGroup(this, 'WorkerSg', {
       vpc,
       allowAllOutbound: true,
-      description: 'Ephemeral LightCraft worker — no inbound access',
+      description: 'Ephemeral LightCraft worker - no inbound access',
     });
 
     const workerRole = new iam.Role(this, 'WorkerInstanceRole', {
