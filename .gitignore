@@ -1,0 +1,14 @@
+**/node_modules/
+infra/cdk.out/
+infra/node_modules/
+infra/dist/
+*.pyc
+__pycache__/
+.venv/
+android/.gradle/
+android/**/build/
+android/local.properties
+.idea/
+*.iml
+.DS_Store
+__pycache__/

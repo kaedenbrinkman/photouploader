@@ -1,0 +1,75 @@
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import type { APIGatewayProxyHandlerV2 } from 'aws-lambda';
+import { actualComputeCost } from './pricing';
+import { json, userIdFromEvent } from './http';
+
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const s3 = new S3Client({});
+
+export const handler: APIGatewayProxyHandlerV2 = async (event) => {
+  const userId = userIdFromEvent(event);
+  const shootId = event.pathParameters?.shootId;
+  if (!userId || !shootId) return json(401, { error: 'unauthorized' });
+
+  const meta = await ddb.send(
+    new GetCommand({ TableName: process.env.TABLE_NAME, Key: { pk: `SHOOT#${shootId}`, sk: 'META' } }),
+  );
+  if (!meta.Item || meta.Item.userId !== userId) return json(404, { error: 'not found' });
+
+  const filesRes = await ddb.send(
+    new QueryCommand({
+      TableName: process.env.TABLE_NAME,
+      KeyConditionExpression: 'pk = :pk AND begins_with(sk, :f)',
+      ExpressionAttributeValues: { ':pk': `SHOOT#${shootId}`, ':f': 'FILE#' },
+    }),
+  );
+  const files = (filesRes.Items ?? []).map((it) => ({
+    sha256: it.sha256,
+    state: it.state,
+    error: it.error,
+    originalName: it.originalName,
+    sizeBytes: it.sizeBytes,
+    updatedAt: it.updatedAt,
+  }));
+
+  let results: unknown = null;
+  const key = meta.Item.resultsS3Key ?? `shoots/${shootId}/results.json`;
+  try {
+    const obj = await s3.send(new GetObjectCommand({ Bucket: process.env.BUCKET_NAME!, Key: key }));
+    results = JSON.parse(await obj.Body!.transformToString());
+  } catch {
+    /* optional */
+  }
+
+  const started = meta.Item.workerStartedAt as number | undefined;
+  const finished = meta.Item.workerFinishedAt as number | undefined;
+  let actualCompute: { seconds?: number; usd?: number } = {};
+  if (started && finished && meta.Item.instanceType) {
+    const seconds = (finished - started) / 1000;
+    actualCompute = {
+      seconds: Math.round(seconds),
+      usd: actualComputeCost(seconds, String(meta.Item.instanceType), Boolean(meta.Item.spot)),
+    };
+  }
+
+  return json(200, {
+    shootId,
+    state: meta.Item.state,
+    phase: meta.Item.phase,
+    albumId: meta.Item.albumId,
+    instanceId: meta.Item.instanceId,
+    missingKeys: meta.Item.missingKeys,
+    progress: {
+      totalFiles: meta.Item.totalFiles ?? files.length,
+      renderedCount: meta.Item.renderedCount ?? 0,
+      publishedCount: meta.Item.publishedCount ?? 0,
+      uploadCompleteCount: files.filter((f) => f.state === 'UPLOADED' || f.state === 'GP_CREATED').length,
+    },
+    estimateAtSubmit: meta.Item.estimateAtSubmit,
+    actualCompute,
+    files,
+    results,
+  });
+};
