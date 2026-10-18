@@ -160,16 +160,27 @@ async function resetStaleProcessing(
   );
 }
 
-async function acquireLaunchLock(shootId: string): Promise<boolean> {
+/** Single atomic lock + READY_TO_PROCESS immediately before RunInstances. */
+async function acquireLaunchLockAndMarkReady(shootId: string): Promise<boolean> {
   const now = Date.now();
   try {
     await ddb.send(
       new UpdateCommand({
         TableName: process.env.TABLE_NAME,
         Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
-        UpdateExpression: 'SET launchLockUntil = :u',
-        ConditionExpression: 'attribute_not_exists(launchLockUntil) OR launchLockUntil < :now',
-        ExpressionAttributeValues: { ':u': now + LAUNCH_LOCK_MS, ':now': now },
+        UpdateExpression:
+          'SET launchLockUntil = :u, #s = :v, phase = :q, verifiedAt = :t REMOVE missingKeys, lastError, launchErrorCode',
+        ConditionExpression:
+          '(attribute_not_exists(launchLockUntil) OR launchLockUntil < :now) AND #s <> :done',
+        ExpressionAttributeNames: { '#s': 'state' },
+        ExpressionAttributeValues: {
+          ':u': now + LAUNCH_LOCK_MS,
+          ':now': now,
+          ':v': 'READY_TO_PROCESS',
+          ':q': 'READY_TO_PROCESS',
+          ':t': now,
+          ':done': 'DONE',
+        },
       }),
     );
     return true;
@@ -322,27 +333,10 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
       });
     }
 
-    if (!(await acquireLaunchLock(shootId))) {
+    if (!(await acquireLaunchLockAndMarkReady(shootId))) {
       return json(409, { error: 'finalize_in_progress', state: meta.Item.state ?? 'READY_TO_PROCESS' });
     }
     lockHeld = true;
-
-    await ddb.send(
-      new UpdateCommand({
-        TableName: process.env.TABLE_NAME,
-        Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
-        UpdateExpression:
-          'SET #s = :v, phase = :q, verifiedAt = :t REMOVE missingKeys, lastError, launchErrorCode',
-        ConditionExpression: '#s <> :done',
-        ExpressionAttributeNames: { '#s': 'state' },
-        ExpressionAttributeValues: {
-          ':v': 'READY_TO_PROCESS',
-          ':q': 'READY_TO_PROCESS',
-          ':t': Date.now(),
-          ':done': 'DONE',
-        },
-      }),
-    );
 
     const settingsHash = manifest.settings_hash ?? meta.Item.settingsHash ?? 'develop.auto-longEdge0-q90';
     const albumTitle = manifest.album_title ?? meta.Item.albumTitle ?? shootId;

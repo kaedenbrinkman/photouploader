@@ -141,11 +141,20 @@ export class PhotoPipelineStack extends cdk.Stack {
     bucket.grantReadWrite(presignFn);
     table.grantReadWriteData(presignFn);
 
+    const finalizeReservedRaw = this.node.tryGetContext('finalizeReservedConcurrency');
+    const finalizeReserved =
+      finalizeReservedRaw != null && finalizeReservedRaw !== '' && finalizeReservedRaw !== false
+        ? Number(finalizeReservedRaw)
+        : undefined;
     const finalizeFn = new lambdaNode.NodejsFunction(this, 'FinalizeFn', {
       ...lambdaDefaults,
       entry: path.join(__dirname, '../lambda/finalize.ts'),
       timeout: cdk.Duration.seconds(60),
-      reservedConcurrentExecutions: 1,
+      ...(finalizeReserved != null &&
+      Number.isFinite(finalizeReserved) &&
+      finalizeReserved > 0
+        ? { reservedConcurrentExecutions: finalizeReserved }
+        : {}),
     });
     bucket.grantReadWrite(finalizeFn);
     table.grantReadWriteData(finalizeFn);
