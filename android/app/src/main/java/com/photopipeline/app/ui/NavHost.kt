@@ -23,7 +23,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Stop
@@ -221,23 +220,6 @@ fun HomeScreen(
                         "Start a shoot — USB access is requested automatically."
                     } else {
                         "Canon R8 via USB — use a data-capable cable."
-                    },
-                )
-            }
-            item {
-                StatusCard(
-                    title = "Google account",
-                    icon = { Icon(Icons.Default.Cloud, null) },
-                    line1 = if (linked) {
-                        repository.googleEmail()?.let { "Signed in as $it" }
-                            ?: "Signed in (${repository.googleUserId()})"
-                    } else {
-                        "Not connected"
-                    },
-                    line2 = if (linked) {
-                        "Photos upload uses your linked Google account on the server."
-                    } else {
-                        "Connect once to upload RAW and publish finished JPEGs to Google Photos."
                     },
                 )
             }
