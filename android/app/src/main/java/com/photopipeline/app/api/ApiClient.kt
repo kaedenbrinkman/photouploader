@@ -9,6 +9,8 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -27,14 +29,14 @@ class ApiClient(
         imageCount: Int,
         totalBytesRaw: Long,
         transferAcceleration: Boolean = false,
-    ): EstimateResponse {
+    ): EstimateResponse = onIo {
         val body = JSONObject()
             .put("imageCount", imageCount)
             .put("totalBytesRaw", totalBytesRaw)
             .putTransferAcceleration(transferAcceleration)
             .toString()
         val req = authorizedRequest("/shoots/estimate").post(body.toRequestBody(JSON)).build()
-        return client.newCall(req).execute().use { resp ->
+        client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) throw ApiRequestException("estimate failed: ${resp.code}", resp.code)
             estimateAdapter.fromJson(resp.body!!.string())
                 ?: throw ApiRequestException("estimate parse failed")
@@ -46,7 +48,7 @@ class ApiClient(
         sha256: String,
         originalName: String,
         transferAcceleration: Boolean = false,
-    ): Pair<String, String> {
+    ): Pair<String, String> = onIo {
         val body = JSONObject()
             .put("action", "create_multipart")
             .put("sha256", sha256)
@@ -54,7 +56,7 @@ class ApiClient(
             .putTransferAcceleration(transferAcceleration)
             .toString()
         val req = authorizedRequest("/shoots/$shootId/presign").post(body.toRequestBody(JSON)).build()
-        return client.newCall(req).execute().use { resp ->
+        client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("multipart failed")
             val json = JSONObject(resp.body!!.string())
             json.getString("uploadId") to json.getString("key")
@@ -69,7 +71,7 @@ class ApiClient(
         originalName: String,
         sizeBytes: Long,
         transferAcceleration: Boolean = false,
-    ): PresignedPartUrl {
+    ): PresignedPartUrl = onIo {
         val body = JSONObject()
             .put("action", "presign_part")
             .put("sha256", sha256)
@@ -80,7 +82,7 @@ class ApiClient(
             .putTransferAcceleration(transferAcceleration)
             .toString()
         val req = authorizedRequest("/shoots/$shootId/presign").post(body.toRequestBody(JSON)).build()
-        return client.newCall(req).execute().use { resp ->
+        client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("presign part failed")
             val json = JSONObject(resp.body!!.string())
             PresignedPartUrl(
@@ -95,7 +97,7 @@ class ApiClient(
         uploadId: String,
         key: String,
         transferAcceleration: Boolean = false,
-    ): List<Pair<Int, String>> {
+    ): List<Pair<Int, String>> = onIo {
         val body = JSONObject()
             .put("action", "list_parts")
             .put("uploadId", uploadId)
@@ -103,7 +105,7 @@ class ApiClient(
             .putTransferAcceleration(transferAcceleration)
             .toString()
         val req = authorizedRequest("/shoots/$shootId/presign").post(body.toRequestBody(JSON)).build()
-        return client.newCall(req).execute().use { resp ->
+        client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("list parts failed")
             val arr = JSONObject(resp.body!!.string()).getJSONArray("parts")
             buildList {
@@ -122,7 +124,7 @@ class ApiClient(
         uploadId: String,
         parts: List<UploadPart>,
         transferAcceleration: Boolean = false,
-    ) {
+    ) = onIo {
         val partsJson = JSONArray().apply {
             parts.sortedBy { it.partNumber }.forEach { p ->
                 put(JSONObject().put("PartNumber", p.partNumber).put("ETag", p.eTag))
@@ -142,7 +144,7 @@ class ApiClient(
         }
     }
 
-    suspend fun uploadManifest(shootId: String, manifestJson: String, transferAcceleration: Boolean = false) {
+    suspend fun uploadManifest(shootId: String, manifestJson: String, transferAcceleration: Boolean = false) = onIo {
         val presignBody = JSONObject()
             .put("action", "presign_manifest")
             .putTransferAcceleration(transferAcceleration)
@@ -161,22 +163,22 @@ class ApiClient(
         }
     }
 
-    suspend fun finalizeShoot(shootId: String) {
+    suspend fun finalizeShoot(shootId: String) = onIo {
         val req = authorizedRequest("/shoots/$shootId/finalize").post("{}".toRequestBody(JSON)).build()
         client.newCall(req).execute().use { resp ->
             if (resp.code !in 200..202) error("finalize failed: ${resp.code}")
         }
     }
 
-    suspend fun fetchStatus(shootId: String): ShootStatusResponse {
+    suspend fun fetchStatus(shootId: String): ShootStatusResponse = onIo {
         val req = authorizedRequest("/shoots/$shootId/status").get().build()
-        return client.newCall(req).execute().use { resp ->
+        client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("status failed")
             statusAdapter.fromJson(resp.body!!.string())!!
         }
     }
 
-    suspend fun exchangeGoogleAuth(serverAuthCode: String): GoogleAuthResponse {
+    suspend fun exchangeGoogleAuth(serverAuthCode: String): GoogleAuthResponse = onIo {
         val body = JSONObject()
             .put("serverAuthCode", serverAuthCode)
             .toString()
@@ -184,7 +186,7 @@ class ApiClient(
             .url("$baseUrl/auth/google")
             .post(body.toRequestBody(JSON))
             .build()
-        return client.newCall(req).execute().use { resp ->
+        client.newCall(req).execute().use { resp ->
             PipelineLog.i("auth", "POST /auth/google HTTP ${resp.code}")
             if (!resp.isSuccessful) {
                 throw ApiRequestException("auth exchange failed: ${resp.code}", resp.code)
@@ -199,6 +201,9 @@ class ApiClient(
             )
         }
     }
+
+    /** All OkHttp [execute] calls run here so callers are safe from the main thread. */
+    private suspend fun <T> onIo(block: suspend () -> T): T = withContext(Dispatchers.IO) { block() }
 
     private suspend fun authorizedRequest(path: String): Request.Builder {
         val token = sessionTokenProvider() ?: throw NotSignedInException()
