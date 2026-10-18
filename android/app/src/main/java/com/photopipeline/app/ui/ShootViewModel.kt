@@ -51,6 +51,12 @@ enum class UploadStartState {
     Failed,
 }
 
+enum class FinalizeState {
+    Idle,
+    InProgress,
+    Failed,
+}
+
 data class ShootUiState(
     val step: ShootFlowStep = ShootFlowStep.PickFiles,
     val busy: Boolean = false,
@@ -68,6 +74,8 @@ data class ShootUiState(
     val uploadStartState: UploadStartState = UploadStartState.Idle,
     val uploadFailedReason: String? = null,
     val autoConnectInFlight: Boolean = false,
+    val finalizeState: FinalizeState = FinalizeState.Idle,
+    val finalizeError: String? = null,
 )
 
 class ShootViewModel(
@@ -124,6 +132,7 @@ class ShootViewModel(
             )
             recomputeStep()
             observeUploadWork()
+            refreshFinalizeError()
             val loaded = repo.getShoot(shootId)
             if (loaded != null &&
                 (loaded.backendState != null || loaded.state !in LOCAL_ONLY_STATES || loaded.albumId != null)
@@ -149,6 +158,8 @@ class ShootViewModel(
     private var pollJob: Job? = null
     private var workObserveJob: Job? = null
     private var autoResumeAttempted = false
+    private var autoFinalizeScheduled = false
+    private var finalizeInFlight = false
 
     fun refreshBackendGate() {
         _ui.value = _ui.value.copy(
@@ -419,31 +430,96 @@ class ShootViewModel(
         }
     }
 
-    fun submitShoot() {
+    fun retryProcessing() {
         refreshBackendGate()
         if (!repo.canUseBackendApi()) {
             _ui.value = _ui.value.copy(snackbar = repo.backendGateMessage())
             return
         }
+        safeScope.launch { runFinalizeForProcessing(userInitiated = true) }
+    }
+
+    private fun refreshFinalizeError() {
+        _ui.value = _ui.value.copy(
+            finalizeError = repo.getFinalizeError(shootId),
+            finalizeState = if (repo.getFinalizeError(shootId) != null) {
+                FinalizeState.Failed
+            } else {
+                _ui.value.finalizeState
+            },
+        )
+    }
+
+    private fun observeAutoFinalize() {
         safeScope.launch {
-            _ui.value = _ui.value.copy(busy = true)
-            runCatching { repo.submitShoot(shootId) }
-                .onSuccess {
-                    _ui.value = _ui.value.copy(
-                        busy = false,
-                        statusLine = "Submitted for processing on LightCraft worker.",
-                        step = ShootFlowStep.Processing,
-                    )
-                    startPolling()
-                }
-                .onFailure { e ->
-                    val msg = when (e) {
-                        is NotSignedInException -> repo.backendGateMessage()
-                        else -> e.message ?: "Submit failed"
-                    }
-                    _ui.value = _ui.value.copy(busy = false, snackbar = msg)
-                }
+            files.collect {
+                tryAutoFinalizeIfReady()
+            }
         }
+    }
+
+    private fun tryAutoFinalizeIfReady() {
+        if (finalizeInFlight) return
+        if (!repo.canUseBackendApi()) return
+        val fileList = files.value
+        if (fileList.isEmpty() || fileList.any { it.uploadState != "UPLOADED" }) return
+        val s = shoot.value ?: return
+        if (s.state in TERMINAL && s.state != "FAILED") return
+        if (s.albumId != null) return
+        if (s.backendState != null && s.state !in LOCAL_ONLY_STATES && s.state != "FAILED") return
+        if (repo.getFinalizeError(shootId) != null) {
+            refreshFinalizeError()
+            return
+        }
+        if (_ui.value.uploadStartState == UploadStartState.Uploading ||
+            _ui.value.uploadStartState == UploadStartState.Starting
+        ) {
+            return
+        }
+        if (autoFinalizeScheduled) return
+        autoFinalizeScheduled = true
+        safeScope.launch { runFinalizeForProcessing(userInitiated = false) }
+    }
+
+    private suspend fun runFinalizeForProcessing(userInitiated: Boolean) {
+        if (finalizeInFlight) return
+        finalizeInFlight = true
+        _ui.value = _ui.value.copy(
+            busy = true,
+            finalizeState = FinalizeState.InProgress,
+            finalizeError = null,
+            statusLine = "Starting server processing…",
+        )
+        runCatching { repo.finalizeShootForProcessing(shootId) }
+            .onSuccess {
+                finalizeInFlight = false
+                autoFinalizeScheduled = false
+                _ui.value = _ui.value.copy(
+                    busy = false,
+                    finalizeState = FinalizeState.Idle,
+                    finalizeError = null,
+                    statusLine = "Processing on LightCraft worker.",
+                    step = ShootFlowStep.Processing,
+                )
+                recomputeStep()
+                startPolling()
+            }
+            .onFailure { e ->
+                finalizeInFlight = false
+                if (!userInitiated) autoFinalizeScheduled = false
+                val msg = when (e) {
+                    is NotSignedInException -> repo.backendGateMessage()
+                    else -> repo.getFinalizeError(shootId) ?: e.message ?: "Processing could not start"
+                }
+                PipelineLog.e("finalize", "finalize failed shootId=$shootId: $msg", e)
+                _ui.value = _ui.value.copy(
+                    busy = false,
+                    finalizeState = FinalizeState.Failed,
+                    finalizeError = msg,
+                    statusLine = "Processing failed: $msg",
+                    snackbar = if (userInitiated) msg else null,
+                )
+            }
     }
 
     fun retryFailedUploads() {
@@ -516,13 +592,14 @@ class ShootViewModel(
                         WorkInfo.State.SUCCEEDED -> {
                             val pending = files.value.any { it.uploadState != "UPLOADED" }
                             _ui.value = _ui.value.copy(
-                                uploadStartState = if (pending) UploadStartState.Idle else UploadStartState.Idle,
+                                uploadStartState = UploadStartState.Idle,
                                 statusLine = if (pending) {
                                     "Upload pass finished — tap to retry remaining files."
                                 } else {
-                                    "All files uploaded — submit for processing."
+                                    "All files uploaded — starting processing…"
                                 },
                             )
+                            if (!pending) tryAutoFinalizeIfReady()
                         }
                         WorkInfo.State.FAILED -> {
                             val reason = info.outputData.getString(UploadWorker.KEY_ERROR)
@@ -584,11 +661,27 @@ class ShootViewModel(
             files.value.all { it.uploadState == "UPLOADED" }
     }
 
+    fun needsProcessingRetry(): Boolean {
+        if (_ui.value.finalizeState == FinalizeState.InProgress) return false
+        val fileList = files.value
+        if (fileList.isEmpty() || fileList.any { it.uploadState != "UPLOADED" }) return false
+        if (_ui.value.finalizeState == FinalizeState.Failed || repo.getFinalizeError(shootId) != null) {
+            return true
+        }
+        val s = shoot.value ?: return false
+        if (s.state == "FAILED") return true
+        // All bytes in S3 but server never left LOCAL (e.g. finalize 409 before backend fix).
+        return s.state in LOCAL_ONLY_STATES &&
+            s.phase.contains("MANIFEST", ignoreCase = true) &&
+            _ui.value.uploadStartState != UploadStartState.Uploading &&
+            _ui.value.uploadStartState != UploadStartState.Starting
+    }
+
     private fun recomputeStep() {
         val s = shoot.value ?: return
         val fileList = files.value
         val step = when {
-            s.state in TERMINAL || s.albumId != null -> ShootFlowStep.Results
+            s.albumId != null || (s.state in TERMINAL && s.state != "FAILED") -> ShootFlowStep.Results
             s.state !in setOf("LOCAL", "IMPORTING") && s.backendState != null -> ShootFlowStep.Processing
             fileList.isEmpty() -> ShootFlowStep.PickFiles
             else -> ShootFlowStep.Upload

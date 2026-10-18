@@ -81,6 +81,7 @@ import com.photopipeline.app.PhotoPipelineApp
 import com.photopipeline.app.ui.components.DebugLogPanel
 import com.photopipeline.app.ui.theme.PhotoPipelineTheme
 import com.photopipeline.app.upload.LiveUploadMetrics
+import com.photopipeline.app.upload.UploadEtaEstimator
 import com.photopipeline.app.upload.UploadMetricsStore
 import android.content.Intent
 import android.provider.Settings
@@ -503,25 +504,49 @@ fun ShootFlowScreen(
                         }
                         if (needRetry > 0) {
                             Text(
-                                "$needRetry file(s) need retry before submit",
+                                "$needRetry file(s) need retry before processing can start",
                                 color = MaterialTheme.colorScheme.error,
                                 style = MaterialTheme.typography.bodyMedium,
                             )
                         }
-                        FilledTonalButton(
-                            onClick = { vm.submitShoot() },
-                            modifier = Modifier.fillMaxWidth(),
-                            enabled = files.isNotEmpty() && files.all { it.uploadState == "UPLOADED" },
-                        ) {
-                            Text("Submit for processing")
+                        if (ui.finalizeState == FinalizeState.InProgress) {
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.Center,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.size(10.dp))
+                                Text("Starting server processing…", style = MaterialTheme.typography.bodyMedium)
+                            }
+                        }
+                        if (vm.needsProcessingRetry()) {
+                            ProcessingRetryBlock(
+                                error = ui.finalizeError,
+                                busy = ui.busy,
+                                onRetry = { vm.retryProcessing() },
+                            )
                         }
                     }
                 }
                 ShootFlowStep.Processing -> item {
-                    ProcessingStep(shoot = shoot, progressJson = ui.processingProgress)
+                    ProcessingStep(
+                        shoot = shoot,
+                        progressJson = ui.processingProgress,
+                        showRetry = vm.needsProcessingRetry(),
+                        finalizeError = ui.finalizeError,
+                        busy = ui.busy,
+                        onRetryProcessing = { vm.retryProcessing() },
+                    )
                 }
                 ShootFlowStep.Results -> item {
-                    ResultsStep(shoot = shoot)
+                    ResultsStep(
+                        shoot = shoot,
+                        showRetry = vm.needsProcessingRetry(),
+                        finalizeError = ui.finalizeError,
+                        busy = ui.busy,
+                        onRetryProcessing = { vm.retryProcessing() },
+                    )
                 }
             }
             item { DebugLogPanel() }
@@ -715,8 +740,9 @@ private fun UploadStep(
             Text("Queue files from the camera before uploading.", color = MaterialTheme.colorScheme.error)
         } else {
             estimateJson?.let { EstimateCard(it) }
+            OverallUploadProgressCard(files = files, metrics = metrics, uploading = uploading)
             if (uploading || metrics.filesTotal > 0) {
-                TransferMetricsCard(metrics) {
+                TransferMetricsCard(metrics, compact = true) {
                     context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
                 }
             }
@@ -768,11 +794,90 @@ private fun UploadStep(
 }
 
 @Composable
-private fun TransferMetricsCard(metrics: LiveUploadMetrics, onOpenCaptivePortal: () -> Unit) {
+private fun OverallUploadProgressCard(
+    files: List<com.photopipeline.app.data.FileEntity>,
+    metrics: LiveUploadMetrics,
+    uploading: Boolean,
+) {
+    val filesDone = if (metrics.filesTotal > 0) metrics.filesDone else files.count { it.uploadState == "UPLOADED" }
+    val filesTotal = if (metrics.filesTotal > 0) metrics.filesTotal else files.size
+    val totalBytes = files.sumOf { it.sizeBytes }.coerceAtLeast(1)
+    val bytesFromFiles = files.sumOf { it.uploadedBytes }
+    val bytesSent = when {
+        uploading && metrics.totalBytes > 0 -> maxOf(metrics.bytesSent, bytesFromFiles)
+        else -> bytesFromFiles
+    }
+    val remaining = (totalBytes - bytesSent).coerceAtLeast(0)
+    val etaSeconds = UploadEtaEstimator.estimateSeconds(remaining, metrics.currentBps, metrics.averageBps)
+    val byteProgress = bytesSent.toFloat() / totalBytes
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Upload progress", style = MaterialTheme.typography.titleMedium)
+            LinearProgressIndicator(
+                progress = { byteProgress.coerceIn(0f, 1f) },
+                modifier = Modifier.fillMaxWidth().height(10.dp),
+            )
+            Text(
+                "${formatBytes(bytesSent)} / ${formatBytes(totalBytes)} · $filesDone / $filesTotal files",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Now ${formatMbps(metrics.currentBps)}", style = MaterialTheme.typography.bodySmall)
+                etaSeconds?.let {
+                    Text(
+                        if (it <= 0L) "Finishing…" else "ETA ~${it / 60}m ${it % 60}s",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun formatBytes(n: Long): String = when {
+    n >= 1_000_000_000 -> "%.2f GB".format(n / 1_000_000_000.0)
+    n >= 1_000_000 -> "%.1f MB".format(n / 1_000_000.0)
+    n >= 1_000 -> "%.0f KB".format(n / 1_000.0)
+    else -> "$n B"
+}
+
+@Composable
+private fun ProcessingRetryBlock(
+    error: String?,
+    busy: Boolean,
+    onRetry: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        error?.let {
+            Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        }
+        FilledTonalButton(onClick = onRetry, modifier = Modifier.fillMaxWidth(), enabled = !busy) {
+            Text("Retry processing")
+        }
+        Text(
+            "Files are already in S3 — no camera needed.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun TransferMetricsCard(
+    metrics: LiveUploadMetrics,
+    compact: Boolean = false,
+    onOpenCaptivePortal: () -> Unit,
+) {
     val net = metrics.network
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Transfer metrics", style = MaterialTheme.typography.titleSmall)
+            Text(
+                if (compact) "Network & acceleration" else "Transfer metrics",
+                style = MaterialTheme.typography.titleSmall,
+            )
             net?.let {
                 Text("Network: ${it.type} · validated=${it.validated} · metered=${it.metered}")
                 if (it.captivePortal) {
@@ -788,11 +893,12 @@ private fun TransferMetricsCard(metrics: LiveUploadMetrics, onOpenCaptivePortal:
                 "Speed now ${formatMbps(metrics.currentBps)} · avg ${formatMbps(metrics.averageBps)} · peak ${formatMbps(metrics.peakBps)}",
                 style = MaterialTheme.typography.bodySmall,
             )
-            Text(
-                "Sent ${metrics.bytesSent}/${metrics.totalBytes} bytes · files ${metrics.filesDone}/${metrics.filesTotal} · parts ${metrics.partsDone}/${metrics.partsTotal}",
-                style = MaterialTheme.typography.bodySmall,
-            )
-            metrics.etaSeconds?.let { Text("ETA ~${it / 60}m ${it % 60}s", style = MaterialTheme.typography.bodySmall) }
+            if (!compact) {
+                Text(
+                    "Sent ${metrics.bytesSent}/${metrics.totalBytes} bytes · files ${metrics.filesDone}/${metrics.filesTotal} · parts ${metrics.partsDone}/${metrics.partsTotal}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
             metrics.lastError?.let { Text("Last error: $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             metrics.pausedReason?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             SpeedSparkline(metrics.speedHistoryBps)
@@ -819,7 +925,14 @@ private fun SpeedSparkline(samples: List<Long>) {
 }
 
 @Composable
-private fun ProcessingStep(shoot: ShootEntity?, progressJson: String?) {
+private fun ProcessingStep(
+    shoot: ShootEntity?,
+    progressJson: String?,
+    showRetry: Boolean,
+    finalizeError: String?,
+    busy: Boolean,
+    onRetryProcessing: () -> Unit,
+) {
     shoot ?: return
     val phases = listOf("IMPORT", "ESTIMATE", "UPLOAD", "MANIFEST", "RENDER", "PUBLISH", "DONE")
     val phase = shoot.phase.uppercase()
@@ -835,23 +948,46 @@ private fun ProcessingStep(shoot: ShootEntity?, progressJson: String?) {
             val o = JSONObject(it)
             Text("Compute: ${o.optInt("seconds")}s · ~$${o.optDouble("usd")}")
         }
+        if (showRetry) {
+            ProcessingRetryBlock(error = finalizeError, busy = busy, onRetry = onRetryProcessing)
+        }
     }
 }
 
 @Composable
-private fun ResultsStep(shoot: ShootEntity?) {
+private fun ResultsStep(
+    shoot: ShootEntity?,
+    showRetry: Boolean,
+    finalizeError: String?,
+    busy: Boolean,
+    onRetryProcessing: () -> Unit,
+) {
     shoot ?: return
+    val failed = shoot.state == "FAILED"
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+        colors = CardDefaults.cardColors(
+            containerColor = if (failed) {
+                MaterialTheme.colorScheme.errorContainer
+            } else {
+                MaterialTheme.colorScheme.primaryContainer
+            },
+        ),
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+            if (!failed) {
+                Icon(Icons.Default.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+            }
             Text("Shoot ${humanShootState(shoot).lowercase()}", style = MaterialTheme.typography.titleMedium)
-            shoot.albumId?.let {
-                Text("Google Photos album id: $it")
+            if (shoot.albumId != null) {
+                Text("Google Photos album id: ${shoot.albumId}")
                 Text("Open Google Photos and search your library for this album.", style = MaterialTheme.typography.bodySmall)
-            } ?: Text("Album link will appear when processing finishes.")
+            } else if (!failed) {
+                Text("Album link will appear when processing finishes.")
+            }
+            if (showRetry) {
+                ProcessingRetryBlock(error = finalizeError, busy = busy, onRetry = onRetryProcessing)
+            }
         }
     }
 }
@@ -1049,23 +1185,37 @@ fun UploadProgressSection(
     showRetryButton: Boolean = true,
 ) {
     if (files.isEmpty()) return
-    val done = files.count { it.uploadState == "UPLOADED" }
-    val totalBytes = files.sumOf { it.sizeBytes }.coerceAtLeast(1)
-    val uploadedBytes = files.sumOf { it.uploadedBytes }
     Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Upload $done / ${files.size}", style = MaterialTheme.typography.titleSmall)
-            LinearProgressIndicator(
-                progress = { uploadedBytes.toFloat() / totalBytes },
-                modifier = Modifier.fillMaxWidth(),
-            )
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Files", style = MaterialTheme.typography.titleSmall)
             files.forEach { f ->
                 val pct = if (f.sizeBytes > 0) f.uploadedBytes.toFloat() / f.sizeBytes else 0f
-                Text(
-                    "${f.originalName}: ${f.uploadState} ${(pct * 100).toInt()}% · ${f.uploadSpeedBps / 1024} KB/s",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                f.lastError?.let { Text("Error: $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            f.originalName,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f),
+                            maxLines = 1,
+                        )
+                        Text(
+                            f.uploadState,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    LinearProgressIndicator(
+                        progress = { pct.coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth().height(4.dp),
+                    )
+                    f.lastError?.let {
+                        Text("Error: $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+                    }
+                }
             }
             if (showRetryButton && files.any { it.uploadState == "FAILED" }) {
                 FilledTonalButton(onClick = onRetry) { Text("Retry failed uploads") }

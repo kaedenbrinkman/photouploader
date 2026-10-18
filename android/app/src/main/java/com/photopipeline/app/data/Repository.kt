@@ -546,12 +546,39 @@ class Repository(
         db.shootDao().upsert(shoot.copy(phase = "MANIFEST_UPLOADED"))
     }
 
-    suspend fun submitShoot(shootId: String) {
+    fun getFinalizeError(shootId: String): String? =
+        prefs.getString(finalizeErrorKey(shootId), null)
+
+    fun clearFinalizeError(shootId: String) {
+        prefs.edit().remove(finalizeErrorKey(shootId)).apply()
+    }
+
+    private fun setFinalizeError(shootId: String, message: String) {
+        prefs.edit().putString(finalizeErrorKey(shootId), message).apply()
+    }
+
+    private fun finalizeErrorKey(shootId: String): String = "shoot_finalize_error_$shootId"
+
+    /** Manifest + finalize only — no camera / MTP (files already in S3). */
+    suspend fun finalizeShootForProcessing(shootId: String) {
         requireBackendReady()
         ensureServerShoot(shootId)
         uploadManifestIfReady(shootId)
-        api.finalizeShoot(shootId)
+        try {
+            api.finalizeShoot(shootId)
+            clearFinalizeError(shootId)
+        } catch (e: ApiRequestException) {
+            val msg = e.message ?: "Finalize failed (HTTP ${e.httpCode ?: "?"})"
+            setFinalizeError(shootId, msg)
+            throw e
+        } catch (e: Exception) {
+            val msg = e.message ?: "Finalize failed"
+            setFinalizeError(shootId, msg)
+            throw e
+        }
     }
+
+    suspend fun submitShoot(shootId: String) = finalizeShootForProcessing(shootId)
 
     suspend fun refreshBackendStatus(shootId: String) {
         if (!canUseBackendApi()) return

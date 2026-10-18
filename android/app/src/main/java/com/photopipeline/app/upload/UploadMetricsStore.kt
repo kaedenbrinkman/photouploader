@@ -44,6 +44,7 @@ object UploadMetricsStore {
 
     fun clear() {
         speedHistory.clear()
+        UploadEtaEstimator.reset()
         _metrics.value = LiveUploadMetrics()
     }
 }
