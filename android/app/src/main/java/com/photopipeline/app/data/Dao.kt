@@ -20,6 +20,9 @@ interface ShootDao {
 
     @Update
     suspend fun update(shoot: ShootEntity)
+
+    @Query("DELETE FROM shoots WHERE shootId = :id")
+    suspend fun delete(id: String)
 }
 
 @Dao
@@ -41,4 +44,7 @@ interface FileDao {
 
     @Query("DELETE FROM files WHERE identityKey = :key")
     suspend fun delete(key: String)
+
+    @Query("DELETE FROM files WHERE shootId = :shootId")
+    suspend fun deleteForShoot(shootId: String)
 }

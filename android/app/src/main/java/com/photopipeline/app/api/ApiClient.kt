@@ -44,12 +44,37 @@ class ApiClient(
         }
     }
 
-    suspend fun ensureServerShoot(shootId: String, albumTitle: String): Unit = onIo {
+    suspend fun deleteShoot(shootId: String) = onIo {
+        val req = authorizedRequest("/shoots/$shootId").delete().build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) failHttp("delete_shoot", resp)
+        }
+    }
+
+    suspend fun abortMultipart(
+        shootId: String,
+        uploadId: String,
+        key: String,
+        transferAcceleration: Boolean = false,
+    ) = onIo {
         val body = JSONObject()
-            .put("action", "create_shoot")
-            .put("shootId", shootId)
-            .put("albumTitle", albumTitle)
+            .put("action", "abort_multipart")
+            .put("uploadId", uploadId)
+            .put("key", key)
+            .putTransferAcceleration(transferAcceleration)
             .toString()
+        val req = authorizedRequest("/shoots/$shootId/presign").post(body.toRequestBody(JSON)).build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) failHttp("abort_multipart", resp)
+        }
+    }
+
+    suspend fun ensureServerShoot(shootId: String, albumTitle: String): Unit = onIo {
+        val body = JSONObject().apply {
+            put("action", "create_shoot")
+            put("shootId", shootId)
+            put("albumTitle", albumTitle)
+        }.toString()
         val req = authorizedRequest("/shoots").post(body.toRequestBody(JSON)).build()
         client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) {

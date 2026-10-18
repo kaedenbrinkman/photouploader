@@ -6,6 +6,7 @@ import android.content.Context
 import androidx.work.CoroutineWorker
 import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import com.photopipeline.app.PhotoPipelineApp
 import com.photopipeline.app.api.ApiRequestException
 import com.photopipeline.app.core.PipelineLog
@@ -142,7 +143,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             )
         }
         promoteToForeground(usesCameraStream)
-        return Result.failure()
+        return Result.failure(workDataOf(KEY_ERROR to reason))
     }
 
     private fun uploadFailureMessage(e: Exception): String = when (e) {
@@ -288,5 +289,6 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
     companion object {
         private val OCTET = "application/octet-stream".toMediaType()
         const val KEY_USES_CAMERA_STREAM = "usesCameraStream"
+        const val KEY_ERROR = "error"
     }
 }

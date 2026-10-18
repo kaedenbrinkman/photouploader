@@ -24,7 +24,10 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -37,7 +40,11 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -119,6 +126,7 @@ fun PhotoPipelineNavHost(repository: Repository, usbCameraManager: UsbCameraMana
                 usb = usbCameraManager,
                 shootId = shootId,
                 onBack = { nav.popBackStack() },
+                onDeleted = { nav.popBackStack() },
             )
         }
     }
@@ -189,7 +197,7 @@ fun HomeScreen(
                     icon = { Icon(Icons.Default.CameraAlt, null) },
                     line1 = usbStatusMessage(usbState),
                     line2 = if (usbState == UsbAccessState.PERMISSION_REQUIRED) {
-                        "Open a shoot and tap Connect to grant USB access."
+                        "Start a shoot — USB access is requested automatically."
                     } else {
                         "Canon R8 via USB — use a data-capable cable."
                     },
@@ -264,7 +272,12 @@ fun HomeScreen(
                 }
             }
             items(shoots, key = { it.shootId }) { s ->
-                ShootListCard(shoot = s, onClick = { onOpenShoot(s.shootId) })
+                ShootListCard(
+                    shoot = s,
+                    repository = repository,
+                    onClick = { onOpenShoot(s.shootId) },
+                    onDeleted = { /* list refreshes via Flow */ },
+                )
             }
             item { DebugLogPanel() }
         }
@@ -295,18 +308,65 @@ private fun StatusCard(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ShootListCard(shoot: ShootEntity, onClick: () -> Unit) {
+private fun ShootListCard(
+    shoot: ShootEntity,
+    repository: Repository,
+    onClick: () -> Unit,
+    onDeleted: () -> Unit,
+) {
     val fmt = remember { SimpleDateFormat("MMM d, yyyy · HH:mm", Locale.getDefault()) }
+    val scope = rememberCoroutineScope()
+    var menuOpen by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
     Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(shoot.albumTitle.ifBlank { shoot.shootId.take(8) }, style = MaterialTheme.typography.titleMedium)
-            Text(humanShootState(shoot), style = MaterialTheme.typography.bodyMedium)
-            Text(
-                "${shoot.imageCount} files · ${fmt.format(Date(shoot.createdAt))}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+        Row(
+            Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(shoot.albumTitle.ifBlank { shoot.shootId.take(8) }, style = MaterialTheme.typography.titleMedium)
+                Text(humanShootState(shoot), style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    "${shoot.imageCount} files · ${fmt.format(Date(shoot.createdAt))}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            IconButton(onClick = { menuOpen = true }) {
+                Icon(Icons.Default.MoreVert, contentDescription = "Shoot actions")
+            }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("Delete shoot") },
+                    onClick = {
+                        menuOpen = false
+                        confirmDelete = true
+                    },
+                    leadingIcon = { Icon(Icons.Default.Delete, null) },
+                )
+            }
         }
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete shoot?") },
+            text = { Text("This cancels any upload, removes files from S3 and the server, and deletes local data.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmDelete = false
+                        scope.launch {
+                            runCatching { repository.deleteShootCompletely(shoot.shootId) }
+                            onDeleted()
+                        }
+                    },
+                ) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
+            },
+        )
     }
 }
 
@@ -317,6 +377,7 @@ fun ShootFlowScreen(
     usb: UsbCameraManager,
     shootId: String,
     onBack: () -> Unit,
+    onDeleted: () -> Unit,
 ) {
     val vm: ShootViewModel = viewModel(
         factory = ShootViewModel.factory(repository, usb, androidx.compose.ui.platform.LocalContext.current, shootId),
@@ -329,9 +390,12 @@ fun ShootFlowScreen(
     val snackbarHost = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
-    LaunchedEffect(ui.step) {
-        if (ui.step == ShootFlowStep.Upload) vm.ensureCameraForUpload()
+    LaunchedEffect(usbState) {
+        vm.onUsbAccessChanged(usbState)
     }
+    var overflowOpen by remember { mutableStateOf(false) }
+    var confirmCancel by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
     LaunchedEffect(ui.snackbar) {
         ui.snackbar?.let { msg ->
             snackbarHost.showSnackbar(msg)
@@ -347,6 +411,29 @@ fun ShootFlowScreen(
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    IconButton(onClick = { overflowOpen = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "Shoot menu")
+                    }
+                    DropdownMenu(expanded = overflowOpen, onDismissRequest = { overflowOpen = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Cancel upload") },
+                            onClick = {
+                                overflowOpen = false
+                                confirmCancel = true
+                            },
+                            leadingIcon = { Icon(Icons.Default.Stop, null) },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Delete shoot") },
+                            onClick = {
+                                overflowOpen = false
+                                confirmDelete = true
+                            },
+                            leadingIcon = { Icon(Icons.Default.Delete, null) },
+                        )
                     }
                 },
             )
@@ -376,14 +463,7 @@ fun ShootFlowScreen(
                 item { BackendGateCard(ui.backendGateMessage) }
             }
             when (ui.step) {
-                ShootFlowStep.Connect -> item {
-                    ConnectStep(
-                        onRefresh = { vm.refreshUsbProbe() },
-                        onConnect = { vm.connectAndListCamera() },
-                        busy = ui.busy,
-                    )
-                }
-                ShootFlowStep.SelectFiles -> item {
+                ShootFlowStep.PickFiles -> item {
                     SelectFilesStep(
                         ui = ui,
                         imported = files,
@@ -392,28 +472,27 @@ fun ShootFlowScreen(
                         busy = ui.busy,
                     )
                 }
-                ShootFlowStep.Estimate -> item {
-                    EstimateStep(
-                        files = files,
-                        estimateJson = shoot?.estimateJson,
-                        onEstimate = { vm.loadEstimate() },
-                        busy = ui.busy,
-                    )
-                }
                 ShootFlowStep.Upload -> {
                     item {
-                        Text(
-                            "Keep the camera USB connected until every file finishes uploading.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
+                        if (ui.isResumeShoot) {
+                            ResumeUploadIntro(files = files, usbState = usbState)
+                        } else {
+                            Text(
+                                "Keep USB connected until every file finishes uploading.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
                     }
                     item {
                         UploadStep(
                             files = files,
                             metrics = uploadMetrics,
                             estimateJson = shoot?.estimateJson,
-                            onUpload = { vm.startUpload() },
+                            ui = ui,
+                            usbState = usbState,
+                            onStart = { vm.startUpload() },
+                            onResume = { vm.connectAndResumeUpload() },
                             onRetry = { vm.retryFailedUploads() },
                         )
                     }
@@ -437,14 +516,41 @@ fun ShootFlowScreen(
             item { DebugLogPanel() }
         }
     }
+    if (confirmCancel) {
+        AlertDialog(
+            onDismissRequest = { confirmCancel = false },
+            title = { Text("Cancel upload?") },
+            text = { Text("Stops the upload worker and aborts in-progress S3 multipart uploads for this shoot.") },
+            confirmButton = {
+                TextButton(onClick = { confirmCancel = false; vm.cancelUpload() }) { Text("Cancel upload") }
+            },
+            dismissButton = { TextButton(onClick = { confirmCancel = false }) { Text("Keep uploading") } },
+        )
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete shoot?") },
+            text = { Text("Removes this shoot locally and on the server (S3 + DynamoDB).") },
+            confirmButton = {
+                TextButton(onClick = { confirmDelete = false; vm.deleteShoot(onDeleted) }) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } },
+        )
+    }
 }
 
 @Composable
 private fun FlowStepper(current: ShootFlowStep) {
-    val labels = listOf("Connect", "Files", "Estimate", "Upload", "Process", "Done")
-    val index = current.ordinal.coerceIn(0, labels.lastIndex)
+    val labels = listOf("Select", "Upload", "Process", "Done")
+    val index = when (current) {
+        ShootFlowStep.PickFiles -> 0
+        ShootFlowStep.Upload -> 1
+        ShootFlowStep.Processing -> 2
+        ShootFlowStep.Results -> 3
+    }
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text("Step ${index + 1} of ${labels.size}: ${labels[index]}", style = MaterialTheme.typography.labelLarge)
+        Text("${labels[index]} · step ${index + 1} of ${labels.size}", style = MaterialTheme.typography.labelLarge)
         LinearProgressIndicator(
             progress = { (index + 1).toFloat() / labels.size },
             modifier = Modifier.fillMaxWidth(),
@@ -453,22 +559,22 @@ private fun FlowStepper(current: ShootFlowStep) {
 }
 
 @Composable
-private fun ConnectStep(onRefresh: () -> Unit, onConnect: () -> Unit, busy: Boolean) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+private fun ResumeUploadIntro(
+    files: List<com.photopipeline.app.data.FileEntity>,
+    usbState: UsbAccessState,
+) {
+    val pending = files.count { it.uploadState != "UPLOADED" }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("Resume shoot", style = MaterialTheme.typography.titleMedium)
         Text(
-            "Plug in the camera, then connect. If Android shows “View files”, choose Photo Pipeline when asked.",
+            "$pending of ${files.size} files still need upload. We rematch camera files by name and size when USB reconnects.",
             style = MaterialTheme.typography.bodyMedium,
         )
-        FilledTonalButton(onClick = onRefresh, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
-            Text("Refresh USB scan")
-        }
-        Button(onClick = onConnect, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
-            if (busy) {
-                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                Spacer(Modifier.size(8.dp))
-            }
-            Text("Connect & list files")
-        }
+        Text(
+            "USB: ${usbStatusMessage(usbState)}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -530,7 +636,11 @@ private fun SelectFilesStep(
             Text("Use selection above")
         }
         Button(onClick = onImport, enabled = !busy && ui.selectedHandles.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
-            Text("Queue selected for upload")
+            if (busy) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.size(8.dp))
+            }
+            Text("Upload ${ui.selectedHandles.size} selected files")
         }
     }
 }
@@ -580,20 +690,55 @@ private fun UploadStep(
     files: List<com.photopipeline.app.data.FileEntity>,
     metrics: LiveUploadMetrics,
     estimateJson: String?,
-    onUpload: () -> Unit,
+    ui: ShootUiState,
+    usbState: UsbAccessState,
+    onStart: () -> Unit,
+    onResume: () -> Unit,
     onRetry: () -> Unit,
 ) {
     val context = LocalContext.current
+    val uploading = ui.uploadStartState == UploadStartState.Uploading ||
+        ui.uploadStartState == UploadStartState.Starting
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (files.isEmpty()) {
             Text("Queue files from the camera before uploading.", color = MaterialTheme.colorScheme.error)
         } else {
             estimateJson?.let { EstimateCard(it) }
-            TransferMetricsCard(metrics) {
-                context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
+            if (uploading || metrics.filesTotal > 0) {
+                TransferMetricsCard(metrics) {
+                    context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
+                }
             }
-            Button(onClick = onUpload, modifier = Modifier.fillMaxWidth()) {
-                Text("Start camera → S3 upload")
+            ui.uploadFailedReason?.let {
+                Text("Failed: $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+            }
+            val primaryLabel = when (ui.uploadStartState) {
+                UploadStartState.Starting -> "Starting…"
+                UploadStartState.Uploading -> "Uploading…"
+                UploadStartState.Failed -> if (ui.isResumeShoot) "Connect & resume upload" else "Retry upload"
+                UploadStartState.Idle -> when {
+                    ui.isResumeShoot && usbState != UsbAccessState.READY -> "Connect & resume upload"
+                    ui.isResumeShoot -> "Resume upload"
+                    else -> "Start camera → S3 upload"
+                }
+            }
+            val primaryAction = when {
+                ui.isResumeShoot && ui.uploadStartState == UploadStartState.Failed -> onResume
+                ui.isResumeShoot && usbState != UsbAccessState.READY -> onResume
+                ui.isResumeShoot && ui.uploadStartState == UploadStartState.Idle -> onResume
+                ui.uploadStartState == UploadStartState.Failed -> onRetry
+                else -> onStart
+            }
+            Button(
+                onClick = primaryAction,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !uploading && !ui.busy,
+            ) {
+                if (uploading || ui.uploadStartState == UploadStartState.Starting) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.size(8.dp))
+                }
+                Text(primaryLabel)
             }
             UploadProgressSection(files, onRetry)
         }

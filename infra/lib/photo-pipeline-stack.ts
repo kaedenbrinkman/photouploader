@@ -158,6 +158,14 @@ export class PhotoPipelineStack extends cdk.Stack {
     bucket.grantRead(statusFn);
     table.grantReadData(statusFn);
 
+    const deleteShootFn = new lambdaNode.NodejsFunction(this, 'DeleteShootFn', {
+      ...lambdaDefaults,
+      entry: path.join(__dirname, '../lambda/delete-shoot.ts'),
+      timeout: cdk.Duration.seconds(120),
+    });
+    bucket.grantReadWrite(deleteShootFn);
+    table.grantReadWriteData(deleteShootFn);
+
     const estimateFn = new lambdaNode.NodejsFunction(this, 'EstimateFn', {
       ...lambdaDefaults,
       entry: path.join(__dirname, '../lambda/estimate.ts'),
@@ -261,6 +269,12 @@ export class PhotoPipelineStack extends cdk.Stack {
       path: '/shoots/{shootId}/status',
       methods: [apigwv2.HttpMethod.GET],
       integration: new apigwIntegrations.HttpLambdaIntegration('Status', statusFn),
+      ...jwtRoutes,
+    });
+    httpApi.addRoutes({
+      path: '/shoots/{shootId}',
+      methods: [apigwv2.HttpMethod.DELETE],
+      integration: new apigwIntegrations.HttpLambdaIntegration('DeleteShoot', deleteShootFn),
       ...jwtRoutes,
     });
     httpApi.addRoutes({

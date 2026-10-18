@@ -1,6 +1,7 @@
 import { ConditionalCheckFailedException, DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import {
+  AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
   ListPartsCommand,
@@ -158,6 +159,19 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
       }),
     );
     return json(200, { key, completed: true, transferAcceleration: accelerated });
+  }
+
+  if (action === 'abort_multipart') {
+    const { uploadId, key } = body;
+    if (!uploadId || !key) return json(400, { error: 'missing fields' });
+    await s3For(body).send(
+      new AbortMultipartUploadCommand({
+        Bucket: process.env.BUCKET_NAME!,
+        Key: key,
+        UploadId: uploadId,
+      }),
+    );
+    return json(200, { aborted: true, key, uploadId });
   }
 
   if (action === 'create_multipart') {

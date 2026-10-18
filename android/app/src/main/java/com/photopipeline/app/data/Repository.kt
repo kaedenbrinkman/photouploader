@@ -5,6 +5,7 @@ import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.workDataOf
+import com.photopipeline.app.upload.UploadMetricsStore
 import com.photopipeline.app.api.ApiClient
 import com.photopipeline.app.api.NotSignedInException
 import com.photopipeline.app.core.AppDefaults
@@ -575,6 +576,55 @@ class Repository(
 
     fun processingProgressJson(shootId: String): String? =
         prefs.getString("shoot_progress_$shootId", null)
+
+    fun uploadWorkName(shootId: String): String = "upload-$shootId"
+
+    suspend fun cancelUploadForShoot(shootId: String) {
+        WorkManager.getInstance(appContext).cancelUniqueWork(uploadWorkName(shootId))
+        val files = db.fileDao().observeForShoot(shootId).first()
+        val accel = uploadPreferences.transferAcceleration
+        for (f in files) {
+            if (
+                !f.s3UploadId.isNullOrBlank() &&
+                !f.s3Key.isNullOrBlank() &&
+                f.uploadState != "UPLOADED"
+            ) {
+                runCatching { api.abortMultipart(shootId, f.s3UploadId!!, f.s3Key!!, accel) }
+                    .onFailure { e ->
+                        PipelineLog.w("upload", "abort multipart ${f.originalName}: ${e.message}", e)
+                    }
+            }
+            if (f.uploadState != "UPLOADED") {
+                db.fileDao().upsert(
+                    f.copy(
+                        uploadState = "PENDING",
+                        s3UploadId = null,
+                        s3Key = null,
+                        uploadPartsJson = "[]",
+                        uploadedBytes = 0,
+                        uploadSpeedBps = 0,
+                        lastError = null,
+                    ),
+                )
+            }
+        }
+        UploadMetricsStore.clear()
+        PipelineLog.i("upload", "Cancelled upload work for shoot $shootId")
+    }
+
+    suspend fun deleteShootCompletely(shootId: String) {
+        cancelUploadForShoot(shootId)
+        if (canUseBackendApi() && isServerShootRegistered(shootId)) {
+            api.deleteShoot(shootId)
+        }
+        db.fileDao().deleteForShoot(shootId)
+        db.shootDao().delete(shootId)
+        prefs.edit()
+            .remove(serverShootRegisteredKey(shootId))
+            .remove("shoot_progress_$shootId")
+            .apply()
+        PipelineLog.i("upload", "Deleted shoot $shootId locally and on server")
+    }
 
     suspend fun enqueueUploads(shootId: String) {
         requireBackendReady()
