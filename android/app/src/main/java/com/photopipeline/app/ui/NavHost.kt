@@ -45,6 +45,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -81,6 +82,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.DisposableEffect
+import com.photopipeline.app.auth.GoogleAuthCoordinator
 import com.photopipeline.app.auth.GoogleSignInHelper
 import com.photopipeline.app.core.AppDefaults
 import androidx.compose.foundation.background
@@ -139,16 +141,25 @@ fun HomeScreen(
     val activity = context as ComponentActivity
     val scope = rememberCoroutineScope()
     var linked by remember { mutableStateOf(repository.isGoogleAccountLinked()) }
-    var signInHelperRef by remember { mutableStateOf<GoogleSignInHelper?>(null) }
+    var authError by remember { mutableStateOf("") }
     val googleLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult(),
     ) { result ->
-        signInHelperRef?.onAuthorizationResult(result.data)
+        GoogleAuthCoordinator.deliverActivityResult(result.resultCode, result.data)
     }
     val signInHelper = remember(activity) {
-        GoogleSignInHelper(activity, repository, scope, googleLauncher) {
-            linked = repository.isGoogleAccountLinked()
-        }.also { signInHelperRef = it }
+        GoogleSignInHelper(
+            activity = activity,
+            repository = repository,
+            scope = scope,
+            authorizationLauncher = googleLauncher,
+            onAuthFinished = { linked = repository.isGoogleAccountLinked() },
+            onAuthError = { authError = it },
+        )
+    }
+    DisposableEffect(signInHelper) {
+        signInHelper.bindCoordinator()
+        onDispose { signInHelper.unbindCoordinator() }
     }
 
     Scaffold(
@@ -201,6 +212,15 @@ fun HomeScreen(
                         "Connect once to upload RAW and publish finished JPEGs to Google Photos."
                     },
                 )
+            }
+            if (authError.isNotBlank()) {
+                item {
+                    Text(
+                        authError,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
             }
             item {
                 if (linked) {
@@ -674,14 +694,24 @@ fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
     var apiBase by remember { mutableStateOf(repository.apiBaseUrl()) }
     var googleClientId by remember { mutableStateOf(repository.googleWebClientId()) }
     val scope = rememberCoroutineScope()
-    var signInHelperRef by remember { mutableStateOf<GoogleSignInHelper?>(null) }
+    var authError by remember { mutableStateOf("") }
     val googleLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult(),
     ) { result ->
-        signInHelperRef?.onAuthorizationResult(result.data)
+        GoogleAuthCoordinator.deliverActivityResult(result.resultCode, result.data)
     }
     val signInHelper = remember(activity) {
-        GoogleSignInHelper(activity, repository, scope, googleLauncher).also { signInHelperRef = it }
+        GoogleSignInHelper(
+            activity = activity,
+            repository = repository,
+            scope = scope,
+            authorizationLauncher = googleLauncher,
+            onAuthError = { authError = it },
+        )
+    }
+    DisposableEffect(signInHelper) {
+        signInHelper.bindCoordinator()
+        onDispose { signInHelper.unbindCoordinator() }
     }
     var wifiOnly by remember { mutableStateOf(prefs.wifiOnly) }
     var allowCellular by remember { mutableStateOf(prefs.allowCellular) }
@@ -716,6 +746,9 @@ fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
                 label = { Text("Google Web OAuth client ID") },
                 modifier = Modifier.fillMaxWidth(),
             )
+            if (authError.isNotBlank()) {
+                Text(authError, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            }
             if (!repository.isGoogleAccountLinked()) {
                 Button(
                     onClick = { signInHelper.start() },

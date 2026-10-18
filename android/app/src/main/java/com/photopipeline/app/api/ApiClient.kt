@@ -1,5 +1,6 @@
 package com.photopipeline.app.api
 
+import com.photopipeline.app.core.PipelineLog
 import com.photopipeline.app.upload.UploadPart
 import com.squareup.moshi.JsonAdapter
 import com.squareup.moshi.Moshi
@@ -184,7 +185,10 @@ class ApiClient(
             .post(body.toRequestBody(JSON))
             .build()
         return client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) throw ApiRequestException("auth exchange failed: ${resp.code}", resp.code)
+            PipelineLog.i("auth", "POST /auth/google HTTP ${resp.code}")
+            if (!resp.isSuccessful) {
+                throw ApiRequestException("auth exchange failed: ${resp.code}", resp.code)
+            }
             val json = JSONObject(resp.body!!.string())
             GoogleAuthResponse(
                 sessionToken = json.getString("sessionToken"),

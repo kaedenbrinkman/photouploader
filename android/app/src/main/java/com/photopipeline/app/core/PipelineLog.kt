@@ -7,6 +7,11 @@ import com.photopipeline.app.mtp.UsbDebugLog
 object PipelineLog {
     private const val TAG = "PhotoPipeline"
 
+    fun i(step: String, message: String) {
+        Log.i(TAG, "[$step] $message")
+        UsbDebugLog.log("[$step] $message")
+    }
+
     fun d(step: String, message: String) {
         Log.d(TAG, "[$step] $message")
         UsbDebugLog.log("[$step] $message")

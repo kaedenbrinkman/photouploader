@@ -32,9 +32,9 @@ fun DebugLogPanel(modifier: Modifier = Modifier) {
             Modifier.fillMaxWidth().padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("USB debug log", style = MaterialTheme.typography.titleSmall)
+            Text("Debug log (USB + auth)", style = MaterialTheme.typography.titleSmall)
             Text(
-                if (lines.isEmpty()) "No USB events yet." else lines.joinToString("\n"),
+                if (lines.isEmpty()) "No events yet — connect camera or sign in to Google." else lines.joinToString("\n"),
                 style = MaterialTheme.typography.bodySmall,
                 fontFamily = FontFamily.Monospace,
                 modifier = Modifier
