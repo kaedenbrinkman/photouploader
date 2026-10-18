@@ -175,15 +175,9 @@ class ApiClient(
         }
     }
 
-    suspend fun exchangeGoogleAuth(
-        code: String,
-        codeVerifier: String,
-        redirectUri: String,
-    ): GoogleAuthResponse {
+    suspend fun exchangeGoogleAuth(serverAuthCode: String): GoogleAuthResponse {
         val body = JSONObject()
-            .put("code", code)
-            .put("codeVerifier", codeVerifier)
-            .put("redirectUri", redirectUri)
+            .put("serverAuthCode", serverAuthCode)
             .toString()
         val req = Request.Builder()
             .url("$baseUrl/auth/google")

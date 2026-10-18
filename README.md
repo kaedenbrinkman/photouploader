@@ -93,7 +93,7 @@ Reproducible bootstrap: `worker/ami/bootstrap.sh` (LightCraft **31a677fe**, Rust
 - `POST /shoots`, `POST /shoots/{id}/presign` — multipart presigns.
 - `POST /shoots/{id}/finalize` — verify manifest, launch EC2 (spot → on-demand fallback).
 - `GET /shoots/{id}/status` — shoot phase, per-file states, actual compute cost after done.
-- `POST /auth/google` — exchange Google auth code + PKCE; returns session JWT; stores refresh token per Google `sub` in SSM.
+- `POST /auth/google` — exchange Android **server auth code** (GIS offline access); returns session JWT; stores refresh token per Google `sub` in SSM.
 
 ## Android app
 

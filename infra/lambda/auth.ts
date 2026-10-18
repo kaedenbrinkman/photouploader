@@ -25,11 +25,9 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
   }
 
   const body = event.body ? JSON.parse(event.body) : {};
-  const code = String(body.code ?? '');
-  const codeVerifier = String(body.codeVerifier ?? '');
-  const redirectUri = String(body.redirectUri ?? '');
-  if (!code || !codeVerifier || !redirectUri) {
-    return json(400, { error: 'code, codeVerifier, and redirectUri required' });
+  const serverAuthCode = String(body.serverAuthCode ?? '');
+  if (!serverAuthCode) {
+    return json(400, { error: 'serverAuthCode required' });
   }
 
   const clientJson = await loadGoogleClient();
@@ -43,12 +41,11 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      code,
+      code: serverAuthCode,
       client_id: clientId,
       client_secret: clientSecret,
-      redirect_uri: redirectUri,
+      redirect_uri: '',
       grant_type: 'authorization_code',
-      code_verifier: codeVerifier,
     }),
   });
   if (!tokenRes.ok) {
@@ -60,8 +57,8 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     refresh_token?: string;
     access_token?: string;
   };
-  const profile = parseIdToken(tokens.id_token);
-  if (!profile?.sub) return json(502, { error: 'missing id_token sub' });
+  const profile = await resolveProfile(tokens, clientId);
+  if (!profile?.sub) return json(502, { error: 'could not resolve google user id' });
 
   if (tokens.refresh_token) {
     const secretPayload = JSON.stringify({
@@ -105,12 +102,43 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
   });
 };
 
-function parseIdToken(idToken?: string): { sub?: string; email?: string } | undefined {
+async function resolveProfile(
+  tokens: { id_token?: string; access_token?: string },
+  clientId: string,
+): Promise<{ sub?: string; email?: string } | undefined> {
+  const fromId = parseAndVerifyIdToken(tokens.id_token, clientId);
+  if (fromId?.sub) return fromId;
+  if (tokens.access_token) {
+    return fetchUserInfo(tokens.access_token);
+  }
+  return undefined;
+}
+
+function parseAndVerifyIdToken(
+  idToken: string | undefined,
+  clientId: string,
+): { sub?: string; email?: string } | undefined {
   if (!idToken) return undefined;
   const parts = idToken.split('.');
   if (parts.length < 2) return undefined;
-  const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+  const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as {
+    sub?: string;
+    email?: string;
+    aud?: string | string[];
+  };
+  const aud = payload.aud;
+  const audOk = aud === clientId || (Array.isArray(aud) && aud.includes(clientId));
+  if (!audOk) return undefined;
   return { sub: payload.sub, email: payload.email };
+}
+
+async function fetchUserInfo(accessToken: string): Promise<{ sub?: string; email?: string } | undefined> {
+  const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok) return undefined;
+  const info = (await res.json()) as { sub?: string; email?: string };
+  return { sub: info.sub, email: info.email };
 }
 
 async function loadGoogleClient(): Promise<any> {

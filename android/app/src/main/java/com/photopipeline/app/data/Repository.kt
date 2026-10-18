@@ -125,8 +125,8 @@ class Repository(
             .apply()
     }
 
-    suspend fun completeGoogleSignIn(code: String, codeVerifier: String, redirectUri: String) {
-        val resp = api.exchangeGoogleAuth(code, codeVerifier, redirectUri)
+    suspend fun completeGoogleSignIn(serverAuthCode: String) {
+        val resp = api.exchangeGoogleAuth(serverAuthCode)
         prefs.edit()
             .putString("session_token", resp.sessionToken)
             .putString("google_sub", resp.sub)

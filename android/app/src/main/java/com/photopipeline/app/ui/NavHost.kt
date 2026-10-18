@@ -78,6 +78,7 @@ import android.content.Intent
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.DisposableEffect
 import com.photopipeline.app.auth.GoogleSignInHelper
@@ -138,14 +139,16 @@ fun HomeScreen(
     val activity = context as ComponentActivity
     val scope = rememberCoroutineScope()
     var linked by remember { mutableStateOf(repository.isGoogleAccountLinked()) }
+    var signInHelperRef by remember { mutableStateOf<GoogleSignInHelper?>(null) }
+    val googleLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult(),
+    ) { result ->
+        signInHelperRef?.onAuthorizationResult(result.data)
+    }
     val signInHelper = remember(activity) {
-        GoogleSignInHelper(activity, repository, scope) { linked = repository.isGoogleAccountLinked() }
-    }
-    val googleLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        signInHelper.onActivityResult(result.data)
-    }
-    DisposableEffect(signInHelper) {
-        onDispose { signInHelper.dispose() }
+        GoogleSignInHelper(activity, repository, scope, googleLauncher) {
+            linked = repository.isGoogleAccountLinked()
+        }.also { signInHelperRef = it }
     }
 
     Scaffold(
@@ -213,7 +216,7 @@ fun HomeScreen(
                     }
                 } else {
                     Button(
-                        onClick = { signInHelper.start(googleLauncher) },
+                        onClick = { signInHelper.start() },
                         modifier = Modifier.fillMaxWidth(),
                         enabled = repository.googleWebClientId().isNotBlank(),
                     ) {
@@ -671,12 +674,14 @@ fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
     var apiBase by remember { mutableStateOf(repository.apiBaseUrl()) }
     var googleClientId by remember { mutableStateOf(repository.googleWebClientId()) }
     val scope = rememberCoroutineScope()
-    val signInHelper = remember(activity) { GoogleSignInHelper(activity, repository, scope) }
-    val googleLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        signInHelper.onActivityResult(result.data)
+    var signInHelperRef by remember { mutableStateOf<GoogleSignInHelper?>(null) }
+    val googleLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult(),
+    ) { result ->
+        signInHelperRef?.onAuthorizationResult(result.data)
     }
-    DisposableEffect(signInHelper) {
-        onDispose { signInHelper.dispose() }
+    val signInHelper = remember(activity) {
+        GoogleSignInHelper(activity, repository, scope, googleLauncher).also { signInHelperRef = it }
     }
     var wifiOnly by remember { mutableStateOf(prefs.wifiOnly) }
     var allowCellular by remember { mutableStateOf(prefs.allowCellular) }
@@ -713,7 +718,7 @@ fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
             )
             if (!repository.isGoogleAccountLinked()) {
                 Button(
-                    onClick = { signInHelper.start(googleLauncher) },
+                    onClick = { signInHelper.start() },
                     modifier = Modifier.fillMaxWidth(),
                     enabled = googleClientId.isNotBlank(),
                 ) {
@@ -766,7 +771,8 @@ fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
             }
             HorizontalDivider()
             Text(
-                "Redirect URI (must match Google Cloud Web client): ${AppDefaults.GOOGLE_REDIRECT_URI}",
+                "Sign-in uses Google Identity Services (server auth code + Web client ID). " +
+                    "Android OAuth client: package com.photopipeline.app + debug SHA-1 in Google Cloud.",
                 style = MaterialTheme.typography.bodySmall,
             )
         }
