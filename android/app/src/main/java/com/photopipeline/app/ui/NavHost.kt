@@ -81,7 +81,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.runtime.DisposableEffect
 import com.photopipeline.app.auth.GoogleAuthCoordinator
 import com.photopipeline.app.auth.GoogleSignInHelper
 import com.photopipeline.app.core.AppDefaults
