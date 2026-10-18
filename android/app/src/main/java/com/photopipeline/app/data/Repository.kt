@@ -8,8 +8,12 @@ import androidx.work.workDataOf
 import com.photopipeline.app.api.ApiClient
 import com.photopipeline.app.api.EstimateResponse
 import com.photopipeline.app.core.fileIdentityKey
-import com.photopipeline.app.mtp.CanonMtpRepository
+import com.photopipeline.app.mtp.MtpConnectionState
 import com.photopipeline.app.mtp.MtpRepository
+import com.photopipeline.app.mtp.MtpObjectInfo
+import com.photopipeline.app.mtp.UsbAccessState
+import com.photopipeline.app.mtp.UsbCameraManager
+import com.photopipeline.app.mtp.UsbDebugLog
 import com.photopipeline.app.upload.UploadPart
 import com.photopipeline.app.upload.UploadParts
 import com.photopipeline.app.upload.UploadWorker
@@ -23,9 +27,10 @@ class Repository(
     val db: AppDatabase,
     context: Context,
     mtpOverride: MtpRepository? = null,
+    private val usb: UsbCameraManager? = null,
 ) {
     private val appContext = context.applicationContext
-    val mtp: MtpRepository = mtpOverride ?: CanonMtpRepository(context)
+    val mtp: MtpRepository = mtpOverride ?: error("MtpRepository required")
     private val prefs = appContext.getSharedPreferences("photopipeline", Context.MODE_PRIVATE)
 
     val api: ApiClient = ApiClient(
@@ -72,10 +77,109 @@ class Repository(
         db.fileDao().upsert(transform(cur))
     }
 
-    suspend fun importFromCamera(shootId: String, destDir: File): Int {
+    fun isGoogleAccountLinked(): Boolean = !prefs.getString("id_token", null).isNullOrBlank()
+
+    fun googleUserId(): String? = prefs.getString("user_id", null)
+
+    fun apiBaseUrl(): String = prefs.getString("api_base", "https://example.execute-api.us-west-2.amazonaws.com")!!
+
+    fun saveSettings(apiBase: String, userId: String?, idToken: String?) {
+        prefs.edit()
+            .putString("api_base", apiBase.trim())
+            .putString("user_id", userId?.trim()?.ifBlank { null })
+            .putString("id_token", idToken?.trim()?.ifBlank { null })
+            .apply()
+    }
+
+    private suspend fun ensureUsbReady(): CameraImportResult.Error? {
+        val manager = usb ?: return null
+        manager.refreshProbe(log = true)
+        when (manager.accessState.value) {
+            UsbAccessState.NO_DEVICE ->
+                return CameraImportResult.Error(
+                    stage = "detect",
+                    userMessage = "No Canon camera found. Plug in the camera via USB and tap Refresh.",
+                )
+            UsbAccessState.PERMISSION_REQUIRED -> {
+                UsbDebugLog.log("Requesting USB permission (user dialog should appear)")
+                val granted = manager.requestPermissionSuspend()
+                if (!granted) {
+                    return CameraImportResult.Error(
+                        stage = "permission",
+                        userMessage = "USB permission denied. Tap Connect again and allow access to the camera.",
+                    )
+                }
+                manager.refreshProbe(log = true)
+                if (manager.accessState.value == UsbAccessState.OPEN_FAILED) {
+                    return CameraImportResult.Error(
+                        stage = "open",
+                        userMessage = "Permission granted but MTP interface is in use. Disconnect USB, reopen Photo Pipeline, and choose this app for USB.",
+                    )
+                }
+            }
+            UsbAccessState.PERMISSION_DENIED ->
+                return CameraImportResult.Error(
+                    stage = "permission",
+                    userMessage = "USB permission denied. In system Settings, clear USB defaults or reconnect the cable.",
+                )
+            UsbAccessState.OPEN_FAILED ->
+                return CameraImportResult.Error(
+                    stage = "open",
+                    userMessage = "Could not open the camera USB interface (another app may be using MTP). Disconnect and choose Photo Pipeline when prompted.",
+                )
+            UsbAccessState.READY -> Unit
+        }
+        val mtpState = mtp.refreshConnection()
+        if (mtpState == MtpConnectionState.ERROR) {
+            return CameraImportResult.Error(
+                stage = "mtp",
+                userMessage = "Camera found but MTP session failed. See debug log for interface details.",
+            )
+        }
+        return null
+    }
+
+    suspend fun listCameraMedia(): CameraImportResult {
+        ensureUsbReady()?.let { return it }
+        val objects = runCatching { mtp.listCr3Objects() }
+            .getOrElse { e ->
+                UsbDebugLog.log("listCr3Objects exception: ${e.message}")
+                return CameraImportResult.Error(
+                    stage = "list",
+                    userMessage = "Failed to read camera file list: ${e.message ?: "unknown error"}",
+                )
+            }
+        if (objects.isEmpty()) {
+            return CameraImportResult.Error(
+                stage = "list",
+                userMessage = "Camera connected but no CR3/JPEG/RAW files found in MTP storage.",
+            )
+        }
+        return CameraImportResult.Listed(
+            objects = objects,
+            statusMessage = "Found ${objects.size} file(s) on camera.",
+        )
+    }
+
+    suspend fun importFromCamera(
+        shootId: String,
+        destDir: File,
+        only: List<MtpObjectInfo>? = null,
+    ): CameraImportResult {
         destDir.mkdirs()
-        mtp.refreshConnection()
-        val objects = mtp.listCr3Objects()
+        ensureUsbReady()?.let { return it }
+        val objects = only ?: runCatching { mtp.listCr3Objects() }.getOrElse { e ->
+            return CameraImportResult.Error(
+                stage = "list",
+                userMessage = "Failed to read camera: ${e.message ?: "unknown error"}",
+            )
+        }
+        if (objects.isEmpty()) {
+            return CameraImportResult.Error(
+                stage = "import",
+                userMessage = "Nothing selected to import.",
+            )
+        }
         val existingKeys = db.fileDao().observeForShoot(shootId).first().map { it.identityKey }.toSet()
         val entities = mutableListOf<FileEntity>()
         for (obj in objects) {
@@ -126,7 +230,16 @@ class Repository(
                 state = "IMPORTING",
             ),
         )
-        return entities.size
+        val msg = when {
+            entities.isEmpty() -> "No new files to import (${objects.size} already in this shoot)."
+            else -> "Imported ${entities.size} new file(s)."
+        }
+        UsbDebugLog.log(msg)
+        return CameraImportResult.Imported(
+            newCount = entities.size,
+            totalOnShoot = allFiles.size,
+            statusMessage = msg,
+        )
     }
 
     suspend fun fetchAndStoreEstimate(shootId: String): EstimateResponse {
@@ -188,6 +301,19 @@ class Repository(
     suspend fun refreshBackendStatus(shootId: String) {
         val status = api.fetchStatus(shootId)
         val shoot = getShoot(shootId) ?: return
+        status.progress?.let { p ->
+            prefs.edit().putString(
+                "shoot_progress_$shootId",
+                JSONObject(
+                    mapOf(
+                        "totalFiles" to p.totalFiles,
+                        "renderedCount" to p.renderedCount,
+                        "publishedCount" to p.publishedCount,
+                        "uploadCompleteCount" to p.uploadCompleteCount,
+                    ),
+                ).toString(),
+            ).apply()
+        }
         db.shootDao().upsert(
             shoot.copy(
                 state = status.state,
@@ -200,6 +326,9 @@ class Repository(
             ),
         )
     }
+
+    fun processingProgressJson(shootId: String): String? =
+        prefs.getString("shoot_progress_$shootId", null)
 
     fun enqueueUploads(shootId: String) {
         val req = OneTimeWorkRequestBuilder<UploadWorker>()

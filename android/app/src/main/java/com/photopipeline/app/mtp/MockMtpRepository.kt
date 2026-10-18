@@ -9,16 +9,17 @@ import java.security.MessageDigest
 class MockMtpRepository : MtpRepository {
     private val _state = MutableStateFlow(MtpConnectionState.DISCONNECTED)
     override val connectionState: StateFlow<MtpConnectionState> = _state
+    private val _usb = MutableStateFlow(UsbAccessState.NO_DEVICE)
+    override val usbAccessState: StateFlow<UsbAccessState> = _usb
 
     private val sampleObjects = listOf(
         MtpObjectInfo(1, 101, "IMG_0001.CR3", 20_000_000, 1_700_000_000_000),
         MtpObjectInfo(1, 102, "IMG_0002.CR3", 21_000_000, 1_700_000_100_000),
     )
 
-    override suspend fun refreshConnection(): MtpConnectionState {
-        _state.value = MtpConnectionState.CONNECTING
-        delay(50)
+    override fun refreshConnection(): MtpConnectionState {
         _state.value = MtpConnectionState.CONNECTED
+        _usb.value = UsbAccessState.READY
         return _state.value
     }
 
@@ -26,6 +27,8 @@ class MockMtpRepository : MtpRepository {
         if (_state.value != MtpConnectionState.CONNECTED) refreshConnection()
         return sampleObjects
     }
+
+    override suspend fun getThumbnail(info: MtpObjectInfo): ByteArray? = null
 
     override suspend fun importObject(
         info: MtpObjectInfo,

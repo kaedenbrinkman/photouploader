@@ -1,6 +1,5 @@
 package com.photopipeline.app.mtp
 
-import android.content.Context
 import android.mtp.MtpConstants
 import android.mtp.MtpDevice
 import android.mtp.MtpObjectInfo as AndroidMtpObjectInfo
@@ -14,37 +13,45 @@ import java.io.RandomAccessFile
 import java.security.MessageDigest
 import kotlin.math.min
 
-/**
- * Canon R8 MTP import via [MtpDevice] (patterns from canon-mtp-direct).
- * Copies objects to phone storage only — originals remain on the camera.
- */
-class CanonMtpRepository(private val context: Context) : MtpRepository {
-    private val session = MtpUsbSession(context)
+class CanonMtpRepository(
+    private val usb: UsbCameraManager,
+) : MtpRepository {
     private val _state = MutableStateFlow(MtpConnectionState.DISCONNECTED)
     override val connectionState: StateFlow<MtpConnectionState> = _state
+    override val usbAccessState: StateFlow<UsbAccessState> = usb.accessState
 
-    override suspend fun refreshConnection(): MtpConnectionState = withContext(Dispatchers.IO) {
+    override fun refreshConnection(): MtpConnectionState {
         _state.value = MtpConnectionState.CONNECTING
-        val device = session.findCanonDevice()
-        when {
-            device == null -> MtpConnectionState.DISCONNECTED
-            !session.hasPermission(device) -> MtpConnectionState.ERROR
-            else -> {
-                val mtp = session.openCanonMtp()
-                if (mtp != null) {
-                    mtp.close()
-                    MtpConnectionState.CONNECTED
-                } else {
-                    MtpConnectionState.ERROR
-                }
-            }
-        }.also { _state.value = it }
+        val access = usb.refreshProbe(log = true)
+        val mapped = when (access) {
+            UsbAccessState.READY -> MtpConnectionState.CONNECTED
+            UsbAccessState.PERMISSION_REQUIRED -> MtpConnectionState.ERROR
+            UsbAccessState.PERMISSION_DENIED -> MtpConnectionState.ERROR
+            UsbAccessState.OPEN_FAILED -> MtpConnectionState.ERROR
+            UsbAccessState.NO_DEVICE -> MtpConnectionState.DISCONNECTED
+        }
+        _state.value = mapped
+        return mapped
     }
 
     override suspend fun listCr3Objects(): List<MtpObjectInfo> = withContext(Dispatchers.IO) {
-        val mtp = session.openCanonMtp() ?: return@withContext emptyList()
+        val mtp = usb.openMtpDevice() ?: run {
+            UsbDebugLog.log("listCr3Objects: could not open MTP")
+            return@withContext emptyList()
+        }
         try {
-            enumerateMedia(mtp)
+            val list = enumerateMedia(mtp)
+            UsbDebugLog.log("listCr3Objects: found ${list.size} media files")
+            list
+        } finally {
+            mtp.close()
+        }
+    }
+
+    override suspend fun getThumbnail(info: MtpObjectInfo): ByteArray? = withContext(Dispatchers.IO) {
+        val mtp = usb.openMtpDevice() ?: return@withContext null
+        try {
+            mtp.getThumbnail(info.handle.toInt())
         } finally {
             mtp.close()
         }
@@ -57,9 +64,11 @@ class CanonMtpRepository(private val context: Context) : MtpRepository {
     ): String = withContext(Dispatchers.IO) {
         val dest = File(destPath)
         dest.parentFile?.mkdirs()
-        val mtp = session.openCanonMtp() ?: throw IOException("MTP not connected")
-        mtp.useMtp { device ->
-            importWithResume(device, info, dest, onProgress)
+        val mtp = usb.openMtpDevice() ?: throw IOException("MTP not connected — check USB permission")
+        try {
+            importWithResume(mtp, info, dest, onProgress)
+        } finally {
+            mtp.close()
         }
         sha256File(dest)
     }
@@ -90,7 +99,6 @@ class CanonMtpRepository(private val context: Context) : MtpRepository {
         return out
     }
 
-    /** canon-mtp-direct: retry object info when handles are stale (e.g. large video on card). */
     private fun getObjectInfoWithRetry(device: MtpDevice, handle: Int, attempts: Int = 3): AndroidMtpObjectInfo? {
         repeat(attempts) { attempt ->
             val info = device.getObjectInfo(handle)
@@ -194,7 +202,6 @@ class CanonMtpRepository(private val context: Context) : MtpRepository {
 
     companion object {
         private const val PARTIAL_CHUNK_BYTES = 512 * 1024L
-        /** MTP parent handle for storage root */
         private const val PARENT_ROOT = 0xFFFFFFFF.toInt()
     }
 }
