@@ -19,13 +19,27 @@ log() { echo "[worker-install] $*"; }
 report_fail() {
   local msg="$1"
   log "FATAL: $msg"
-  aws dynamodb update-item \
-    --table-name "$DYNAMODB_TABLE" \
-    --key "{\"pk\":{\"S\":\"SHOOT#${SHOOT_ID}\"},\"sk\":{\"S\":\"META\"}}" \
-    --update-expression "SET #s = :f, phase = :ph, lastError = :e, updatedAt = :t" \
-    --expression-attribute-names '{"#s":"state"}' \
-    --expression-attribute-values "{\":f\":{\"S\":\"FAILED\"},\":ph\":{\"S\":\"BOOTSTRAP_FAILED\"},\":e\":{\"S\":\"${msg}\"},\":t\":{\"N\":\"$(date +%s000)\"}}" \
-    || log "could not write bootstrap failure to DynamoDB"
+  REGION=$(curl -sf http://169.254.169.254/latest/meta-data/placement/region || true)
+  export AWS_DEFAULT_REGION="${REGION:-us-west-2}"
+  export BOOT_MSG="$msg"
+  python3 - <<'PY'
+import boto3, os, time
+region = os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
+ddb = boto3.client("dynamodb", region_name=region)
+ddb.update_item(
+    TableName=os.environ["DYNAMODB_TABLE"],
+    Key={"pk": {"S": f"SHOOT#{os.environ['SHOOT_ID']}"}, "sk": {"S": "META"}},
+    UpdateExpression="SET #s = :f, phase = :ph, lastError = :e, updatedAt = :t",
+    ExpressionAttributeNames={"#s": "state"},
+    ExpressionAttributeValues={
+        ":f": {"S": "FAILED"},
+        ":ph": {"S": "BOOTSTRAP_FAILED"},
+        ":e": {"S": os.environ.get("BOOT_MSG", "bootstrap failed")},
+        ":t": {"N": str(int(time.time() * 1000))},
+    },
+)
+PY
+  sudo shutdown -h now
   exit 1
 }
 

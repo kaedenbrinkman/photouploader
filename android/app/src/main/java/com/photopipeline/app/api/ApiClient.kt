@@ -264,9 +264,9 @@ class ApiClient(
         var detail: String? = null
         runCatching {
             val o = JSONObject(body)
-            ec2 = o.optString("ec2ErrorCode").takeIf { it.isNotBlank() }
-            detail = o.optString("detail").takeIf { it.isNotBlank() }
-                ?: o.optString("error").takeIf { it.isNotBlank() }
+            val errField = o.optString("error").takeIf { it.isNotBlank() }
+            ec2 = o.optString("ec2ErrorCode").takeIf { it.isNotBlank() } ?: errField
+            detail = o.optString("detail").takeIf { it.isNotBlank() } ?: errField
         }
         val friendly = FinalizeErrorMessages.friendly(ec2, detail, resp.code)
         PipelineLog.w("api", "finalize HTTP ${resp.code} ec2=$ec2 detail=$detail")

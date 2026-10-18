@@ -47,10 +47,11 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
   const finished = meta.Item.workerFinishedAt as number | undefined;
   let actualCompute: { seconds?: number; usd?: number } = {};
   if (started && finished && meta.Item.instanceType) {
-    const seconds = (finished - started) / 1000;
+    const seconds = Math.max(0, (finished - started) / 1000);
+    const usd = actualComputeCost(seconds, String(meta.Item.instanceType), Boolean(meta.Item.spot));
     actualCompute = {
       seconds: Math.round(seconds),
-      usd: actualComputeCost(seconds, String(meta.Item.instanceType), Boolean(meta.Item.spot)),
+      usd: Number.isFinite(usd) ? usd : 0,
     };
   }
 

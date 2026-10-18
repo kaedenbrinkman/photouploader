@@ -119,9 +119,9 @@ export class PhotoPipelineStack extends cdk.Stack {
       WORKER_AMI_ID: workerAmi.getImage(this).imageId,
       WORKER_MAX_LIFETIME_MINUTES: '120',
       WORKER_BUNDLE_KEY: 'releases/photopipeline-worker.tar.gz',
-      WORKER_BUNDLE_SHA256: '',
+      WORKER_BUNDLE_SHA256_PARAM: '/photopipeline/worker-bundle-sha256',
       LIGHTCRAFT_BINARY_KEY: 'releases/lightcraft-cli',
-      LIGHTCRAFT_BINARY_SHA256: '',
+      LIGHTCRAFT_SHA256_PARAM: '/photopipeline/lightcraft-sha256',
       AWS_ACCOUNT_ID: this.account,
     };
 
@@ -145,6 +145,7 @@ export class PhotoPipelineStack extends cdk.Stack {
       ...lambdaDefaults,
       entry: path.join(__dirname, '../lambda/finalize.ts'),
       timeout: cdk.Duration.seconds(60),
+      reservedConcurrentExecutions: 1,
     });
     bucket.grantReadWrite(finalizeFn);
     table.grantReadWriteData(finalizeFn);
@@ -161,6 +162,15 @@ export class PhotoPipelineStack extends cdk.Stack {
         conditions: {
           StringLike: { 'iam:AWSServiceName': 'spot.amazonaws.com' },
         },
+      }),
+    );
+    finalizeFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['ssm:GetParameter'],
+        resources: [
+          `arn:aws:ssm:${this.region}:${this.account}:parameter/photopipeline/worker-bundle-sha256`,
+          `arn:aws:ssm:${this.region}:${this.account}:parameter/photopipeline/lightcraft-sha256`,
+        ],
       }),
     );
 
@@ -224,6 +234,7 @@ export class PhotoPipelineStack extends cdk.Stack {
       entry: path.join(__dirname, '../lambda/watchdog.ts'),
       timeout: cdk.Duration.seconds(60),
     });
+    table.grantReadWriteData(watchdogFn);
     watchdogFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['ec2:DescribeInstances', 'ec2:TerminateInstances'],

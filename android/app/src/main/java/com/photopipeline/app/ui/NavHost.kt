@@ -80,6 +80,7 @@ import com.photopipeline.app.mtp.UsbCameraManager
 import com.photopipeline.app.PhotoPipelineApp
 import com.photopipeline.app.ui.components.DebugLogPanel
 import com.photopipeline.app.ui.theme.PhotoPipelineTheme
+import com.photopipeline.app.api.FinalizeErrorMessages
 import com.photopipeline.app.upload.LiveUploadMetrics
 import com.photopipeline.app.upload.UploadEtaEstimator
 import com.photopipeline.app.upload.UploadMetricsStore
@@ -539,6 +540,9 @@ fun ShootFlowScreen(
                         progressJson = ui.processingProgress,
                         showRetry = vm.needsProcessingRetry(),
                         processingError = processingError,
+                        serverPhase = ui.serverPhase,
+                        serverLaunchErrorCode = ui.serverLaunchErrorCode,
+                        serverLastError = ui.serverLastError,
                         finalizeInProgress = ui.finalizeState == FinalizeState.InProgress,
                         busy = ui.busy,
                         onRetryProcessing = { vm.retryProcessing() },
@@ -947,19 +951,25 @@ private fun ProcessingStep(
     progressJson: String?,
     showRetry: Boolean,
     processingError: String?,
+    serverPhase: String?,
+    serverLaunchErrorCode: String?,
+    serverLastError: String?,
     finalizeInProgress: Boolean,
     busy: Boolean,
     onRetryProcessing: () -> Unit,
 ) {
     shoot ?: return
     val phases = listOf("IMPORT", "ESTIMATE", "UPLOAD", "MANIFEST", "RENDER", "PUBLISH", "DONE")
-    val phase = shoot.phase.uppercase()
+    val phase = (serverPhase ?: shoot.phase).uppercase()
     val idx = phases.indexOfFirst { phase.contains(it, ignoreCase = true) }.coerceAtLeast(0)
     val waitingToStart = shoot.state == "READY_TO_PROCESS" || shoot.state == "LOCAL"
+    val displayError = processingError ?: serverLastError?.let {
+        FinalizeErrorMessages.friendly(serverLaunchErrorCode, it)
+    }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (showRetry) {
             ProcessingRetryBlock(
-                error = processingError,
+                error = displayError,
                 busy = busy,
                 onRetry = onRetryProcessing,
                 prominent = true,
@@ -967,6 +977,13 @@ private fun ProcessingStep(
         }
         Text("Processing on server", style = MaterialTheme.typography.titleMedium)
         Text(humanShootState(shoot))
+        Text("Phase: ${serverPhase ?: shoot.phase}", style = MaterialTheme.typography.bodySmall)
+        serverLaunchErrorCode?.let {
+            Text("Error code: $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+        }
+        serverLastError?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
         if (finalizeInProgress) {
             Row(
                 Modifier.fillMaxWidth(),
@@ -985,7 +1002,9 @@ private fun ProcessingStep(
         }
         shoot.actualComputeJson?.let {
             val o = JSONObject(it)
-            Text("Compute: ${o.optInt("seconds")}s · ~$${o.optDouble("usd")}")
+            val sec = o.optInt("seconds", 0)
+            val usd = o.usd("usd", 0.0)
+            Text("Compute: ${sec}s · ~$${"%.4f".format(usd)}")
         }
     }
 }

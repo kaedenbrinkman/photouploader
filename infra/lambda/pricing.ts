@@ -58,9 +58,12 @@ export function estimateShoot(
 
 export function actualComputeCost(computeSeconds: number, instanceType: string, spot: boolean): number {
   const p = pricingTable as any;
+  const seconds = Number.isFinite(computeSeconds) && computeSeconds > 0 ? computeSeconds : 0;
   const rateKey = spot ? 'spotUsdPerHour' : 'onDemandUsdPerHour';
-  const hourly = p.ec2[rateKey][instanceType] ?? p.ec2.onDemandUsdPerHour['c7i.2xlarge'];
-  return round(hourly * (computeSeconds / 3600));
+  const fallback = p.ec2?.onDemandUsdPerHour?.['c7i.2xlarge'] ?? 0.34;
+  const hourlyRaw = p.ec2?.[rateKey]?.[instanceType] ?? fallback;
+  const hourly = Number.isFinite(hourlyRaw) && hourlyRaw > 0 ? hourlyRaw : fallback;
+  return round(hourly * (seconds / 3600));
 }
 
 function round(n: number) {

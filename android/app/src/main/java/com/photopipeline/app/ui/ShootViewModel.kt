@@ -78,6 +78,9 @@ data class ShootUiState(
     val finalizeState: FinalizeState = FinalizeState.Idle,
     val finalizeError: String? = null,
     val serverProcessingError: String? = null,
+    val serverPhase: String? = null,
+    val serverLaunchErrorCode: String? = null,
+    val serverLastError: String? = null,
 )
 
 class ShootViewModel(
@@ -629,16 +632,18 @@ class ShootViewModel(
                 runCatching { repo.refreshBackendStatus(shootId) }
                     .onSuccess { status ->
                         status?.let {
-                            val serverMsg = FinalizeErrorMessages.friendly(
-                                it.launchErrorCode,
-                                it.lastError,
-                            ).takeIf { msg ->
-                                it.state == "READY_TO_PROCESS" || it.state == "FAILED" ||
-                                    !it.lastError.isNullOrBlank()
-                            }
-                            if (serverMsg != null) {
-                                _ui.value = _ui.value.copy(serverProcessingError = serverMsg)
-                            }
+                            val friendly = FinalizeErrorMessages.friendly(it.launchErrorCode, it.lastError)
+                            _ui.value = _ui.value.copy(
+                                serverPhase = it.phase,
+                                serverLaunchErrorCode = it.launchErrorCode,
+                                serverLastError = it.lastError,
+                                serverProcessingError = when {
+                                    it.state == "READY_TO_PROCESS" || it.state == "FAILED" -> friendly
+                                    it.state == "PROCESSING" && !it.lastError.isNullOrBlank() -> friendly
+                                    !it.lastError.isNullOrBlank() -> friendly
+                                    else -> _ui.value.serverProcessingError
+                                },
+                            )
                         }
                     }
                     .onFailure { e ->
@@ -686,6 +691,8 @@ class ShootViewModel(
         if (!s.backendState.isNullOrBlank() && s.backendState in setOf("FAILED", "READY_TO_PROCESS")) {
             return true
         }
+        if (s.state == "PROCESSING" && !_ui.value.serverLastError.isNullOrBlank()) return true
+        if (s.state == "PROCESSING" && s.backendState == "READY_TO_PROCESS") return true
         // All bytes in S3 but server never left LOCAL (e.g. finalize 409 before backend fix).
         return s.state in LOCAL_ONLY_STATES &&
             s.phase.contains("MANIFEST", ignoreCase = true) &&

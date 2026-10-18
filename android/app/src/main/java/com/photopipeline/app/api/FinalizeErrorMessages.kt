@@ -11,6 +11,10 @@ object FinalizeErrorMessages {
                 return "AWS capacity is temporarily unavailable in this region — try again later."
             "worker_artifacts_not_configured" ->
                 return "Server worker bundle is not deployed yet — contact the operator."
+            "worker_artifacts_missing" ->
+                return "Worker release files are missing or checksums do not match — try again after deploy."
+            "worker_sha_ssm_missing" ->
+                return "Worker SHA256 parameters are not configured in SSM — contact the operator."
         }
         if (!detail.isNullOrBlank()) return detail.take(280)
         return when (httpCode) {

@@ -603,8 +603,10 @@ class Repository(
                 phase = status.phase ?: status.state,
                 backendState = status.state,
                 albumId = status.albumId,
-                actualComputeJson = status.actualCompute?.let {
-                    JSONObject(mapOf("seconds" to it.seconds, "usd" to it.usd)).toString()
+                actualComputeJson = status.actualCompute?.let { ac ->
+                    val sec = ac.seconds ?: 0
+                    val usd = ac.usd?.takeIf { !it.isNaN() && !it.isInfinite() } ?: 0.0
+                    JSONObject(mapOf("seconds" to sec, "usd" to usd)).toString()
                 },
             ),
         )
