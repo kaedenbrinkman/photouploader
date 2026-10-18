@@ -54,6 +54,8 @@ jobs:
           scripts/build-worker-bundle.sh
       - name: Bootstrap docker verify (stub LightCraft)
         run: docker build -f worker/ami/Dockerfile.verify .
+      - name: AL2023 user-data venv and vendored pip
+        run: docker build -f worker/ami/Dockerfile.bootstrap-test .
 
   android:
     runs-on: ubuntu-latest

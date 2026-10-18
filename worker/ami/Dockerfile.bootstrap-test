@@ -1,0 +1,12 @@
+FROM amazonlinux:2023
+RUN dnf install -y python3 tar python3-pip && dnf clean all
+WORKDIR /src
+COPY worker/requirements.txt worker/requirements.txt
+COPY worker/worker worker/worker
+COPY scripts/build-worker-bundle.sh scripts/build-worker-bundle.sh
+COPY worker/ami/test-bootstrap-al2023.sh worker/ami/test-bootstrap-al2023.sh
+COPY infra/lambda/ec2-userdata-bootstrap.sh infra/lambda/ec2-userdata-bootstrap.sh
+COPY worker/ami/ec2-install-from-s3.sh worker/ami/ec2-install-from-s3.sh
+RUN chmod +x scripts/build-worker-bundle.sh worker/ami/test-bootstrap-al2023.sh \
+  && scripts/build-worker-bundle.sh /src/dist \
+  && worker/ami/test-bootstrap-al2023.sh

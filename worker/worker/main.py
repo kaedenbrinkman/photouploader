@@ -57,6 +57,21 @@ def shutdown_instance():
         log.exception("shutdown failed")
 
 
+def manage_shutdown_backstop(*, cancel: bool, arm_idle_minutes: int | None = None) -> None:
+    """Cancel bootstrap backstop; optionally arm idle shutdown (matches user-data lifetime)."""
+    try:
+        if cancel:
+            subprocess.run(["sudo", "shutdown", "-c"], check=False, timeout=5)
+        if arm_idle_minutes is not None and arm_idle_minutes > 0:
+            subprocess.run(
+                ["sudo", "shutdown", "-h", f"+{arm_idle_minutes}", "photopipeline worker idle backstop"],
+                check=False,
+                timeout=5,
+            )
+    except Exception:
+        log.exception("shutdown backstop update failed")
+
+
 def run() -> int:
     cfg = WorkerConfig.from_env()
     s3 = boto3.client("s3", region_name=cfg.region)
@@ -77,6 +92,7 @@ def run() -> int:
         renderedCount=0,
         publishedCount=0,
     )
+    manage_shutdown_backstop(cancel=True, arm_idle_minutes=120)
 
     try:
         manifest = load_manifest(s3, cfg.bucket, cfg.shoot_id)

@@ -2,7 +2,7 @@
 
 Production workers boot from the **latest Amazon Linux 2023** AMI. Finalize Lambda user-data downloads:
 
-- `s3://<bucket>/releases/photopipeline-worker.tar.gz` (Python worker; build with `scripts/build-worker-bundle.sh`)
+- `s3://<bucket>/releases/photopipeline-worker.tar.gz` (Python worker + **vendored wheels** in `vendor/`; build with `scripts/build-worker-bundle.sh`)
 - `s3://<bucket>/releases/lightcraft-cli` (prebuilt binary)
 
 Before launch, finalize **HEAD**s both objects, requires non-zero size, and verifies **ChecksumSHA256** or object metadata `sha256` against SSM (see below).

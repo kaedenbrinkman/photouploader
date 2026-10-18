@@ -1,3 +1,5 @@
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { EC2Client, RunInstancesCommand } from '@aws-sdk/client-ec2';
@@ -19,6 +21,11 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const ec2 = new EC2Client({});
 
 const LAUNCH_LOCK_MS = 5 * 60_000;
+
+const EC2_USERDATA_BOOTSTRAP = readFileSync(
+  join(__dirname, 'ec2-userdata-bootstrap.sh'),
+  'utf8',
+);
 
 interface ManifestFile {
   sha256: string;
@@ -53,8 +60,7 @@ function buildUserData(params: {
     lightcraftKey,
     lightcraftSha256,
   } = params;
-  return `#!/bin/bash
-set -euo pipefail
+  const exports = `#!/bin/bash
 export SHOOT_ID=${shootId}
 export USER_ID=${userId}
 export BUCKET_NAME=${bucket}
@@ -68,46 +74,8 @@ export LIGHTCRAFT_BINARY_KEY=${lightcraftKey}
 export LIGHTCRAFT_BINARY_SHA256=${lightcraftSha256}
 export LIGHTCRAFT_BIN=/opt/photopipeline/lightcraft/lightcraft-cli
 export INSTALL_ROOT=/opt/photopipeline
-report_fail() {
-  export BOOT_MSG="$1"
-  REGION=$(curl -sf http://169.254.169.254/latest/meta-data/placement/region || true)
-  export AWS_DEFAULT_REGION="\${REGION:-us-west-2}"
-  python3 - <<'PY'
-import boto3, os, sys, time
-region = os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
-ddb = boto3.client("dynamodb", region_name=region)
-ddb.update_item(
-    TableName=os.environ["DYNAMODB_TABLE"],
-    Key={"pk": {"S": f"SHOOT#{os.environ['SHOOT_ID']}"}, "sk": {"S": "META"}},
-    UpdateExpression="SET #s = :f, phase = :ph, lastError = :e, updatedAt = :t",
-    ExpressionAttributeNames={"#s": "state"},
-    ExpressionAttributeValues={
-        ":f": {"S": "FAILED"},
-        ":ph": {"S": "BOOTSTRAP_FAILED"},
-        ":e": {"S": os.environ.get("BOOT_MSG", "bootstrap failed")},
-        ":t": {"N": str(int(time.time() * 1000))},
-    },
-)
-PY
-  sudo shutdown -h now
-  exit 1
-}
-dnf install -y aws-cli python3 python3-pip tar 2>/dev/null || yum install -y aws-cli python3 python3-pip tar
-python3 -m pip install --no-cache-dir boto3
-mkdir -p "$INSTALL_ROOT"
-BUNDLE=/tmp/worker-bundle.tar.gz
-aws s3 cp "s3://$BUCKET_NAME/$WORKER_BUNDLE_KEY" "$BUNDLE" || report_fail "worker bundle missing"
-echo "$WORKER_BUNDLE_SHA256  $BUNDLE" | sha256sum -c - || report_fail "worker bundle checksum mismatch"
-tar -xzf "$BUNDLE" -C "$INSTALL_ROOT"
-python3 -m pip install --no-cache-dir -r "$INSTALL_ROOT/photopipeline-worker/requirements.txt"
-LC=/tmp/lightcraft-cli
-aws s3 cp "s3://$BUCKET_NAME/$LIGHTCRAFT_BINARY_KEY" "$LC" || report_fail "lightcraft binary missing"
-echo "$LIGHTCRAFT_BINARY_SHA256  $LC" | sha256sum -c - || report_fail "lightcraft checksum mismatch"
-chmod +x "$LC"
-mkdir -p "$INSTALL_ROOT/lightcraft"
-mv "$LC" "$LIGHTCRAFT_BIN"
-cd "$INSTALL_ROOT/photopipeline-worker" && python3 -m worker.main
 `;
+  return `${exports}${EC2_USERDATA_BOOTSTRAP}`;
 }
 
 async function recordLaunchFailure(
