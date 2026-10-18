@@ -457,9 +457,18 @@ class Repository(
     fun processingProgressJson(shootId: String): String? =
         prefs.getString("shoot_progress_$shootId", null)
 
-    fun enqueueUploads(shootId: String) {
+    suspend fun enqueueUploads(shootId: String) {
+        val pending = getPendingFiles(shootId)
+        val usesCameraStream = pending.any {
+            it.uploadSource == "CAMERA_STREAM" || it.localPath.isNullOrBlank()
+        }
         val req = OneTimeWorkRequestBuilder<UploadWorker>()
-            .setInputData(workDataOf("shootId" to shootId))
+            .setInputData(
+                workDataOf(
+                    "shootId" to shootId,
+                    UploadWorker.KEY_USES_CAMERA_STREAM to usesCameraStream,
+                ),
+            )
             .addTag("upload-$shootId")
             .build()
         WorkManager.getInstance(appContext).enqueueUniqueWork(

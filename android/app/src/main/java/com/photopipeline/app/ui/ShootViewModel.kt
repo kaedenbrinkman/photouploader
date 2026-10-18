@@ -252,9 +252,11 @@ class ShootViewModel(
             _ui.value = _ui.value.copy(snackbar = repo.backendGateMessage())
             return
         }
-        repo.enqueueUploads(shootId)
-        _ui.value = _ui.value.copy(step = ShootFlowStep.Processing, statusLine = "Uploading to S3…")
-        startPolling()
+        safeScope.launch {
+            repo.enqueueUploads(shootId)
+            _ui.value = _ui.value.copy(step = ShootFlowStep.Processing, statusLine = "Uploading to S3…")
+            startPolling()
+        }
     }
 
     fun submitShoot() {

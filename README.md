@@ -100,7 +100,7 @@ Reproducible bootstrap: `worker/ami/bootstrap.sh` (LightCraft **31a677fe**, Rust
 - **Connect with Google** (PKCE via Custom Tabs); backend session JWT for API calls; Google Photos refresh token on server.
 - USB host / MTP (Canon vendor `0x04A9`); `MockMtpRepository` for tests, `CanonMtpRepository` stub for hardware.
 - Dedupe key: storage + handle + size + capture time + SHA-256.
-- WorkManager foreground uploads with per-file progress, retry, Room persistence.
+- WorkManager foreground uploads (`dataSync` + `connectedDevice` FGS types on API 35+) with per-file progress, retry, Room persistence. Android 15 caps `dataSync` foreground time at **6 hours/day**; long shoots rely on multipart resume + WorkManager retry rather than one endless FGS.
 - **Before submit:** cost estimate from backend; **after processing:** actual compute time & cost from status poll (survives app restart).
 
 ## Tests & CI
