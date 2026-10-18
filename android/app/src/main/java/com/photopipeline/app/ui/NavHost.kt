@@ -78,7 +78,9 @@ import com.photopipeline.app.data.ShootEntity
 import com.photopipeline.app.mtp.UsbAccessState
 import com.photopipeline.app.mtp.UsbCameraManager
 import com.photopipeline.app.PhotoPipelineApp
+import com.photopipeline.app.ui.components.AccountAvatarButton
 import com.photopipeline.app.ui.components.DebugLogPanel
+import com.photopipeline.app.ui.components.GoogleAccountMenuSheet
 import com.photopipeline.app.ui.theme.PhotoPipelineTheme
 import com.photopipeline.app.api.FinalizeErrorMessages
 import com.photopipeline.app.upload.LiveUploadMetrics
@@ -150,6 +152,7 @@ fun HomeScreen(
     val activity = context as ComponentActivity
     val scope = rememberCoroutineScope()
     var linked by remember { mutableStateOf(repository.isGoogleAccountLinked()) }
+    var accountMenuOpen by remember { mutableStateOf(false) }
     var authError by remember { mutableStateOf("") }
     val googleLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult(),
@@ -177,9 +180,11 @@ fun HomeScreen(
             TopAppBar(
                 title = { Text("Photo Pipeline") },
                 actions = {
-                    IconButton(onClick = onSettings) {
-                        Icon(Icons.Default.Settings, contentDescription = "Settings")
-                    }
+                    AccountAvatarButton(
+                        repository = repository,
+                        linked = linked,
+                        onClick = { accountMenuOpen = true },
+                    )
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
                     scrolledContainerColor = MaterialTheme.colorScheme.surface,
@@ -188,6 +193,21 @@ fun HomeScreen(
         },
         snackbarHost = { SnackbarHost(snackbarHost) },
     ) { pad ->
+        GoogleAccountMenuSheet(
+            repository = repository,
+            linked = linked,
+            visible = accountMenuOpen,
+            onDismiss = { accountMenuOpen = false },
+            onOpenSettings = {
+                accountMenuOpen = false
+                onSettings()
+            },
+            onSignOut = {
+                signInHelper.signOut()
+                linked = false
+                scope.launch { snackbarHost.showSnackbar("Signed out") }
+            },
+        )
         LazyColumn(
             modifier = Modifier.padding(pad).fillMaxSize(),
             contentPadding = PaddingValues(16.dp),
@@ -231,19 +251,8 @@ fun HomeScreen(
                     )
                 }
             }
-            item {
-                if (linked) {
-                    FilledTonalButton(
-                        onClick = {
-                            repository.signOutGoogle()
-                            linked = false
-                            scope.launch { snackbarHost.showSnackbar("Signed out") }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text("Sign out")
-                    }
-                } else {
+            if (!linked) {
+                item {
                     Button(
                         onClick = { signInHelper.start() },
                         modifier = Modifier.fillMaxWidth(),
@@ -395,6 +404,13 @@ fun ShootFlowScreen(
 
     LaunchedEffect(usbState) {
         vm.onUsbAccessChanged(usbState)
+    }
+    val cameraNotNeeded = allUploaded ||
+        ui.step == ShootFlowStep.Processing ||
+        ui.step == ShootFlowStep.Results
+    DisposableEffect(cameraNotNeeded) {
+        usb.setSuppressEmptyDeviceListWarnings(cameraNotNeeded)
+        onDispose { usb.setSuppressEmptyDeviceListWarnings(false) }
     }
     var overflowOpen by remember { mutableStateOf(false) }
     var confirmCancel by remember { mutableStateOf(false) }
@@ -1122,7 +1138,7 @@ fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
             } else {
                 FilledTonalButton(
                     onClick = {
-                        repository.signOutGoogle()
+                        signInHelper.signOut()
                         scope.launch { snackbarHost.showSnackbar("Signed out") }
                     },
                     modifier = Modifier.fillMaxWidth(),

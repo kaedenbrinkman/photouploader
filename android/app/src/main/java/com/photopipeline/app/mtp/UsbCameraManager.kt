@@ -41,6 +41,19 @@ class UsbCameraManager(private val appContext: Context) {
 
     private var permissionCallback: ((Boolean) -> Unit)? = null
 
+    @Volatile
+    private var suppressEmptyDeviceListWarnings = false
+
+    private var emptyDeviceListLoggedWhileSuppressed = false
+
+    /** When true, empty USB device lists log at debug at most once until reset. */
+    fun setSuppressEmptyDeviceListWarnings(suppress: Boolean) {
+        if (suppress != suppressEmptyDeviceListWarnings) {
+            emptyDeviceListLoggedWhileSuppressed = false
+        }
+        suppressEmptyDeviceListWarnings = suppress
+    }
+
     private val permissionReceiver =
         object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
@@ -152,11 +165,21 @@ class UsbCameraManager(private val appContext: Context) {
         val devices = listUsbDevices()
         PipelineLog.d("usb", "deviceList ($reason): count=${devices.size}")
         if (devices.isEmpty()) {
-            PipelineLog.w(
-                "usb",
-                "deviceList empty — if system shows the camera, com.android.mtp or Canon Camera Connect " +
-                    "may hold the session; disconnect USB, force-stop those apps, reconnect and pick Photo Pipeline.",
-            )
+            if (suppressEmptyDeviceListWarnings) {
+                if (!emptyDeviceListLoggedWhileSuppressed) {
+                    emptyDeviceListLoggedWhileSuppressed = true
+                    PipelineLog.d(
+                        "usb",
+                        "deviceList empty ($reason) — camera not needed on this screen",
+                    )
+                }
+            } else {
+                PipelineLog.w(
+                    "usb",
+                    "deviceList empty — if system shows the camera, com.android.mtp or Canon Camera Connect " +
+                        "may hold the session; disconnect USB, force-stop those apps, reconnect and pick Photo Pipeline.",
+                )
+            }
             _selectedDevice.value?.let { cached ->
                 PipelineLog.d("usb", "Cached ATTACHED device: ${UsbDeviceInspector.describe(cached)}")
             }

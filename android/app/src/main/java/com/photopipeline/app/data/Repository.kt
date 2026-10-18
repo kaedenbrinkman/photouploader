@@ -28,6 +28,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import org.json.JSONArray
 import org.json.JSONObject
+import okhttp3.OkHttpClient
 import java.io.File
 
 class Repository(
@@ -41,6 +42,7 @@ class Repository(
     private val appContext = context.applicationContext
     val mtp: MtpRepository = mtpOverride ?: error("MtpRepository required")
     private val prefs = appContext.getSharedPreferences("photopipeline", Context.MODE_PRIVATE)
+    private val googleHttp = OkHttpClient.Builder().build()
 
     val api: ApiClient = ApiClient(
         baseUrlProvider = { apiBaseUrl() },
@@ -112,6 +114,17 @@ class Repository(
 
     fun googleEmail(): String? = prefs.getString("google_email", null)
 
+    fun googleDisplayName(): String? = prefs.getString("google_name", null)
+
+    fun googlePictureUrl(): String? = prefs.getString("google_picture_url", null)
+
+    /** Cached avatar file preferred for Coil. */
+    fun googlePictureModel(): Any? {
+        val cache = java.io.File(appContext.filesDir, "google_avatar.jpg")
+        if (cache.exists() && cache.length() > 0L) return cache
+        return googlePictureUrl()?.takeIf { it.isNotBlank() }
+    }
+
     fun googleWebClientId(): String =
         prefs.getString("google_web_client_id", AppDefaults.GOOGLE_WEB_CLIENT_ID)
             ?.trim()
@@ -128,14 +141,55 @@ class Repository(
             .apply()
     }
 
-    suspend fun completeGoogleSignIn(serverAuthCode: String) {
+    suspend fun completeGoogleSignIn(serverAuthCode: String, googleAccessToken: String? = null) {
         val resp = api.exchangeGoogleAuth(serverAuthCode)
+        var name: String? = null
+        var picture: String? = null
+        if (!googleAccessToken.isNullOrBlank()) {
+            fetchGoogleUserInfo(googleAccessToken)?.let { info ->
+                name = info.first
+                picture = info.second
+            }
+        }
         prefs.edit()
             .putString("session_token", resp.sessionToken)
             .putString("google_sub", resp.sub)
             .putString("google_email", resp.email)
+            .putString("google_name", name)
+            .putString("google_picture_url", picture)
             .apply()
+        if (!picture.isNullOrBlank()) {
+            cacheGoogleAvatar(picture!!)
+        }
         PipelineLog.d("auth", "Signed in as ${resp.sub} gphotos=${resp.gphotosLinked}")
+    }
+
+    private suspend fun fetchGoogleUserInfo(accessToken: String): Pair<String?, String?>? {
+        return runCatching {
+            val req = okhttp3.Request.Builder()
+                .url("https://www.googleapis.com/oauth2/v3/userinfo")
+                .header("Authorization", "Bearer $accessToken")
+                .get()
+                .build()
+            googleHttp.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@runCatching null
+                val json = org.json.JSONObject(resp.body!!.string())
+                json.optString("name").ifBlank { null } to json.optString("picture").ifBlank { null }
+            }
+        }.getOrNull()
+    }
+
+    private suspend fun cacheGoogleAvatar(pictureUrl: String) {
+        runCatching {
+            val req = okhttp3.Request.Builder().url(pictureUrl).get().build()
+            googleHttp.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@runCatching
+                val body = resp.body?.bytes() ?: return@runCatching
+                java.io.File(appContext.filesDir, "google_avatar.jpg").writeBytes(body)
+            }
+        }.onFailure { e ->
+            PipelineLog.d("auth", "avatar cache failed: ${e.message}")
+        }
     }
 
     fun signOutGoogle() {
@@ -143,7 +197,10 @@ class Repository(
             .remove("session_token")
             .remove("google_sub")
             .remove("google_email")
+            .remove("google_name")
+            .remove("google_picture_url")
             .apply()
+        runCatching { java.io.File(appContext.filesDir, "google_avatar.jpg").delete() }
     }
 
     fun isBackendConfigured(): Boolean = apiBaseUrl().startsWith("http")

@@ -78,7 +78,10 @@ class GoogleSignInHelper(
                 } else {
                     val hasCode = !authorizationResult.serverAuthCode.isNullOrBlank()
                     PipelineLog.i("auth", "immediate result serverAuthCodePresent=$hasCode")
-                    exchangeServerAuthCode(authorizationResult.serverAuthCode)
+                    exchangeServerAuthCode(
+                        authorizationResult.serverAuthCode,
+                        authorizationResult.accessToken,
+                    )
                 }
             }
             .addOnFailureListener { e ->
@@ -115,7 +118,10 @@ class GoogleSignInHelper(
                 Identity.getAuthorizationClient(activity).getAuthorizationResultFromIntent(data)
             val hasCode = !authorizationResult.serverAuthCode.isNullOrBlank()
             PipelineLog.i("auth", "parsed authorization result serverAuthCodePresent=$hasCode")
-            exchangeServerAuthCode(authorizationResult.serverAuthCode)
+            exchangeServerAuthCode(
+                authorizationResult.serverAuthCode,
+                authorizationResult.accessToken,
+            )
         } catch (e: ApiException) {
             val msg = e.message ?: "Google authorization result failed"
             PipelineLog.i("auth", "getAuthorizationResultFromIntent failed: $msg")
@@ -124,7 +130,13 @@ class GoogleSignInHelper(
         }
     }
 
-    private fun exchangeServerAuthCode(serverAuthCode: String?) {
+    fun signOut() {
+        exchangeInFlight = false
+        onAuthError("")
+        repository.signOutGoogle()
+    }
+
+    private fun exchangeServerAuthCode(serverAuthCode: String?, googleAccessToken: String? = null) {
         val code = serverAuthCode?.trim().orEmpty()
         val hasCode = code.isNotEmpty()
         PipelineLog.i("auth", "exchangeServerAuthCode serverAuthCodePresent=$hasCode")
@@ -143,7 +155,7 @@ class GoogleSignInHelper(
             try {
                 runCatching {
                     PipelineLog.i("auth", "POST /auth/google starting")
-                    repository.completeGoogleSignIn(code)
+                    repository.completeGoogleSignIn(code, googleAccessToken)
                 }.onSuccess {
                     PipelineLog.i("auth", "session saved linked=${repository.isGoogleAccountLinked()}")
                     onAuthError("")

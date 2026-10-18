@@ -36,6 +36,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.plus
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.UUID
 
 enum class ShootFlowStep {
@@ -626,11 +630,14 @@ class ShootViewModel(
         if (!shouldPollBackend()) return
         pollJob?.cancel()
         pollJob = safeScope.launch {
+            var pollIntervalMs = 10_000L
             while (isActive) {
                 if (!shouldPollBackend()) break
                 var stopPolling = false
+                var transientFailure = false
                 runCatching { repo.refreshBackendStatus(shootId) }
                     .onSuccess { status ->
+                        pollIntervalMs = 10_000L
                         status?.let {
                             val friendly = FinalizeErrorMessages.friendly(it.launchErrorCode, it.lastError)
                             _ui.value = _ui.value.copy(
@@ -647,23 +654,51 @@ class ShootViewModel(
                         }
                     }
                     .onFailure { e ->
-                        val detail = when (e) {
-                            is ApiRequestException ->
-                                "poll failed HTTP ${e.httpCode ?: "?"}: ${e.message}"
-                            else -> "poll failed: ${e.message}"
+                        if (isTransientPollError(e)) {
+                            transientFailure = true
+                            PipelineLog.d(
+                                "status",
+                                "poll transient network error, retry in ${pollIntervalMs}ms: ${e.message}",
+                            )
+                            pollIntervalMs = (pollIntervalMs * 2).coerceAtMost(120_000L)
+                        } else {
+                            val detail = when (e) {
+                                is ApiRequestException ->
+                                    "poll failed HTTP ${e.httpCode ?: "?"}: ${e.message}"
+                                else -> "poll failed: ${e.message}"
+                            }
+                            PipelineLog.w("status", detail, e)
+                            if (e is ApiRequestException && e.httpCode == 404) stopPolling = true
                         }
-                        PipelineLog.w("status", detail, e)
-                        if (e is ApiRequestException && e.httpCode == 404) stopPolling = true
                     }
                 if (stopPolling) break
-                val progress = repo.processingProgressJson(shootId)
-                _ui.value = _ui.value.copy(processingProgress = progress)
-                recomputeStep()
-                val state = shoot.value?.state
-                if (state in TERMINAL) break
-                delay(10_000)
+                if (!transientFailure) {
+                    val progress = repo.processingProgressJson(shootId)
+                    _ui.value = _ui.value.copy(processingProgress = progress)
+                    recomputeStep()
+                    val state = shoot.value?.state
+                    if (state in TERMINAL) break
+                }
+                delay(pollIntervalMs)
             }
         }
+    }
+
+    private fun isTransientPollError(e: Throwable): Boolean {
+        var t: Throwable? = e
+        while (t != null) {
+            when (t) {
+                is UnknownHostException,
+                is ConnectException,
+                is SocketTimeoutException,
+                -> return true
+            }
+            if (t is IOException && t.message?.contains("Unable to resolve host", ignoreCase = true) == true) {
+                return true
+            }
+            t = t.cause
+        }
+        return false
     }
 
     private fun shouldPollBackend(): Boolean {
