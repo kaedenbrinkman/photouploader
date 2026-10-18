@@ -16,7 +16,8 @@
     "deepArchiveUsdPerGbMonth": 0.00099,
     "putPer1000": 0.005,
     "getPer1000": 0.0004,
-    "rawRetentionDaysStandard": 30
+    "rawRetentionDaysStandard": 30,
+    "transferAccelerationUsdPerGb": 0.04
   },
   "lambdaAndApi": {
     "estimatePerShootUsd": 0.002

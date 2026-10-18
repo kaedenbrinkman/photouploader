@@ -12,4 +12,4 @@
 6. Store `token.json` (refresh token) in AWS Secrets Manager/SSM SecureString (KMS); worker fetches at start, writes back if rotated. Never log it.
 Use a non-personal test JPEG for the first run.
 
-For this pipeline, the **Android app** starts account linking via the backend OAuth endpoints (`/oauth/photos/start` → user signs in → `/oauth/photos/callback` stores an encrypted refresh token per user in Secrets Manager).
+For this pipeline, the **Android app** uses **Connect with Google** (authorization code + PKCE). The app calls `POST /auth/google`; the backend stores the refresh token per Google `sub` in SSM. See **`GOOGLE_OAUTH_ANDROID.md`** for Web/Android client types, redirect URI, and SHA-1.

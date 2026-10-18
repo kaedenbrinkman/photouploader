@@ -10,10 +10,19 @@ data class CostEstimateDto(
     val s3StandardMonthUsd: Double,
     val s3DeepArchiveMonthUsd: Double,
     val requestsUsd: Double,
+    val transferAccelerationUsd: Double = 0.0,
     val totalShootUsd: Double,
 )
 
 data class EstimateResponse(val estimate: CostEstimateDto, val notes: List<String>)
+
+data class GoogleAuthResponse(
+    val sessionToken: String,
+    val expiresIn: Long,
+    val sub: String,
+    val email: String?,
+    val gphotosLinked: Boolean,
+)
 
 data class ShootStatusResponse(
     val shootId: String,

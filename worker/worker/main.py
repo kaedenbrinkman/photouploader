@@ -41,7 +41,7 @@ def download_raws(s3, bucket: str, shoot_id: str, manifest: dict, raw_dir: Path)
         name = (f.get("original_name") or "").upper()
         if name.endswith(".JPG"):
             ext = ".JPG"
-        key = f"shoots/{shoot_id}/raw/{sha}{ext}"
+        key = f.get("s3_key") or f"shoots/{shoot_id}/raw/{sha}{ext}"
         dest = raw_dir / f"{sha}{ext}"
         if not dest.exists():
             dest.parent.mkdir(parents=True, exist_ok=True)

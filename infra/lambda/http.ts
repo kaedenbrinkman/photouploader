@@ -1,6 +1,8 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 
 export function userIdFromEvent(event: APIGatewayProxyEventV2): string | undefined {
+  const lambda = event.requestContext.authorizer?.lambda;
+  if (lambda?.sub) return String(lambda.sub);
   const jwt = event.requestContext.authorizer?.jwt;
   if (jwt?.claims?.sub) return String(jwt.claims.sub);
   return undefined;
