@@ -1,5 +1,5 @@
 FROM amazonlinux:2023
-RUN dnf install -y python3 tar python3-pip && dnf clean all
+RUN dnf install -y python3 tar gzip python3-pip && dnf clean all
 WORKDIR /src
 COPY worker/requirements.txt worker/requirements.txt
 COPY worker/worker worker/worker
