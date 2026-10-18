@@ -541,6 +541,10 @@ private fun TransferMetricsCard(metrics: LiveUploadMetrics, onOpenCaptivePortal:
                 }
             }
             Text(
+                "S3 Transfer Acceleration: ${if (metrics.transferAccelerationActive) "on" else "off"}",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Text(
                 "Speed now ${formatMbps(metrics.currentBps)} · avg ${formatMbps(metrics.averageBps)} · peak ${formatMbps(metrics.peakBps)}",
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -623,6 +627,7 @@ fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
     var allowCellular by remember { mutableStateOf(prefs.allowCellular) }
     var partSizeMb by remember { mutableStateOf((prefs.partSizeBytes / (1024 * 1024)).toString()) }
     var concurrency by remember { mutableStateOf(prefs.maxConcurrentParts.toString()) }
+    var transferAcceleration by remember { mutableStateOf(prefs.transferAcceleration) }
     val snackbarHost = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
@@ -659,6 +664,7 @@ fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
                     prefs.allowCellular = allowCellular
                     prefs.partSizeBytes = (partSizeMb.toLongOrNull() ?: 8L).coerceAtLeast(5L) * 1024 * 1024
                     prefs.maxConcurrentParts = concurrency.toIntOrNull()?.coerceIn(0, 4) ?: 0
+                    prefs.transferAcceleration = transferAcceleration
                     scope.launch { snackbarHost.showSnackbar("Settings saved") }
                 },
                 modifier = Modifier.fillMaxWidth(),
@@ -677,6 +683,14 @@ fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
             }
             OutlinedTextField(partSizeMb, { partSizeMb = it }, label = { Text("Part size (MiB, min 5)") }, modifier = Modifier.fillMaxWidth())
             OutlinedTextField(concurrency, { concurrency = it }, label = { Text("Parallel parts (0=adaptive, 1-4)") }, modifier = Modifier.fillMaxWidth())
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(
+                    "Use Transfer Acceleration (≈ +\$0.04/GB, helps on far-away/slow networks)",
+                    modifier = Modifier.weight(1f).padding(end = 8.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Switch(transferAcceleration, { transferAcceleration = it })
+            }
             HorizontalDivider()
             Text(
                 "OAuth: ${repository.photosOAuthUrl(userId.ifBlank { "me" })}",
@@ -710,9 +724,16 @@ fun EstimateCard(json: String) {
                 style = MaterialTheme.typography.titleSmall,
             )
             Text("Processing ~${o.optDouble("processingMinutes")} min")
+            val accelUsd = o.optDouble("transferAccelerationUsd", 0.0)
             Text(
-                "This shoot ~$${o.optDouble("totalShootUsd")} " +
-                    "(compute $${o.optDouble("computeUsd")} + S3 ~$${o.optDouble("s3StandardMonthUsd")}/mo)",
+                buildString {
+                    append(
+                        "This shoot ~$${o.optDouble("totalShootUsd")} " +
+                            "(compute $${o.optDouble("computeUsd")} + S3 ~$${o.optDouble("s3StandardMonthUsd")}/mo",
+                    )
+                    if (accelUsd > 0) append(" + accel ~$$accelUsd")
+                    append(")")
+                },
             )
             o.optString("notes").takeIf { it.isNotBlank() }?.let {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

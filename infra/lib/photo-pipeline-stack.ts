@@ -49,6 +49,8 @@ export class PhotoPipelineStack extends cdk.Stack {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       enforceSSL: true,
       versioned: false,
+      /** No cost until accelerated PUT/GET; presign Lambda uses s3-accelerate when requested. */
+      transferAcceleration: true,
       lifecycleRules: [
         {
           id: 'raw-deep-archive',

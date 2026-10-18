@@ -37,4 +37,8 @@ class UploadPreferences(context: Context) {
     var lastMeasuredUploadBps: Long
         get() = prefs.getLong("last_measured_upload_bps", 0)
         set(v) = prefs.edit().putLong("last_measured_upload_bps", v).apply()
+
+    var transferAcceleration: Boolean
+        get() = prefs.getBoolean("transfer_acceleration", false)
+        set(v) = prefs.edit().putBoolean("transfer_acceleration", v).apply()
 }

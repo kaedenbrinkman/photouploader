@@ -20,6 +20,7 @@ data class S3Pricing(
     val standardUsdPerGbMonth: Double,
     val deepArchiveUsdPerGbMonth: Double,
     val putPer1000: Double,
+    val transferAccelerationUsdPerGb: Double = 0.04,
 )
 
 data class LambdaApiPricing(

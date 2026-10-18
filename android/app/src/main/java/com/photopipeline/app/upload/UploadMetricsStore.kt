@@ -21,6 +21,7 @@ data class LiveUploadMetrics(
     val pausedReason: String? = null,
     val network: NetworkSnapshot? = null,
     val speedHistoryBps: List<Long> = emptyList(),
+    val transferAccelerationActive: Boolean = false,
 )
 
 object UploadMetricsStore {

@@ -10,6 +10,7 @@ data class CostEstimateDto(
     val s3StandardMonthUsd: Double,
     val s3DeepArchiveMonthUsd: Double,
     val requestsUsd: Double,
+    val transferAccelerationUsd: Double = 0.0,
     val totalShootUsd: Double,
 )
 

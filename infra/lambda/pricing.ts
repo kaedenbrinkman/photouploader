@@ -10,6 +10,7 @@ export interface CostEstimate {
   s3StandardMonthUsd: number;
   s3DeepArchiveMonthUsd: number;
   requestsUsd: number;
+  transferAccelerationUsd: number;
   totalShootUsd: number;
 }
 
@@ -17,7 +18,11 @@ export function getPricingTable() {
   return pricingTable;
 }
 
-export function estimateShoot(imageCount: number, totalBytesRaw: number): CostEstimate {
+export function estimateShoot(
+  imageCount: number,
+  totalBytesRaw: number,
+  opts?: { transferAcceleration?: boolean },
+): CostEstimate {
   if (imageCount <= 0) throw new Error('imageCount must be positive');
   const p = pricingTable as any;
   const ec2 = p.ec2;
@@ -34,6 +39,8 @@ export function estimateShoot(imageCount: number, totalBytesRaw: number): CostEs
   const s3DeepArchiveMonthUsd = gb * p.s3.deepArchiveUsdPerGbMonth;
   const puts = imageCount * 3;
   const requestsUsd = (puts / 1000) * p.s3.putPer1000 + p.lambdaAndApi.estimatePerShootUsd;
+  const accelRate = p.s3.transferAccelerationUsdPerGb ?? 0.04;
+  const transferAccelerationUsd = opts?.transferAcceleration ? round(gb * accelRate) : 0;
   return {
     imageCount,
     totalBytesRaw,
@@ -44,7 +51,8 @@ export function estimateShoot(imageCount: number, totalBytesRaw: number): CostEs
     s3StandardMonthUsd: round(s3StandardMonthUsd),
     s3DeepArchiveMonthUsd: round(s3DeepArchiveMonthUsd),
     requestsUsd: round(requestsUsd),
-    totalShootUsd: round(computeUsd + s3StandardMonthUsd + requestsUsd),
+    transferAccelerationUsd,
+    totalShootUsd: round(computeUsd + s3StandardMonthUsd + requestsUsd + transferAccelerationUsd),
   };
 }
 

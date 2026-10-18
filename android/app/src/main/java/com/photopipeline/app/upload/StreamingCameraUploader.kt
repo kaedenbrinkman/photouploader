@@ -48,13 +48,16 @@ class StreamingCameraUploader(
         var uploadId = file.s3UploadId
         var key = file.s3Key
         if (uploadId.isNullOrBlank() || key.isNullOrBlank()) {
-            val created = api.createMultipart(shootId, uploadRef, file.originalName)
+            val accel = prefs.transferAcceleration
+            val created = api.createMultipart(shootId, uploadRef, file.originalName, accel)
+            UploadMetricsStore.update { it.copy(transferAccelerationActive = accel) }
             uploadId = created.first
             key = created.second
         }
         if (parts.isEmpty()) {
             runCatching {
-                parts = api.listParts(shootId, uploadId!!, key!!).map { UploadPart(it.first, it.second) }
+                parts = api.listParts(shootId, uploadId!!, key!!, prefs.transferAcceleration)
+                    .map { UploadPart(it.first, it.second) }
             }
         }
         onProgress(0, 0, parts.size, plans.size, parts, uploadId!!, key!!)
@@ -75,14 +78,20 @@ class StreamingCameraUploader(
                     val read = MtpPartReader.readPart(mtp, handle, plan.offset, plan.length.toInt(), buffer)
                     if (read <= 0) throw IOException("MTP read 0 bytes at ${plan.offset}")
                     hasher.update(buffer, 0, read)
-                    val url = api.presignPart(
+                    val presigned = api.presignPart(
                         shootId,
                         uploadRef,
                         plan.partNumber,
                         uploadId!!,
                         file.originalName,
                         file.sizeBytes,
+                        prefs.transferAcceleration,
                     )
+                    UploadMetricsStore.update {
+                        it.copy(transferAccelerationActive = presigned.transferAcceleration ||
+                            presigned.url.contains("s3-accelerate", ignoreCase = true))
+                    }
+                    val url = presigned.url
                     val body = buffer.copyOf(read).toRequestBody(OCTET)
                     val response = http.newCall(Request.Builder().url(url).put(body).build()).execute()
                     response.use { resp ->
@@ -117,7 +126,7 @@ class StreamingCameraUploader(
                 }
             }
         }
-        api.completeMultipart(shootId, uploadRef, key!!, uploadId!!, parts)
+        api.completeMultipart(shootId, uploadRef, key!!, uploadId!!, parts, prefs.transferAcceleration)
         return Result(hasher.digestHex(), parts)
     }
 

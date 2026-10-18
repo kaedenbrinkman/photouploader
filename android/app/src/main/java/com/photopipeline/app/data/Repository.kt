@@ -301,8 +301,9 @@ class Repository(
         } else {
             null
         }
+        val useAccel = uploadPreferences.transferAcceleration
         val stored = if (canUseBackendApi()) {
-            val remote = runCatching { api.fetchEstimate(imageCount, totalBytes) }
+            val remote = runCatching { api.fetchEstimate(imageCount, totalBytes, useAccel) }
             if (remote.isSuccess) {
                 StoredEstimate(remote.getOrThrow(), EstimateSource.BACKEND)
             } else {
@@ -312,14 +313,20 @@ class Repository(
                     "Backend estimate failed (${err?.message}); using local pricing.json",
                     err,
                 )
-                StoredEstimate(localPricing.estimateShoot(imageCount, totalBytes), EstimateSource.LOCAL)
+                StoredEstimate(
+                    localPricing.estimateShoot(imageCount, totalBytes, useAccel),
+                    EstimateSource.LOCAL,
+                )
             }
         } else {
             PipelineLog.d(
                 "estimate",
                 "Using local pricing (signedIn=${isGoogleAccountLinked()} configured=${isBackendConfigured()})",
             )
-            StoredEstimate(localPricing.estimateShoot(imageCount, totalBytes), EstimateSource.LOCAL)
+            StoredEstimate(
+                localPricing.estimateShoot(imageCount, totalBytes, useAccel),
+                EstimateSource.LOCAL,
+            )
         }
         val shoot = getShoot(shootId)
         if (shoot != null) {
@@ -332,6 +339,7 @@ class Repository(
                             "totalShootUsd" to stored.response.estimate.totalShootUsd,
                             "computeUsd" to stored.response.estimate.computeUsd,
                             "s3StandardMonthUsd" to stored.response.estimate.s3StandardMonthUsd,
+                            "transferAccelerationUsd" to stored.response.estimate.transferAccelerationUsd,
                             "source" to stored.source.name,
                             "notes" to notes,
                             "uploadMinutesMeasured" to uploadMinutes,
@@ -380,7 +388,7 @@ class Repository(
                     }
                 },
             )
-        api.uploadManifest(shootId, manifest.toString())
+        api.uploadManifest(shootId, manifest.toString(), uploadPreferences.transferAcceleration)
         db.shootDao().upsert(shoot.copy(phase = "MANIFEST_UPLOADED"))
     }
 

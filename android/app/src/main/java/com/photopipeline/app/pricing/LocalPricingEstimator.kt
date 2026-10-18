@@ -13,7 +13,11 @@ class LocalPricingEstimator private constructor(private val table: PricingTable)
 
     constructor(pricingJsonString: String) : this(parse(pricingJsonString))
 
-    fun estimateShoot(imageCount: Int, totalBytesRaw: Long): EstimateResponse {
+    fun estimateShoot(
+        imageCount: Int,
+        totalBytesRaw: Long,
+        transferAcceleration: Boolean = false,
+    ): EstimateResponse {
         require(imageCount > 0) { "imageCount must be positive" }
         val ec2 = table.ec2
         val s3 = table.s3
@@ -34,6 +38,11 @@ class LocalPricingEstimator private constructor(private val table: PricingTable)
         val s3DeepArchiveMonthUsd = gb * s3.deepArchiveUsdPerGbMonth
         val puts = imageCount * 3
         val requestsUsd = (puts / 1000.0) * s3.putPer1000 + table.lambdaAndApi.estimatePerShootUsd
+        val transferAccelerationUsd = if (transferAcceleration) {
+            round4(gb * s3.transferAccelerationUsdPerGb)
+        } else {
+            0.0
+        }
         val dto = CostEstimateDto(
             imageCount = imageCount,
             totalBytesRaw = totalBytesRaw,
@@ -44,12 +53,14 @@ class LocalPricingEstimator private constructor(private val table: PricingTable)
             s3StandardMonthUsd = round4(s3StandardMonthUsd),
             s3DeepArchiveMonthUsd = round4(s3DeepArchiveMonthUsd),
             requestsUsd = round4(requestsUsd),
-            totalShootUsd = round4(computeUsd + s3StandardMonthUsd + requestsUsd),
+            transferAccelerationUsd = transferAccelerationUsd,
+            totalShootUsd = round4(computeUsd + s3StandardMonthUsd + requestsUsd + transferAccelerationUsd),
         )
-        return EstimateResponse(
-            estimate = dto,
-            notes = listOf("Computed on device from bundled pricing.json"),
-        )
+        val notes = mutableListOf("Computed on device from bundled pricing.json")
+        if (transferAcceleration) {
+            notes += "Includes S3 Transfer Acceleration surcharge (~$${s3.transferAccelerationUsdPerGb}/GB uploaded)."
+        }
+        return EstimateResponse(estimate = dto, notes = notes)
     }
 
     private fun round1(n: Double): Double = round(n * 10.0) / 10.0

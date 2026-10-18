@@ -20,8 +20,16 @@ class ApiClient(
     private val estimateAdapter: JsonAdapter<EstimateResponse> = moshi.adapter(EstimateResponse::class.java)
     private val statusAdapter: JsonAdapter<ShootStatusResponse> = moshi.adapter(ShootStatusResponse::class.java)
 
-    suspend fun fetchEstimate(imageCount: Int, totalBytesRaw: Long): EstimateResponse {
-        val body = JSONObject().put("imageCount", imageCount).put("totalBytesRaw", totalBytesRaw).toString()
+    suspend fun fetchEstimate(
+        imageCount: Int,
+        totalBytesRaw: Long,
+        transferAcceleration: Boolean = false,
+    ): EstimateResponse {
+        val body = JSONObject()
+            .put("imageCount", imageCount)
+            .put("totalBytesRaw", totalBytesRaw)
+            .putTransferAcceleration(transferAcceleration)
+            .toString()
         val req = authorizedRequest("/shoots/estimate").post(body.toRequestBody(JSON)).build()
         return client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) throw ApiRequestException("estimate failed: ${resp.code}", resp.code)
@@ -30,11 +38,17 @@ class ApiClient(
         }
     }
 
-    suspend fun createMultipart(shootId: String, sha256: String, originalName: String): Pair<String, String> {
+    suspend fun createMultipart(
+        shootId: String,
+        sha256: String,
+        originalName: String,
+        transferAcceleration: Boolean = false,
+    ): Pair<String, String> {
         val body = JSONObject()
             .put("action", "create_multipart")
             .put("sha256", sha256)
             .put("originalName", originalName)
+            .putTransferAcceleration(transferAcceleration)
             .toString()
         val req = authorizedRequest("/shoots/$shootId/presign").post(body.toRequestBody(JSON)).build()
         return client.newCall(req).execute().use { resp ->
@@ -51,7 +65,8 @@ class ApiClient(
         uploadId: String,
         originalName: String,
         sizeBytes: Long,
-    ): String {
+        transferAcceleration: Boolean = false,
+    ): PresignedPartUrl {
         val body = JSONObject()
             .put("action", "presign_part")
             .put("sha256", sha256)
@@ -59,19 +74,30 @@ class ApiClient(
             .put("uploadId", uploadId)
             .put("originalName", originalName)
             .put("sizeBytes", sizeBytes)
+            .putTransferAcceleration(transferAcceleration)
             .toString()
         val req = authorizedRequest("/shoots/$shootId/presign").post(body.toRequestBody(JSON)).build()
         return client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("presign part failed")
-            JSONObject(resp.body!!.string()).getString("url")
+            val json = JSONObject(resp.body!!.string())
+            PresignedPartUrl(
+                url = json.getString("url"),
+                transferAcceleration = json.optBoolean("transferAcceleration", transferAcceleration),
+            )
         }
     }
 
-    suspend fun listParts(shootId: String, uploadId: String, key: String): List<Pair<Int, String>> {
+    suspend fun listParts(
+        shootId: String,
+        uploadId: String,
+        key: String,
+        transferAcceleration: Boolean = false,
+    ): List<Pair<Int, String>> {
         val body = JSONObject()
             .put("action", "list_parts")
             .put("uploadId", uploadId)
             .put("key", key)
+            .putTransferAcceleration(transferAcceleration)
             .toString()
         val req = authorizedRequest("/shoots/$shootId/presign").post(body.toRequestBody(JSON)).build()
         return client.newCall(req).execute().use { resp ->
@@ -92,6 +118,7 @@ class ApiClient(
         key: String,
         uploadId: String,
         parts: List<UploadPart>,
+        transferAcceleration: Boolean = false,
     ) {
         val partsJson = JSONArray().apply {
             parts.sortedBy { it.partNumber }.forEach { p ->
@@ -104,6 +131,7 @@ class ApiClient(
             .put("key", key)
             .put("uploadId", uploadId)
             .put("parts", partsJson)
+            .putTransferAcceleration(transferAcceleration)
             .toString()
         val req = authorizedRequest("/shoots/$shootId/presign").post(body.toRequestBody(JSON)).build()
         client.newCall(req).execute().use { resp ->
@@ -111,8 +139,11 @@ class ApiClient(
         }
     }
 
-    suspend fun uploadManifest(shootId: String, manifestJson: String) {
-        val presignBody = JSONObject().put("action", "presign_manifest").toString()
+    suspend fun uploadManifest(shootId: String, manifestJson: String, transferAcceleration: Boolean = false) {
+        val presignBody = JSONObject()
+            .put("action", "presign_manifest")
+            .putTransferAcceleration(transferAcceleration)
+            .toString()
         val presignReq = authorizedRequest("/shoots/$shootId/presign").post(presignBody.toRequestBody(JSON)).build()
         val url = client.newCall(presignReq).execute().use { resp ->
             if (!resp.isSuccessful) error("presign manifest failed")
@@ -151,8 +182,15 @@ class ApiClient(
             .header("Authorization", "Bearer $token")
     }
 
+    private fun JSONObject.putTransferAcceleration(enabled: Boolean): JSONObject {
+        if (enabled) put("transferAcceleration", true)
+        return this
+    }
+
     companion object {
         private val JSON = "application/json".toMediaType()
         private val MANIFEST_JSON = "application/json".toMediaType()
     }
 }
+
+data class PresignedPartUrl(val url: String, val transferAcceleration: Boolean)

@@ -34,6 +34,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 shootId = shootId,
                 filesTotal = files.size,
                 network = network.snapshot(),
+                transferAccelerationActive = prefs.transferAcceleration,
             )
         }
         if (!network.canUpload(prefs.wifiOnly, prefs.allowCellular)) {
@@ -137,8 +138,9 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 file.captureTimeEpochMs,
             )
         }
+        val accel = prefs.transferAcceleration
         if (uploadId.isNullOrBlank() || key.isNullOrBlank()) {
-            val created = repo.api.createMultipart(shootId, uploadRef, file.originalName)
+            val created = repo.api.createMultipart(shootId, uploadRef, file.originalName, accel)
             uploadId = created.first
             key = created.second
         }
@@ -151,10 +153,21 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 val buf = ByteArray(plan.length.toInt())
                 raf.seek(plan.offset)
                 raf.readFully(buf)
-                val url = repo.api.presignPart(
-                    shootId, uploadRef, plan.partNumber, uploadId!!, file.originalName, file.sizeBytes,
+                val presigned = repo.api.presignPart(
+                    shootId,
+                    uploadRef,
+                    plan.partNumber,
+                    uploadId!!,
+                    file.originalName,
+                    file.sizeBytes,
+                    accel,
                 )
-                client.newCall(Request.Builder().url(url).put(buf.toRequestBody(OCTET)).build()).execute().use { resp ->
+                UploadMetricsStore.update {
+                    it.copy(transferAccelerationActive = presigned.transferAcceleration || accel)
+                }
+                client.newCall(
+                    Request.Builder().url(presigned.url).put(buf.toRequestBody(OCTET)).build(),
+                ).execute().use { resp ->
                     if (!resp.isSuccessful) error("part upload failed")
                     val eTag = resp.header("ETag")?.trim()?.trim('"') ?: error("missing ETag")
                     parts = UploadParts.merge(parts, UploadPart(plan.partNumber, eTag))
@@ -170,7 +183,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 )
             }
         }
-        repo.api.completeMultipart(shootId, uploadRef, key!!, uploadId!!, parts)
+        repo.api.completeMultipart(shootId, uploadRef, key!!, uploadId!!, parts, accel)
     }
 
     private fun pausedMessage(net: NetworkSnapshot): String = when {
