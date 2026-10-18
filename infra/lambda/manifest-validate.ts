@@ -1,6 +1,7 @@
 export interface ManifestFile {
   sha256: string;
   size_bytes: number;
+  s3_key?: string;
   original_name?: string;
   storage_id?: number;
   object_handle?: number;

@@ -6,17 +6,29 @@ import android.content.Context
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.work.ForegroundInfo
+
 object UploadNotifications {
     private const val CHANNEL = "uploads"
     private const val NOTIFICATION_ID = 42
 
-    fun foregroundInfo(context: Context): ForegroundInfo {
+    fun foregroundInfo(
+        context: Context,
+        speedBps: Long = 0,
+        etaSeconds: Long? = null,
+        filesDone: Int = 0,
+        filesTotal: Int = 0,
+    ): ForegroundInfo {
         createChannel(context)
+        val speedMbps = speedBps * 8.0 / 1_000_000.0
+        val eta = etaSeconds?.let { " · ETA ${it / 60}m ${it % 60}s" } ?: ""
         val notification = NotificationCompat.Builder(context, CHANNEL)
-            .setContentTitle("Uploading RAW files")
-            .setContentText("Transfer to S3 in progress")
+            .setContentTitle("Uploading from camera → S3")
+            .setContentText(
+                "Files $filesDone/$filesTotal · ${"%.1f".format(speedMbps)} Mbps$eta",
+            )
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .build()
         return ForegroundInfo(NOTIFICATION_ID, notification)
     }

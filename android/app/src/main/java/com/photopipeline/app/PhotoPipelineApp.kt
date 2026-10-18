@@ -8,9 +8,12 @@ import com.photopipeline.app.data.Repository
 import com.photopipeline.app.mtp.CanonMtpRepository
 import com.photopipeline.app.mtp.UsbCameraManager
 import com.photopipeline.app.pricing.LocalPricingEstimator
+import com.photopipeline.app.upload.UploadPreferences
 
 class PhotoPipelineApp : Application(), Configuration.Provider {
     lateinit var repository: Repository
+        private set
+    lateinit var uploadPreferences: UploadPreferences
         private set
     lateinit var usbCameraManager: UsbCameraManager
         private set
@@ -22,6 +25,7 @@ class PhotoPipelineApp : Application(), Configuration.Provider {
         usbCameraManager.start()
         val pricingJson = assets.open("pricing.json").bufferedReader().use { it.readText() }
         val localPricing = LocalPricingEstimator(pricingJson)
+        uploadPreferences = UploadPreferences(this)
         val db = AppDatabase.build(this)
         repository = Repository(
             db,
@@ -29,6 +33,7 @@ class PhotoPipelineApp : Application(), Configuration.Provider {
             CanonMtpRepository(usbCameraManager),
             usbCameraManager,
             localPricing,
+            uploadPreferences,
         )
     }
 

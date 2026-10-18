@@ -184,8 +184,17 @@ class ShootViewModel(
                 _ui.value = _ui.value.copy(snackbar = "Select at least one file to import.")
                 return@launch
             }
-            _ui.value = _ui.value.copy(busy = true, statusLine = "Importing ${selected.size} file(s)…")
-            when (val result = repo.importFromCamera(shootId, importDir, selected)) {
+            _ui.value = _ui.value.copy(
+                busy = true,
+                statusLine = "Queuing ${selected.size} file(s) for camera→S3 upload (keep USB connected)…",
+            )
+            when (
+                val result = repo.registerSelectedCameraFiles(
+                    shootId,
+                    selected,
+                    localCopy = false,
+                )
+            ) {
                 is CameraImportResult.Imported -> {
                     _ui.value = _ui.value.copy(
                         busy = false,

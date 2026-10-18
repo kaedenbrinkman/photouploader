@@ -8,7 +8,8 @@ import androidx.work.workDataOf
 import com.photopipeline.app.api.ApiClient
 import com.photopipeline.app.api.NotSignedInException
 import com.photopipeline.app.core.PipelineLog
-import com.photopipeline.app.core.fileIdentityKey
+import com.photopipeline.app.core.cameraFileIdentityKey
+import com.photopipeline.app.core.metadataUploadSha256
 import com.photopipeline.app.pricing.LocalPricingEstimator
 import com.photopipeline.app.mtp.MtpRepository
 import com.photopipeline.app.mtp.MtpObjectInfo
@@ -17,6 +18,7 @@ import com.photopipeline.app.mtp.UsbCameraManager
 import com.photopipeline.app.mtp.UsbDebugLog
 import com.photopipeline.app.upload.UploadPart
 import com.photopipeline.app.upload.UploadParts
+import com.photopipeline.app.upload.UploadPreferences
 import com.photopipeline.app.upload.UploadWorker
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -30,6 +32,7 @@ class Repository(
     mtpOverride: MtpRepository? = null,
     private val usb: UsbCameraManager? = null,
     private val localPricing: LocalPricingEstimator,
+    private val uploadPreferences: UploadPreferences,
 ) {
     private val appContext = context.applicationContext
     val mtp: MtpRepository = mtpOverride ?: error("MtpRepository required")
@@ -55,6 +58,26 @@ class Repository(
     suspend fun markFileFailed(identityKey: String, error: String) = patchFile(identityKey) {
         it.copy(uploadState = "FAILED", lastError = error, retryCount = it.retryCount + 1)
     }
+
+    suspend fun markFilePaused(identityKey: String, reason: String) = patchFile(identityKey) {
+        it.copy(uploadState = "PAUSED", lastError = reason)
+    }
+
+    suspend fun markFileUploading(identityKey: String) = patchFile(identityKey) {
+        it.copy(uploadState = "UPLOADING", lastError = null)
+    }
+
+    suspend fun incrementRetry(identityKey: String, error: String) = patchFile(identityKey) {
+        it.copy(retryCount = it.retryCount + 1, lastError = error)
+    }
+
+    suspend fun updateFileContentSha256(identityKey: String, sha256: String, parts: List<UploadPart>) =
+        patchFile(identityKey) {
+            it.copy(sha256 = sha256, uploadPartsJson = UploadParts.toJson(parts), uploadedBytes = it.sizeBytes)
+        }
+
+    suspend fun countUploadedFiles(shootId: String): Int =
+        db.fileDao().observeForShoot(shootId).first().count { it.uploadState == "UPLOADED" }
 
     suspend fun updateUploadProgress(
         identityKey: String,
@@ -181,52 +204,57 @@ class Repository(
         )
     }
 
-    suspend fun importFromCamera(
+    suspend fun registerSelectedCameraFiles(
         shootId: String,
-        destDir: File,
-        only: List<MtpObjectInfo>? = null,
+        only: List<MtpObjectInfo>,
+        localCopy: Boolean = false,
+        destDir: File? = null,
     ): CameraImportResult {
-        destDir.mkdirs()
         ensureUsbReady()?.let { return it }
-        val objects = only ?: runCatching { mtp.listCr3Objects() }.getOrElse { e ->
-            return CameraImportResult.Error(
-                stage = "list",
-                userMessage = "Failed to read camera: ${e.message ?: "unknown error"}",
-            )
-        }
-        if (objects.isEmpty()) {
-            return CameraImportResult.Error(
-                stage = "import",
-                userMessage = "Nothing selected to import.",
-            )
+        if (only.isEmpty()) {
+            return CameraImportResult.Error(stage = "import", userMessage = "Nothing selected.")
         }
         val existingKeys = db.fileDao().observeForShoot(shootId).first().map { it.identityKey }.toSet()
         val entities = mutableListOf<FileEntity>()
-        for (obj in objects) {
-            val path = File(destDir, obj.filename).absolutePath
-            val partialSha = if (File(path).length() == obj.sizeBytes && File(path).exists()) {
-                sha256File(File(path))
-            } else {
-                mtp.importObject(obj, path) { }
-            }
-            val key = fileIdentityKey(
+        for (obj in only) {
+            val identityKey = cameraFileIdentityKey(
                 obj.storageId,
                 obj.handle,
                 obj.sizeBytes,
                 obj.captureTimeEpochMs,
-                partialSha,
             )
-            if (key in existingKeys) continue
+            if (identityKey in existingKeys) continue
+            val uploadRef = metadataUploadSha256(
+                obj.storageId,
+                obj.handle,
+                obj.sizeBytes,
+                obj.captureTimeEpochMs,
+            )
+            var localPath: String? = null
+            var sha256 = ""
+            var uploadSource = "CAMERA_STREAM"
+            if (localCopy && destDir != null) {
+                destDir.mkdirs()
+                val path = File(destDir, obj.filename).absolutePath
+                sha256 = if (File(path).length() == obj.sizeBytes && File(path).exists()) {
+                    sha256File(File(path))
+                } else {
+                    mtp.importObject(obj, path) { }
+                }
+                localPath = path
+                uploadSource = "LOCAL"
+            }
             entities += FileEntity(
-                identityKey = key,
+                identityKey = identityKey,
                 shootId = shootId,
-                sha256 = partialSha,
+                sha256 = sha256.ifBlank { uploadRef },
                 originalName = obj.filename,
                 sizeBytes = obj.sizeBytes,
                 storageId = obj.storageId,
                 objectHandle = obj.handle,
                 captureTimeEpochMs = obj.captureTimeEpochMs,
-                localPath = path,
+                localPath = localPath,
+                uploadSource = uploadSource,
                 uploadState = "PENDING",
                 uploadedBytes = 0,
                 uploadSpeedBps = 0,
@@ -251,8 +279,9 @@ class Repository(
             ),
         )
         val msg = when {
-            entities.isEmpty() -> "No new files to import (${objects.size} already in this shoot)."
-            else -> "Imported ${entities.size} new file(s)."
+            entities.isEmpty() -> "No new files to add (${only.size} already in this shoot)."
+            localCopy -> "Copied ${entities.size} file(s) to phone (local mode)."
+            else -> "Queued ${entities.size} file(s) for direct camera→S3 upload (no full copy on phone)."
         }
         UsbDebugLog.log(msg)
         return CameraImportResult.Imported(
@@ -266,6 +295,12 @@ class Repository(
         val files = db.fileDao().observeForShoot(shootId).first()
         val imageCount = files.size.coerceAtLeast(1)
         val totalBytes = files.sumOf { it.sizeBytes }.coerceAtLeast(1)
+        val measuredBps = uploadPreferences.lastMeasuredUploadBps
+        val uploadMinutes = if (measuredBps > 0) {
+            (totalBytes * 8.0 / measuredBps / 60.0).coerceAtLeast(0.1)
+        } else {
+            null
+        }
         val stored = if (canUseBackendApi()) {
             val remote = runCatching { api.fetchEstimate(imageCount, totalBytes) }
             if (remote.isSuccess) {
@@ -299,6 +334,8 @@ class Repository(
                             "s3StandardMonthUsd" to stored.response.estimate.s3StandardMonthUsd,
                             "source" to stored.source.name,
                             "notes" to notes,
+                            "uploadMinutesMeasured" to uploadMinutes,
+                            "measuredUploadMbps" to if (measuredBps > 0) measuredBps * 8.0 / 1_000_000.0 else null,
                         ),
                     ).toString(),
                     phase = "ESTIMATE",
@@ -322,9 +359,18 @@ class Repository(
                 "files",
                 JSONArray().apply {
                     files.forEach { f ->
+                        val uploadRef = metadataUploadSha256(
+                            f.storageId,
+                            f.objectHandle,
+                            f.sizeBytes,
+                            f.captureTimeEpochMs,
+                        )
+                        val ext = if (f.originalName.uppercase().endsWith(".JPG")) ".JPG" else ".CR3"
+                        val s3Key = "shoots/$shootId/raw/${uploadRef.lowercase()}$ext"
                         put(
                             JSONObject()
                                 .put("sha256", f.sha256)
+                                .put("s3_key", s3Key)
                                 .put("size_bytes", f.sizeBytes)
                                 .put("original_name", f.originalName)
                                 .put("storage_id", f.storageId)

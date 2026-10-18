@@ -29,6 +29,8 @@ data class FileEntity(
     val objectHandle: Long,
     val captureTimeEpochMs: Long,
     val localPath: String?,
+    /** CAMERA_STREAM (default) streams MTP→S3; LOCAL uses localPath copy mode. */
+    val uploadSource: String = "CAMERA_STREAM",
     val uploadState: String,
     val uploadedBytes: Long,
     val uploadSpeedBps: Long,

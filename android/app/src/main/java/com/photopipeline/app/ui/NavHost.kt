@@ -69,8 +69,16 @@ import com.photopipeline.app.data.Repository
 import com.photopipeline.app.data.ShootEntity
 import com.photopipeline.app.mtp.UsbAccessState
 import com.photopipeline.app.mtp.UsbCameraManager
+import com.photopipeline.app.PhotoPipelineApp
 import com.photopipeline.app.ui.components.DebugLogPanel
 import com.photopipeline.app.ui.theme.PhotoPipelineTheme
+import com.photopipeline.app.upload.LiveUploadMetrics
+import com.photopipeline.app.upload.UploadMetricsStore
+import android.content.Intent
+import android.provider.Settings
+import androidx.compose.foundation.background
+import androidx.compose.material3.Switch
+import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -248,6 +256,7 @@ fun ShootFlowScreen(
     val shoot by vm.shoot.collectAsState()
     val files by vm.files.collectAsState()
     val ui by vm.ui.collectAsState()
+    val uploadMetrics by UploadMetricsStore.metrics.collectAsState()
     val usbState by usb.accessState.collectAsState()
     val snackbarHost = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
@@ -323,7 +332,19 @@ fun ShootFlowScreen(
                 }
                 ShootFlowStep.Upload -> {
                     item {
-                        UploadStep(files = files, onUpload = { vm.startUpload() }, onRetry = { vm.retryFailedUploads() })
+                        Text(
+                            "Keep the camera USB connected until every file finishes uploading.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                    item {
+                        UploadStep(
+                            files = files,
+                            metrics = uploadMetrics,
+                            onUpload = { vm.startUpload() },
+                            onRetry = { vm.retryFailedUploads() },
+                        )
                     }
                     item {
                         FilledTonalButton(
@@ -438,7 +459,7 @@ private fun SelectFilesStep(
             Text("Use selection above")
         }
         Button(onClick = onImport, enabled = !busy && ui.selectedHandles.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
-            Text("Import selected to phone")
+            Text("Queue selected for upload")
         }
     }
 }
@@ -486,17 +507,69 @@ private fun EstimateStep(
 @Composable
 private fun UploadStep(
     files: List<com.photopipeline.app.data.FileEntity>,
+    metrics: LiveUploadMetrics,
     onUpload: () -> Unit,
     onRetry: () -> Unit,
 ) {
+    val context = LocalContext.current
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (files.isEmpty()) {
-            Text("Import files before uploading.", color = MaterialTheme.colorScheme.error)
+            Text("Queue files from the camera before uploading.", color = MaterialTheme.colorScheme.error)
         } else {
+            TransferMetricsCard(metrics) {
+                context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
+            }
             Button(onClick = onUpload, modifier = Modifier.fillMaxWidth()) {
-                Text("Upload to S3")
+                Text("Start camera → S3 upload")
             }
             UploadProgressSection(files, onRetry)
+        }
+    }
+}
+
+@Composable
+private fun TransferMetricsCard(metrics: LiveUploadMetrics, onOpenCaptivePortal: () -> Unit) {
+    val net = metrics.network
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Transfer metrics", style = MaterialTheme.typography.titleSmall)
+            net?.let {
+                Text("Network: ${it.type} · validated=${it.validated} · metered=${it.metered}")
+                if (it.captivePortal) {
+                    Text("Captive portal detected — hotel Wi-Fi login required.", color = MaterialTheme.colorScheme.error)
+                    FilledTonalButton(onClick = onOpenCaptivePortal) { Text("Open Wi-Fi sign-in") }
+                }
+            }
+            Text(
+                "Speed now ${formatMbps(metrics.currentBps)} · avg ${formatMbps(metrics.averageBps)} · peak ${formatMbps(metrics.peakBps)}",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Text(
+                "Sent ${metrics.bytesSent}/${metrics.totalBytes} bytes · files ${metrics.filesDone}/${metrics.filesTotal} · parts ${metrics.partsDone}/${metrics.partsTotal}",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            metrics.etaSeconds?.let { Text("ETA ~${it / 60}m ${it % 60}s", style = MaterialTheme.typography.bodySmall) }
+            metrics.lastError?.let { Text("Last error: $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            metrics.pausedReason?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            SpeedSparkline(metrics.speedHistoryBps)
+        }
+    }
+}
+
+private fun formatMbps(bps: Long): String = "%.1f Mbps".format(bps * 8.0 / 1_000_000.0)
+
+@Composable
+private fun SpeedSparkline(samples: List<Long>) {
+    if (samples.isEmpty()) return
+    val max = samples.max().coerceAtLeast(1).toFloat()
+    Row(Modifier.fillMaxWidth().height(28.dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+        samples.forEach { v ->
+            Box(
+                Modifier
+                    .weight(1f)
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.25f + 0.75f * (v / max))),
+            )
         }
     }
 }
@@ -542,9 +615,14 @@ private fun ResultsStep(shoot: ShootEntity?) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
+    val prefs = (LocalContext.current.applicationContext as PhotoPipelineApp).uploadPreferences
     var apiBase by remember { mutableStateOf(repository.apiBaseUrl()) }
     var userId by remember { mutableStateOf(repository.googleUserId().orEmpty()) }
     var idToken by remember { mutableStateOf("") }
+    var wifiOnly by remember { mutableStateOf(prefs.wifiOnly) }
+    var allowCellular by remember { mutableStateOf(prefs.allowCellular) }
+    var partSizeMb by remember { mutableStateOf((prefs.partSizeBytes / (1024 * 1024)).toString()) }
+    var concurrency by remember { mutableStateOf(prefs.maxConcurrentParts.toString()) }
     val snackbarHost = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
@@ -577,12 +655,28 @@ fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
             Button(
                 onClick = {
                     repository.saveSettings(apiBase, userId, idToken.ifBlank { null })
+                    prefs.wifiOnly = wifiOnly
+                    prefs.allowCellular = allowCellular
+                    prefs.partSizeBytes = (partSizeMb.toLongOrNull() ?: 8L).coerceAtLeast(5L) * 1024 * 1024
+                    prefs.maxConcurrentParts = concurrency.toIntOrNull()?.coerceIn(0, 4) ?: 0
                     scope.launch { snackbarHost.showSnackbar("Settings saved") }
                 },
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text("Save")
             }
+            HorizontalDivider()
+            Text("Upload", style = MaterialTheme.typography.titleMedium)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Wi-Fi only")
+                Switch(wifiOnly, { wifiOnly = it })
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Allow cellular")
+                Switch(allowCellular, { allowCellular = it })
+            }
+            OutlinedTextField(partSizeMb, { partSizeMb = it }, label = { Text("Part size (MiB, min 5)") }, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(concurrency, { concurrency = it }, label = { Text("Parallel parts (0=adaptive, 1-4)") }, modifier = Modifier.fillMaxWidth())
             HorizontalDivider()
             Text(
                 "OAuth: ${repository.photosOAuthUrl(userId.ifBlank { "me" })}",
