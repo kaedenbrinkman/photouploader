@@ -7,5 +7,6 @@ object AppDefaults {
      * Web application OAuth client ID (server client ID for offline access / serverAuthCode).
      * Override in Settings. Android OAuth client (package + SHA-1) authorizes the APK only.
      */
-    const val GOOGLE_WEB_CLIENT_ID = ""
+    const val GOOGLE_WEB_CLIENT_ID =
+        "295257233255-iqrdnab7db4thkk2u65i5u37pdcuctd1.apps.googleusercontent.com"
 }

@@ -31,7 +31,7 @@ aws ssm put-parameter \
   --overwrite
 ```
 
-Copy the **Web client ID** into `AppDefaults.GOOGLE_WEB_CLIENT_ID` (or Settings).
+Default **Web client ID** is hard-coded in `AppDefaults.GOOGLE_WEB_CLIENT_ID` (overridable in Settings).
 
 ### B. Android (required — authorizes the APK)
 

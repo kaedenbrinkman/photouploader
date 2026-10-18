@@ -3,6 +3,7 @@ import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { GetParameterCommand, PutParameterCommand, SSMClient } from '@aws-sdk/client-ssm';
 import type { APIGatewayProxyHandlerV2 } from 'aws-lambda';
 import { getMethod, getPath, json } from './http';
+import { webClientCredentials } from './google-oauth-client';
 import { issueSessionToken } from './session';
 
 const ssm = new SSMClient({});
@@ -31,11 +32,11 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
   }
 
   const clientJson = await loadGoogleClient();
-  const clientId = clientJson.web?.client_id ?? clientJson.installed?.client_id;
-  const clientSecret = clientJson.web?.client_secret ?? clientJson.installed?.client_secret;
-  if (!clientId || !clientSecret) {
-    return json(500, { error: 'google oauth client misconfigured in SSM' });
+  const creds = webClientCredentials(clientJson);
+  if (!creds) {
+    return json(500, { error: 'google oauth client misconfigured in SSM (expected web.client_id + web.client_secret)' });
   }
+  const { clientId, clientSecret } = creds;
 
   const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
