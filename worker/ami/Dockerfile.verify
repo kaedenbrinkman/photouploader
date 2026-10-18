@@ -1,5 +1,5 @@
 FROM amazonlinux:2023
-RUN dnf install -y git gcc gcc-c++ make python3 python3-pip tar curl && dnf clean all
+RUN dnf install -y git gcc gcc-c++ make python3 python3-pip tar && dnf clean all
 COPY worker/ami/bootstrap.sh /tmp/bootstrap.sh
 COPY worker /tmp/photopipeline-worker
 ENV SKIP_LIGHTCRAFT_BUILD=1
