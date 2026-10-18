@@ -118,6 +118,7 @@ export class PhotoPipelineStack extends cdk.Stack {
       WORKER_SUBNET_ID: workerSubnetId.valueAsString,
       WORKER_AMI_ID: workerAmi.getImage(this).imageId,
       WORKER_MAX_LIFETIME_MINUTES: '120',
+      WORKER_BOOTSTRAP_TIMEOUT_MINUTES: '10',
       WORKER_BUNDLE_KEY: 'releases/photopipeline-worker.tar.gz',
       WORKER_BUNDLE_SHA256_PARAM: '/photopipeline/worker-bundle-sha256',
       LIGHTCRAFT_BINARY_KEY: 'releases/lightcraft-cli',
@@ -317,7 +318,7 @@ export class PhotoPipelineStack extends cdk.Stack {
     });
 
     new events.Rule(this, 'WorkerWatchdogSchedule', {
-      schedule: events.Schedule.rate(cdk.Duration.hours(1)),
+      schedule: events.Schedule.rate(cdk.Duration.minutes(10)),
       targets: [new targets.LambdaFunction(watchdogFn)],
     });
 

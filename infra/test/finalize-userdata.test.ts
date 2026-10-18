@@ -18,4 +18,14 @@ describe('EC2 user-data bootstrap script', () => {
     expect(sh).toMatch(/trap 'on_err \$LINENO' ERR/);
     expect(sh).toMatch(/report_fail/);
   });
+
+  it('updates shoot phase BOOTSTRAPPING then RENDERING', () => {
+    expect(sh).toMatch(/set_shoot_phase BOOTSTRAPPING/);
+    expect(sh).toMatch(/set_shoot_phase RENDERING/);
+  });
+
+  it('includes redacted bootstrap log tail in lastError on failure', () => {
+    expect(sh).toMatch(/splitlines\(\)\[-50:\]/);
+    expect(sh).toMatch(/\[REDACTED\]/);
+  });
 });

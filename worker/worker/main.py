@@ -86,7 +86,7 @@ def run() -> int:
     store.update_shoot(
         cfg.shoot_id,
         state="PROCESSING",
-        phase="DOWNLOADING",
+        phase="RENDERING",
         workerStartedAt=t0,
         totalFiles=0,
         renderedCount=0,
@@ -99,7 +99,7 @@ def run() -> int:
         total = len(manifest.get("files", []))
         store.update_shoot(cfg.shoot_id, totalFiles=total, phase="DOWNLOADING")
         raws = download_raws(s3, cfg.bucket, cfg.shoot_id, manifest, raw_dir)
-        store.update_shoot(cfg.shoot_id, phase="PROCESSING")
+        store.update_shoot(cfg.shoot_id, phase="RENDERING")
         rendered: list[Path] = []
         rendered_count = 0
 
@@ -146,7 +146,7 @@ def run() -> int:
                 if out:
                     rendered.append(out)
                     rendered_count += 1
-                    store.update_shoot(cfg.shoot_id, renderedCount=rendered_count, phase="PROCESSING")
+                    store.update_shoot(cfg.shoot_id, renderedCount=rendered_count, phase="RENDERING")
                 log.info("processed %s err=%s (%s/%s)", sha, err, rendered_count, total)
 
         store.update_shoot(cfg.shoot_id, state="PUBLISHING", phase="PUBLISHING_GP")

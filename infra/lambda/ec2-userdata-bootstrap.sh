@@ -9,9 +9,44 @@ INSTALL_ROOT="${INSTALL_ROOT:-/opt/photopipeline}"
 LIGHTCRAFT_BIN="${LIGHTCRAFT_BIN:-${INSTALL_ROOT}/lightcraft/lightcraft-cli}"
 VENV="${INSTALL_ROOT}/venv"
 WORKER_PY="${VENV}/bin/python"
+BOOTSTRAP_LOG="${INSTALL_ROOT}/bootstrap.log"
 BOOT_FAIL_REPORTED=0
 
-log() { echo "[photopipeline-bootstrap] $*" >&2; }
+mkdir -p "$INSTALL_ROOT"
+touch "$BOOTSTRAP_LOG"
+exec > >(tee -a "$BOOTSTRAP_LOG") 2>&1
+
+log() { echo "[photopipeline-bootstrap] $*"; }
+
+set_shoot_phase() {
+  local phase="$1"
+  export BOOTSTRAP_PHASE="$phase"
+  python3 - <<'PY' || log "phase update failed: ${BOOTSTRAP_PHASE}"
+import json, os, subprocess, time
+
+phase = os.environ["BOOTSTRAP_PHASE"]
+ts = str(int(time.time() * 1000))
+vals = json.dumps({":ph": {"S": phase}, ":t": {"N": ts}})
+subprocess.run(
+    [
+        "aws",
+        "dynamodb",
+        "update-item",
+        "--table-name",
+        os.environ["DYNAMODB_TABLE"],
+        "--key",
+        json.dumps(
+            {"pk": {"S": f"SHOOT#{os.environ['SHOOT_ID']}"}, "sk": {"S": "META"}}
+        ),
+        "--update-expression",
+        "SET phase = :ph, updatedAt = :t",
+        "--expression-attribute-values",
+        vals,
+    ],
+    check=False,
+)
+PY
+}
 
 report_fail() {
   local msg="${1:-bootstrap failed}"
@@ -25,10 +60,37 @@ report_fail() {
   REGION=$(curl -sf --max-time 2 http://169.254.169.254/latest/meta-data/placement/region || true)
   export AWS_DEFAULT_REGION="${REGION:-us-west-2}"
   export BOOT_MSG="$msg"
+  export BOOTSTRAP_LOG
   python3 - <<'PY' || log "ddb update failed (continuing shutdown)"
-import json, os, subprocess, time
+import json, os, re, subprocess, time
+
+def redact(line: str) -> str:
+    patterns = [
+        (r"(?i)(authorization:\s*)\S+", r"\1[REDACTED]"),
+        (r"(?i)(bearer\s+)\S+", r"\1[REDACTED]"),
+        (r"(?i)(token[=:]\s*)\S+", r"\1[REDACTED]"),
+        (r"(?i)(secret[=:]\s*)\S+", r"\1[REDACTED]"),
+        (r"(?i)(password[=:]\s*)\S+", r"\1[REDACTED]"),
+        (r"(?i)(AWS_SECRET_ACCESS_KEY[=:]\s*)\S+", r"\1[REDACTED]"),
+        (r"(?i)(AWS_SESSION_TOKEN[=:]\s*)\S+", r"\1[REDACTED]"),
+    ]
+    for pat, repl in patterns:
+        line = re.sub(pat, repl, line)
+    return line
 
 msg = os.environ.get("BOOT_MSG", "bootstrap failed")
+log_path = os.environ.get("BOOTSTRAP_LOG", "")
+if log_path and os.path.isfile(log_path):
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            tail = [redact(ln) for ln in f.read().splitlines()[-50:]]
+        if tail:
+            msg = msg + "\n\n--- bootstrap log (last %d lines) ---\n" % len(tail) + "\n".join(tail)
+    except OSError:
+        pass
+if len(msg) > 3500:
+    msg = msg[-3500:]
+
 ts = str(int(time.time() * 1000))
 vals = json.dumps(
     {
@@ -77,9 +139,10 @@ arm_worker_idle_backstop() {
   sudo shutdown -h +120 "photopipeline worker idle backstop" 2>/dev/null || true
 }
 
+set_shoot_phase BOOTSTRAPPING
+
 dnf install -y aws-cli python3 tar 2>/dev/null || yum install -y aws-cli python3 tar
 
-mkdir -p "$INSTALL_ROOT"
 BUNDLE=/tmp/worker-bundle.tar.gz
 aws s3 cp "s3://${BUCKET_NAME}/${WORKER_BUNDLE_KEY}" "$BUNDLE" || report_fail "worker bundle missing"
 echo "${WORKER_BUNDLE_SHA256}  ${BUNDLE}" | sha256sum -c - || report_fail "worker bundle checksum mismatch"
@@ -103,6 +166,7 @@ mv "$LC" "$LIGHTCRAFT_BIN"
 
 cancel_bootstrap_backstop
 arm_worker_idle_backstop
+set_shoot_phase RENDERING
 
 cd "${INSTALL_ROOT}/photopipeline-worker"
 exec "$WORKER_PY" -m worker.main
