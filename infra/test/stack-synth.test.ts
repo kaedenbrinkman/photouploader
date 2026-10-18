@@ -28,6 +28,15 @@ describe('PhotoPipelineStack synth', () => {
     }
   });
 
+  it('does not create a Cognito user pool (Google session JWT auth only)', () => {
+    const app = new cdk.App();
+    const stack = new PhotoPipelineStack(app, 'NoCognitoStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+    });
+    const pools = Template.fromStack(stack).findResources('AWS::Cognito::UserPool');
+    expect(Object.keys(pools)).toHaveLength(0);
+  });
+
   it('worker VPC parameters are required at deploy time (no placeholder defaults)', () => {
     const app = new cdk.App();
     const stack = new PhotoPipelineStack(app, 'ParamTestStack', {

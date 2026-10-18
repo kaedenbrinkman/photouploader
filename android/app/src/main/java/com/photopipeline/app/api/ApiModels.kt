@@ -16,6 +16,14 @@ data class CostEstimateDto(
 
 data class EstimateResponse(val estimate: CostEstimateDto, val notes: List<String>)
 
+data class GoogleAuthResponse(
+    val sessionToken: String,
+    val expiresIn: Long,
+    val sub: String,
+    val email: String?,
+    val gphotosLinked: Boolean,
+)
+
 data class ShootStatusResponse(
     val shootId: String,
     val state: String,

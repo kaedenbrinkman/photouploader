@@ -12,9 +12,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 class ApiClient(
-    private val baseUrl: String,
-    private val idTokenProvider: suspend () -> String?,
+    private val baseUrlProvider: () -> String,
+    private val sessionTokenProvider: suspend () -> String?,
 ) {
+    private val baseUrl: String
+        get() = baseUrlProvider().trim().trimEnd('/')
     private val client = OkHttpClient.Builder().build()
     private val moshi: Moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
     private val estimateAdapter: JsonAdapter<EstimateResponse> = moshi.adapter(EstimateResponse::class.java)
@@ -173,10 +175,35 @@ class ApiClient(
         }
     }
 
-    fun photosOAuthStartUrl(userId: String): String = "$baseUrl/oauth/photos/start?userId=$userId"
+    suspend fun exchangeGoogleAuth(
+        code: String,
+        codeVerifier: String,
+        redirectUri: String,
+    ): GoogleAuthResponse {
+        val body = JSONObject()
+            .put("code", code)
+            .put("codeVerifier", codeVerifier)
+            .put("redirectUri", redirectUri)
+            .toString()
+        val req = Request.Builder()
+            .url("$baseUrl/auth/google")
+            .post(body.toRequestBody(JSON))
+            .build()
+        return client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) throw ApiRequestException("auth exchange failed: ${resp.code}", resp.code)
+            val json = JSONObject(resp.body!!.string())
+            GoogleAuthResponse(
+                sessionToken = json.getString("sessionToken"),
+                expiresIn = json.getLong("expiresIn"),
+                sub = json.getString("sub"),
+                email = json.optString("email").ifBlank { null },
+                gphotosLinked = json.optBoolean("gphotosLinked", false),
+            )
+        }
+    }
 
     private suspend fun authorizedRequest(path: String): Request.Builder {
-        val token = idTokenProvider() ?: throw NotSignedInException()
+        val token = sessionTokenProvider() ?: throw NotSignedInException()
         return Request.Builder()
             .url("$baseUrl$path")
             .header("Authorization", "Bearer $token")

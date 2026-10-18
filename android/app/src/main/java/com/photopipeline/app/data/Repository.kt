@@ -7,6 +7,7 @@ import androidx.work.WorkManager
 import androidx.work.workDataOf
 import com.photopipeline.app.api.ApiClient
 import com.photopipeline.app.api.NotSignedInException
+import com.photopipeline.app.core.AppDefaults
 import com.photopipeline.app.core.PipelineLog
 import com.photopipeline.app.core.cameraFileIdentityKey
 import com.photopipeline.app.core.metadataUploadSha256
@@ -39,8 +40,8 @@ class Repository(
     private val prefs = appContext.getSharedPreferences("photopipeline", Context.MODE_PRIVATE)
 
     val api: ApiClient = ApiClient(
-        baseUrl = prefs.getString("api_base", "https://example.execute-api.us-west-2.amazonaws.com")!!,
-        idTokenProvider = { prefs.getString("id_token", null) },
+        baseUrlProvider = { apiBaseUrl() },
+        sessionTokenProvider = { prefs.getString("session_token", null) },
     )
 
     fun observeShoots(): Flow<List<ShootEntity>> = db.shootDao().observeAll()
@@ -102,30 +103,55 @@ class Repository(
         db.fileDao().upsert(transform(cur))
     }
 
-    fun isGoogleAccountLinked(): Boolean = !prefs.getString("id_token", null).isNullOrBlank()
+    fun isGoogleAccountLinked(): Boolean = !prefs.getString("session_token", null).isNullOrBlank()
 
-    fun googleUserId(): String? = prefs.getString("user_id", null)
+    fun googleUserId(): String? = prefs.getString("google_sub", null)
 
-    fun apiBaseUrl(): String = prefs.getString("api_base", "https://example.execute-api.us-west-2.amazonaws.com")!!
+    fun googleEmail(): String? = prefs.getString("google_email", null)
 
-    fun saveSettings(apiBase: String, userId: String?, idToken: String?) {
+    fun googleWebClientId(): String =
+        prefs.getString("google_web_client_id", AppDefaults.GOOGLE_WEB_CLIENT_ID)
+            ?.trim()
+            .orEmpty()
+            .ifBlank { AppDefaults.GOOGLE_WEB_CLIENT_ID }
+
+    fun apiBaseUrl(): String =
+        prefs.getString("api_base", AppDefaults.API_BASE_URL)!!.trim().trimEnd('/')
+
+    fun saveSettings(apiBase: String, googleWebClientId: String?) {
         prefs.edit()
-            .putString("api_base", apiBase.trim())
-            .putString("user_id", userId?.trim()?.ifBlank { null })
-            .putString("id_token", idToken?.trim()?.ifBlank { null })
+            .putString("api_base", apiBase.trim().trimEnd('/'))
+            .putString("google_web_client_id", googleWebClientId?.trim()?.ifBlank { null })
             .apply()
     }
 
-    fun isBackendConfigured(): Boolean {
-        val base = apiBaseUrl()
-        return base.startsWith("http") && !base.contains("example.execute-api")
+    suspend fun completeGoogleSignIn(code: String, codeVerifier: String, redirectUri: String) {
+        val resp = api.exchangeGoogleAuth(code, codeVerifier, redirectUri)
+        prefs.edit()
+            .putString("session_token", resp.sessionToken)
+            .putString("google_sub", resp.sub)
+            .putString("google_email", resp.email)
+            .apply()
+        PipelineLog.d("auth", "Signed in as ${resp.sub} gphotos=${resp.gphotosLinked}")
     }
+
+    fun signOutGoogle() {
+        prefs.edit()
+            .remove("session_token")
+            .remove("google_sub")
+            .remove("google_email")
+            .apply()
+    }
+
+    fun isBackendConfigured(): Boolean = apiBaseUrl().startsWith("http")
 
     fun canUseBackendApi(): Boolean = isBackendConfigured() && isGoogleAccountLinked()
 
     fun backendGateMessage(): String = when {
         !isBackendConfigured() -> "Backend not configured — set your API base URL in Settings."
-        !isGoogleAccountLinked() -> "Link Google account in Settings before upload or submit."
+        googleWebClientId().isBlank() ->
+            "Set Google Web OAuth client ID in Settings (see gphotos/GOOGLE_OAUTH_ANDROID.md)."
+        !isGoogleAccountLinked() -> "Tap Connect with Google before upload or submit."
         else -> ""
     }
 
@@ -357,7 +383,7 @@ class Repository(
         val files = db.fileDao().observeForShoot(shootId).first()
         if (files.isEmpty() || files.any { it.uploadState != "UPLOADED" }) return
         val shoot = getShoot(shootId) ?: return
-        val userId = prefs.getString("user_id", null) ?: return
+        val userId = prefs.getString("google_sub", null) ?: return
         val manifest = JSONObject()
             .put("shoot_id", shootId)
             .put("user_id", userId)
@@ -442,8 +468,6 @@ class Repository(
             req,
         )
     }
-
-    fun photosOAuthUrl(userId: String): String = api.photosOAuthStartUrl(userId)
 
     suspend fun retryFile(identityKey: String) {
         val f = db.fileDao().getFile(identityKey) ?: return

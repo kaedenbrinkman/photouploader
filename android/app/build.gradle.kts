@@ -17,6 +17,7 @@ android {
         versionName = "0.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
+        manifestPlaceholders["appAuthRedirectScheme"] = "com.photopipeline.app"
     }
 
     signingConfigs {
@@ -72,6 +73,7 @@ dependencies {
     implementation("com.squareup.moshi:moshi-kotlin:1.15.1")
     implementation("com.squareup.moshi:moshi-adapters:1.15.1")
 
+    implementation("net.openid:appauth:0.11.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("org.jetbrains.kotlin:kotlin-reflect:2.0.21")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")

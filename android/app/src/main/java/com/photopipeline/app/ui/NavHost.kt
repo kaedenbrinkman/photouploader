@@ -76,6 +76,12 @@ import com.photopipeline.app.upload.LiveUploadMetrics
 import com.photopipeline.app.upload.UploadMetricsStore
 import android.content.Intent
 import android.provider.Settings
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.DisposableEffect
+import com.photopipeline.app.auth.GoogleSignInHelper
+import com.photopipeline.app.core.AppDefaults
 import androidx.compose.foundation.background
 import androidx.compose.material3.Switch
 import androidx.compose.ui.platform.LocalContext
@@ -128,6 +134,19 @@ fun HomeScreen(
     val shoots by repository.observeShoots().collectAsState(initial = emptyList())
     val usbState by usb.accessState.collectAsState()
     val snackbarHost = remember { SnackbarHostState() }
+    val context = LocalContext.current
+    val activity = context as ComponentActivity
+    val scope = rememberCoroutineScope()
+    var linked by remember { mutableStateOf(repository.isGoogleAccountLinked()) }
+    val signInHelper = remember(activity) {
+        GoogleSignInHelper(activity, repository, scope) { linked = repository.isGoogleAccountLinked() }
+    }
+    val googleLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        signInHelper.onActivityResult(result.data)
+    }
+    DisposableEffect(signInHelper) {
+        onDispose { signInHelper.dispose() }
+    }
 
     Scaffold(
         contentWindowInsets = WindowInsets(0),
@@ -165,15 +184,42 @@ fun HomeScreen(
             }
             item {
                 StatusCard(
-                    title = "Google Photos",
+                    title = "Google account",
                     icon = { Icon(Icons.Default.Cloud, null) },
-                    line1 = if (repository.isGoogleAccountLinked()) {
-                        "Signed in${repository.googleUserId()?.let { " ($it)" } ?: ""}"
+                    line1 = if (linked) {
+                        repository.googleEmail()?.let { "Signed in as $it" }
+                            ?: "Signed in (${repository.googleUserId()})"
                     } else {
-                        "Not linked"
+                        "Not connected"
                     },
-                    line2 = "Link account in Settings before submitting a shoot.",
+                    line2 = if (linked) {
+                        "Photos upload uses your linked Google account on the server."
+                    } else {
+                        "Connect once to upload RAW and publish finished JPEGs to Google Photos."
+                    },
                 )
+            }
+            item {
+                if (linked) {
+                    FilledTonalButton(
+                        onClick = {
+                            repository.signOutGoogle()
+                            linked = false
+                            scope.launch { snackbarHost.showSnackbar("Signed out") }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Sign out")
+                    }
+                } else {
+                    Button(
+                        onClick = { signInHelper.start(googleLauncher) },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = repository.googleWebClientId().isNotBlank(),
+                    ) {
+                        Text("Connect with Google")
+                    }
+                }
             }
             item {
                 Button(
@@ -620,16 +666,24 @@ private fun ResultsStep(shoot: ShootEntity?) {
 @Composable
 fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
     val prefs = (LocalContext.current.applicationContext as PhotoPipelineApp).uploadPreferences
+    val context = LocalContext.current
+    val activity = context as ComponentActivity
     var apiBase by remember { mutableStateOf(repository.apiBaseUrl()) }
-    var userId by remember { mutableStateOf(repository.googleUserId().orEmpty()) }
-    var idToken by remember { mutableStateOf("") }
+    var googleClientId by remember { mutableStateOf(repository.googleWebClientId()) }
+    val scope = rememberCoroutineScope()
+    val signInHelper = remember(activity) { GoogleSignInHelper(activity, repository, scope) }
+    val googleLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        signInHelper.onActivityResult(result.data)
+    }
+    DisposableEffect(signInHelper) {
+        onDispose { signInHelper.dispose() }
+    }
     var wifiOnly by remember { mutableStateOf(prefs.wifiOnly) }
     var allowCellular by remember { mutableStateOf(prefs.allowCellular) }
     var partSizeMb by remember { mutableStateOf((prefs.partSizeBytes / (1024 * 1024)).toString()) }
     var concurrency by remember { mutableStateOf(prefs.maxConcurrentParts.toString()) }
     var transferAcceleration by remember { mutableStateOf(prefs.transferAcceleration) }
     val snackbarHost = remember { SnackbarHostState() }
-    val scope = rememberCoroutineScope()
 
     Scaffold(
         contentWindowInsets = WindowInsets(0),
@@ -650,16 +704,35 @@ fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             OutlinedTextField(apiBase, { apiBase = it }, label = { Text("API base URL") }, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(userId, { userId = it }, label = { Text("Google user id") }, modifier = Modifier.fillMaxWidth())
+            Text("Default region: ${AppDefaults.AWS_REGION}", style = MaterialTheme.typography.bodySmall)
             OutlinedTextField(
-                idToken,
-                { idToken = it },
-                label = { Text("ID token (paste to link account)") },
+                googleClientId,
+                { googleClientId = it },
+                label = { Text("Google Web OAuth client ID") },
                 modifier = Modifier.fillMaxWidth(),
             )
+            if (!repository.isGoogleAccountLinked()) {
+                Button(
+                    onClick = { signInHelper.start(googleLauncher) },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = googleClientId.isNotBlank(),
+                ) {
+                    Text("Connect with Google")
+                }
+            } else {
+                FilledTonalButton(
+                    onClick = {
+                        repository.signOutGoogle()
+                        scope.launch { snackbarHost.showSnackbar("Signed out") }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Sign out")
+                }
+            }
             Button(
                 onClick = {
-                    repository.saveSettings(apiBase, userId, idToken.ifBlank { null })
+                    repository.saveSettings(apiBase, googleClientId.ifBlank { null })
                     prefs.wifiOnly = wifiOnly
                     prefs.allowCellular = allowCellular
                     prefs.partSizeBytes = (partSizeMb.toLongOrNull() ?: 8L).coerceAtLeast(5L) * 1024 * 1024
@@ -693,7 +766,7 @@ fun SettingsScreen(repository: Repository, onBack: () -> Unit) {
             }
             HorizontalDivider()
             Text(
-                "OAuth: ${repository.photosOAuthUrl(userId.ifBlank { "me" })}",
+                "Redirect URI (must match Google Cloud Web client): ${AppDefaults.GOOGLE_REDIRECT_URI}",
                 style = MaterialTheme.typography.bodySmall,
             )
         }

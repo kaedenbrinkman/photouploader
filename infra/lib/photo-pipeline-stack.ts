@@ -3,7 +3,6 @@ import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as apigwIntegrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import * as authorizers from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
 import * as budgets from 'aws-cdk-lib/aws-budgets';
-import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as events from 'aws-cdk-lib/aws-events';
@@ -18,6 +17,7 @@ import * as path from 'path';
 
 /** Created manually (CloudFormation cannot create SecureString parameters). */
 const GOOGLE_OAUTH_CLIENT_PARAM = '/photopipeline/google-oauth-client';
+const SESSION_JWT_SECRET_PARAM = '/photopipeline/session-jwt-secret';
 
 /**
  * Idle-cost design: no NAT/VPC endpoints/custom KMS/Secrets Manager/REST API/always-on EC2.
@@ -75,19 +75,6 @@ export class PhotoPipelineStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
-    const userPool = new cognito.UserPool(this, 'PhotoPipelineUserPool', {
-      selfSignUpEnabled: false,
-      signInAliases: { email: true },
-      passwordPolicy: { minLength: 12, requireLowercase: true, requireUppercase: true, requireDigits: true },
-      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
-
-    const userPoolClient = userPool.addClient('AndroidAppClient', {
-      authFlows: { userPassword: true, userSrp: true },
-      generateSecret: false,
-    });
-
     const vpc = ec2.Vpc.fromVpcAttributes(this, 'DefaultVpc', {
       vpcId: workerVpcId.valueAsString,
       availabilityZones: cdk.Fn.getAzs(),
@@ -125,8 +112,7 @@ export class PhotoPipelineStack extends cdk.Stack {
       BUCKET_NAME: bucket.bucketName,
       TABLE_NAME: table.tableName,
       GOOGLE_OAUTH_PARAM: GOOGLE_OAUTH_CLIENT_PARAM,
-      USER_POOL_ID: userPool.userPoolId,
-      CLIENT_ID: userPoolClient.userPoolClientId,
+      SESSION_JWT_PARAM: SESSION_JWT_SECRET_PARAM,
       WORKER_INSTANCE_PROFILE_NAME: workerInstanceProfile.ref,
       WORKER_SECURITY_GROUP_ID: workerSecurityGroup.securityGroupId,
       WORKER_SUBNET_ID: workerSubnetId.valueAsString,
@@ -177,25 +163,40 @@ export class PhotoPipelineStack extends cdk.Stack {
       entry: path.join(__dirname, '../lambda/estimate.ts'),
     });
 
-    const oauthFn = new lambdaNode.NodejsFunction(this, 'OAuthFn', {
+    const authFn = new lambdaNode.NodejsFunction(this, 'AuthFn', {
       ...lambdaDefaults,
-      entry: path.join(__dirname, '../lambda/oauth.ts'),
+      entry: path.join(__dirname, '../lambda/auth.ts'),
     });
-    oauthFn.addToRolePolicy(
+    authFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['ssm:GetParameter'],
         resources: [
           `arn:aws:ssm:${this.region}:${this.account}:parameter${GOOGLE_OAUTH_CLIENT_PARAM}`,
+          `arn:aws:ssm:${this.region}:${this.account}:parameter${SESSION_JWT_SECRET_PARAM}`,
         ],
       }),
     );
-    oauthFn.addToRolePolicy(
+    authFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ['ssm:PutParameter', 'ssm:GetParameter'],
+        actions: ['ssm:PutParameter'],
         resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter/photopipeline/users/*`],
       }),
     );
-    table.grantReadWriteData(oauthFn);
+    table.grantReadWriteData(authFn);
+
+    const authorizerFn = new lambdaNode.NodejsFunction(this, 'SessionAuthorizerFn', {
+      ...lambdaDefaults,
+      entry: path.join(__dirname, '../lambda/authorizer.ts'),
+      timeout: cdk.Duration.seconds(10),
+    });
+    authorizerFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['ssm:GetParameter'],
+        resources: [
+          `arn:aws:ssm:${this.region}:${this.account}:parameter${SESSION_JWT_SECRET_PARAM}`,
+        ],
+      }),
+    );
 
     const watchdogFn = new lambdaNode.NodejsFunction(this, 'WatchdogFn', {
       ...lambdaDefaults,
@@ -209,11 +210,12 @@ export class PhotoPipelineStack extends cdk.Stack {
       }),
     );
 
-    const httpAuthorizer = new authorizers.HttpUserPoolAuthorizer(
-      'CognitoJwtAuthorizer',
-      userPool,
-      { userPoolClients: [userPoolClient], identitySource: ['$request.header.Authorization'] },
-    );
+    const httpAuthorizer = new authorizers.HttpLambdaAuthorizer('SessionJwtAuthorizer', authorizerFn, {
+      authorizerName: 'session-jwt',
+      responseTypes: [authorizers.HttpLambdaResponseType.SIMPLE],
+      identitySource: ['$request.header.Authorization'],
+      resultsCacheTtl: cdk.Duration.minutes(5),
+    });
 
     const httpApi = new apigwv2.HttpApi(this, 'PhotoPipelineHttpApi', {
       apiName: 'PhotoPipeline',
@@ -262,14 +264,9 @@ export class PhotoPipelineStack extends cdk.Stack {
       ...jwtRoutes,
     });
     httpApi.addRoutes({
-      path: '/oauth/photos/start',
-      methods: [apigwv2.HttpMethod.GET],
-      integration: new apigwIntegrations.HttpLambdaIntegration('OAuthStart', oauthFn),
-    });
-    httpApi.addRoutes({
-      path: '/oauth/photos/callback',
-      methods: [apigwv2.HttpMethod.GET],
-      integration: new apigwIntegrations.HttpLambdaIntegration('OAuthCallback', oauthFn),
+      path: '/auth/google',
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwIntegrations.HttpLambdaIntegration('GoogleAuth', authFn),
     });
 
     new events.Rule(this, 'WorkerWatchdogSchedule', {
@@ -294,14 +291,15 @@ export class PhotoPipelineStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'HttpApiUrl', { value: httpApi.apiEndpoint });
     new cdk.CfnOutput(this, 'BucketName', { value: bucket.bucketName });
-    new cdk.CfnOutput(this, 'UserPoolId', { value: userPool.userPoolId });
-    new cdk.CfnOutput(this, 'UserPoolClientId', { value: userPoolClient.userPoolClientId });
     new cdk.CfnOutput(this, 'GoogleOAuthClientSetup', {
-      value: `Create SSM param ${GOOGLE_OAUTH_CLIENT_PARAM} (SecureString) before OAuth: aws ssm put-parameter --name ${GOOGLE_OAUTH_CLIENT_PARAM} --type SecureString --value file://client_secret.json`,
+      value: `Create SSM param ${GOOGLE_OAUTH_CLIENT_PARAM} (SecureString Web client JSON): aws ssm put-parameter --name ${GOOGLE_OAUTH_CLIENT_PARAM} --type SecureString --value file://client_secret.json`,
+    });
+    new cdk.CfnOutput(this, 'SessionJwtSecretSetup', {
+      value: `Create SSM param ${SESSION_JWT_SECRET_PARAM} (SecureString, 32+ random bytes): aws ssm put-parameter --name ${SESSION_JWT_SECRET_PARAM} --type SecureString --value "$(openssl rand -base64 32)"`,
     });
     new cdk.CfnOutput(this, 'IdleCostNotes', {
       value:
-        'Expect ~$0/mo idle: HTTP API/Lambda/DynamoDB/S3/SSM params only charge on use; no NAT/KMS/Secrets/Cognito MAU on basic pool.',
+        'Expect ~$0/mo idle: HTTP API/Lambda/DynamoDB/S3/SSM params only charge on use; no Cognito/NAT/KMS/Secrets Manager.',
     });
   }
 }
