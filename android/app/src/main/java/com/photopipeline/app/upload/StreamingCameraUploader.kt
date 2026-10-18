@@ -2,6 +2,7 @@ package com.photopipeline.app.upload
 
 import android.mtp.MtpDevice
 import com.photopipeline.app.api.ApiClient
+import com.photopipeline.app.core.PipelineLog
 import com.photopipeline.app.core.metadataUploadSha256
 import com.photopipeline.app.data.FileEntity
 import com.photopipeline.app.mtp.UsbCameraManager
@@ -26,7 +27,7 @@ class StreamingCameraUploader(
         file: FileEntity,
         onProgress: suspend (
             uploadedBytes: Long,
-            speedBps: Long,
+            speed: TransferSpeedTracker.Snapshot,
             partsDone: Int,
             partsTotal: Int,
             parts: List<UploadPart>,
@@ -34,6 +35,7 @@ class StreamingCameraUploader(
             s3Key: String,
         ) -> Unit,
     ): Result {
+        val fileStartMs = System.currentTimeMillis()
         val mtp = usb.openMtpDevice() ?: throw IOException("Camera not connected — reconnect to continue upload")
         val handle = file.objectHandle.toInt()
         val uploadRef = metadataUploadSha256(
@@ -54,13 +56,25 @@ class StreamingCameraUploader(
             uploadId = created.first
             key = created.second
         }
+        PipelineLog.i(
+            "upload",
+            "file start name=${file.originalName} key=$key size=${file.sizeBytes} parts=${plans.size}",
+        )
         if (parts.isEmpty()) {
             runCatching {
                 parts = api.listParts(shootId, uploadId!!, key!!, prefs.transferAcceleration)
                     .map { UploadPart(it.first, it.second) }
             }
         }
-        onProgress(0, 0, parts.size, plans.size, parts, uploadId!!, key!!)
+        onProgress(
+            0,
+            TransferSpeedTracker.Snapshot(0, 0, 0, 0, file.sizeBytes, null),
+            parts.size,
+            plans.size,
+            parts,
+            uploadId!!,
+            key!!,
+        )
         val completedNumbers = parts.map { it.partNumber }.toSet()
         val hasher = IncrementalHasher()
         val speed = TransferSpeedTracker()
@@ -80,6 +94,7 @@ class StreamingCameraUploader(
             var attempt = 0
             while (true) {
                 try {
+                    val partStartMs = System.currentTimeMillis()
                     val read = MtpPartReader.readPart(
                         mtpRef,
                         handle,
@@ -100,11 +115,14 @@ class StreamingCameraUploader(
                         prefs.transferAcceleration,
                     )
                     UploadMetricsStore.update {
-                        it.copy(transferAccelerationActive = presigned.transferAcceleration ||
-                            presigned.url.contains("s3-accelerate", ignoreCase = true))
+                        it.copy(
+                            transferAccelerationActive = presigned.transferAcceleration ||
+                                presigned.url.contains("s3-accelerate", ignoreCase = true),
+                        )
                     }
                     val url = presigned.url
                     val body = buffer.copyOf(read).toRequestBody(OCTET)
+                    val putStartMs = System.currentTimeMillis()
                     val response = http.newCall(Request.Builder().url(url).put(body).build()).execute()
                     response.use { resp ->
                         if (resp.code == 403 || resp.code == 400) {
@@ -115,12 +133,18 @@ class StreamingCameraUploader(
                             ?: throw IOException("missing ETag part ${plan.partNumber}")
                         parts = UploadParts.merge(parts, UploadPart(plan.partNumber, eTag))
                     }
+                    val putMs = System.currentTimeMillis() - putStartMs
+                    val partMs = System.currentTimeMillis() - partStartMs
+                    PipelineLog.i(
+                        "upload",
+                        "part key=$key part=${plan.partNumber}/${plans.size} bytes=$read putMs=$putMs totalMs=$partMs",
+                    )
                     val uploadedBytes = min(file.sizeBytes, plan.offset + read)
                     speed.recordBytes(read)
                     val snap = speed.snapshot()
                     onProgress(
                         uploadedBytes,
-                        snap.averageBps,
+                        snap,
                         parts.size,
                         plans.size,
                         parts,
@@ -138,7 +162,13 @@ class StreamingCameraUploader(
                 }
             }
         }
+        val completeStart = System.currentTimeMillis()
         api.completeMultipart(shootId, uploadRef, key!!, uploadId!!, parts, prefs.transferAcceleration)
+        PipelineLog.i(
+            "upload",
+            "file complete name=${file.originalName} key=$key ms=${System.currentTimeMillis() - completeStart} " +
+                "sessionMs=${System.currentTimeMillis() - fileStartMs}",
+        )
         return Result(hasher.digestHex(), parts)
     }
 

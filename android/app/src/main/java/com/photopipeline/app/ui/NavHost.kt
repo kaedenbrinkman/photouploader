@@ -497,6 +497,17 @@ fun ShootFlowScreen(
                         )
                     }
                     item {
+                        val needRetry = files.count {
+                            it.uploadState == "FAILED" || it.uploadState == "PENDING" ||
+                                it.uploadState == "PAUSED" || it.uploadState == "UPLOADING"
+                        }
+                        if (needRetry > 0) {
+                            Text(
+                                "$needRetry file(s) need retry before submit",
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
                         FilledTonalButton(
                             onClick = { vm.submitShoot() },
                             modifier = Modifier.fillMaxWidth(),

@@ -20,17 +20,23 @@ class TransferSpeedTracker(
     private var bytesSent: Long = 0
     private var totalBytes: Long = 0
     private var peakBps: Long = 0
+    private var sessionStartMs: Long = 0
+    private var sessionBytes: Long = 0
 
     fun reset(total: Long) {
         samples.clear()
         bytesSent = 0
         totalBytes = total
         peakBps = 0
+        sessionStartMs = 0
+        sessionBytes = 0
     }
 
     fun recordBytes(delta: Int) {
         if (delta <= 0) return
         val now = nowMs()
+        if (sessionStartMs == 0L) sessionStartMs = now
+        sessionBytes += delta
         bytesSent += delta
         samples.addLast(now to delta.toLong())
         trim(now)
@@ -41,11 +47,17 @@ class TransferSpeedTracker(
     fun snapshot(): Snapshot {
         val now = nowMs()
         trim(now)
-        val avg = averageBps(now)
+        val avg = sessionAverageBps(now).takeIf { it > 0 } ?: averageBps(now)
         val cur = currentBps(now)
         val remaining = (totalBytes - bytesSent).coerceAtLeast(0)
         val eta = if (avg > 0 && remaining > 0) remaining / avg else null
         return Snapshot(cur, avg, peakBps, bytesSent, totalBytes, eta)
+    }
+
+    private fun sessionAverageBps(now: Long): Long {
+        if (sessionStartMs == 0L) return 0
+        val span = max(1, now - sessionStartMs)
+        return sessionBytes * 1000 / span
     }
 
     private fun trim(now: Long) {

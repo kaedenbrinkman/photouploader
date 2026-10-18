@@ -47,6 +47,16 @@ def test_manifest_s3_key():
     )
     assert f.s3_raw_key("shoot-1") == f"shoots/shoot-1/raw/{'c' * 64}.CR3"
 
+    custom = ManifestFile.from_dict(
+        {
+            "sha256": "d" * 64,
+            "size_bytes": 1,
+            "original_name": "IMG_0001.CR3",
+            "s3_key": "shoots/shoot-1/raw/upload-metadata-ref.CR3",
+        }
+    )
+    assert custom.s3_raw_key("shoot-1") == "shoots/shoot-1/raw/upload-metadata-ref.CR3"
+
 
 def test_shoot_state_transitions():
     assert can_transition_shoot(ShootState.UPLOADING, ShootState.MANIFEST_SUBMITTED)

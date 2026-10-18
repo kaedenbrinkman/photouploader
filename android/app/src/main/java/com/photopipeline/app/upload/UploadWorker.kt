@@ -30,6 +30,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
     private val prefs = app.uploadPreferences
     private val network = NetworkStatusMonitor(appContext)
     private val streamUploader = StreamingCameraUploader(usb, repo.api, StreamingCameraUploader.defaultHttp(), prefs)
+    private val sessionSpeed = TransferSpeedTracker()
 
     /** Used by [getForegroundInfo] before [doWork] runs (inputData from enqueue). */
     private val enqueueUsesCamera: Boolean
@@ -40,6 +41,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         val files = repo.getPendingFiles(shootId)
         if (files.isEmpty()) return Result.success()
         val usesCameraStream = files.any { it.isCameraStreamUpload() }
+        sessionSpeed.reset(files.sumOf { it.sizeBytes }.coerceAtLeast(1))
         UploadMetricsStore.update {
             it.copy(
                 shootId = shootId,
@@ -48,6 +50,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 transferAccelerationActive = prefs.transferAcceleration,
                 lastError = null,
                 pausedReason = null,
+                peakBps = 0,
             )
         }
         promoteToForeground(usesCameraStream)
@@ -70,16 +73,18 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         }
 
         var filesDone = repo.countUploadedFiles(shootId)
-        for (file in files) {
+        val failedKeys = mutableListOf<String>()
+
+        suspend fun uploadOne(file: FileEntity): Boolean {
             if (file.isCameraStreamUpload()) {
                 usb.refreshProbe(log = false)
                 if (usb.accessState.value != UsbAccessState.READY) {
                     val reason = "Camera not open for MTP (USB state=${usb.accessState.value})"
                     repo.markFileFailed(file.identityKey, reason)
-                    return failWorker(reason, usesCameraStream)
+                    return false
                 }
             }
-            try {
+            return try {
                 if (!file.localPath.isNullOrBlank() && File(file.localPath).exists()) {
                     uploadLocalFile(shootId, file)
                 } else {
@@ -87,14 +92,15 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 }
                 repo.markFileUploaded(file.identityKey)
                 filesDone++
+                UploadMetricsStore.update { it.copy(filesDone = filesDone, network = network.snapshot()) }
+                true
             } catch (e: StreamingCameraUploader.PresignExpiredException) {
-                val reason = e.message ?: "presign expired"
-                repo.incrementRetry(file.identityKey, reason)
-                return retryWorker(reason, usesCameraStream, retryable = true)
+                throw e
             } catch (e: Exception) {
                 val reason = uploadFailureMessage(e)
                 PipelineLog.e("upload", "File ${file.originalName} failed: $reason", e)
                 repo.markFileFailed(file.identityKey, reason)
+                failedKeys += file.identityKey
                 UploadMetricsStore.update {
                     it.copy(
                         retries = it.retries + 1,
@@ -102,15 +108,48 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         network = network.snapshot(),
                     )
                 }
-                if (usesCameraStream || runAttemptCount >= 8) {
-                    return failWorker(reason, usesCameraStream)
-                }
-                delay(RetryPolicy.backoffMs(runAttemptCount))
+                false
+            }
+        }
+
+        for (file in files) {
+            try {
+                uploadOne(file)
+            } catch (e: StreamingCameraUploader.PresignExpiredException) {
+                val reason = e.message ?: "presign expired"
+                repo.incrementRetry(file.identityKey, reason)
                 return retryWorker(reason, usesCameraStream, retryable = true)
             }
-            UploadMetricsStore.update { it.copy(filesDone = filesDone, network = network.snapshot()) }
         }
-        prefs.lastMeasuredUploadBps = UploadMetricsStore.metrics.value.averageBps
+
+        if (failedKeys.isNotEmpty()) {
+            var retryRound = 0
+            while (failedKeys.isNotEmpty() && retryRound < 3) {
+                retryRound++
+                delay(RetryPolicy.backoffMs(retryRound))
+                PipelineLog.i("upload", "Retry pass $retryRound for ${failedKeys.size} failed file(s)")
+                val retryIds = failedKeys.toList()
+                for (identityKey in retryIds) {
+                    repo.retryFile(identityKey)
+                    val file = repo.db.fileDao().getFile(identityKey) ?: continue
+                    try {
+                        if (uploadOne(file)) {
+                            failedKeys.remove(identityKey)
+                        }
+                    } catch (e: StreamingCameraUploader.PresignExpiredException) {
+                        val reason = e.message ?: "presign expired"
+                        return retryWorker(reason, usesCameraStream, retryable = true)
+                    }
+                }
+            }
+        }
+
+        if (failedKeys.isNotEmpty()) {
+            val n = failedKeys.size
+            return failWorker("$n file(s) failed upload — use Retry on the shoot screen", usesCameraStream)
+        }
+
+        prefs.lastMeasuredUploadBps = sessionSpeed.snapshot().averageBps
         repo.uploadManifestIfReady(shootId)
         UploadMetricsStore.clear()
         return Result.success()
@@ -154,11 +193,17 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
 
     private suspend fun uploadStreaming(shootId: String, file: FileEntity) {
         repo.markFileUploading(file.identityKey)
-        val result = streamUploader.uploadFile(shootId, file) { uploaded, speed, partsDone, partsTotal, parts, uploadId, s3Key ->
+        var lastUploaded = 0L
+        val result = streamUploader.uploadFile(shootId, file) { uploaded, snap, partsDone, partsTotal, parts, uploadId, s3Key ->
+            val delta = (uploaded - lastUploaded).toInt()
+            if (delta > 0) sessionSpeed.recordBytes(delta)
+            lastUploaded = uploaded
+            val sessionSnap = sessionSpeed.snapshot()
             UploadMetricsStore.update {
                 it.copy(
-                    currentBps = speed,
-                    averageBps = speed,
+                    currentBps = snap.currentBps,
+                    averageBps = sessionSnap.averageBps,
+                    peakBps = maxOf(it.peakBps, snap.peakBps, sessionSnap.peakBps),
                     bytesSent = uploaded,
                     totalBytes = file.sizeBytes,
                     partsDone = partsDone,
@@ -166,10 +211,11 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                     network = network.snapshot(),
                 )
             }
+            UploadMetricsStore.pushSpeedSample(snap.currentBps)
             repo.updateUploadProgress(
                 file.identityKey,
                 uploaded,
-                speed,
+                snap.currentBps,
                 uploadId,
                 s3Key,
                 parts,
@@ -197,12 +243,16 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             uploadId = created.first
             key = created.second
         }
+        PipelineLog.i("upload", "file start (local) name=${file.originalName} key=$key size=${file.sizeBytes}")
+        val fileSpeed = TransferSpeedTracker()
+        fileSpeed.reset(file.sizeBytes)
         val partSize = prefs.partSizeBytes
         val plans = MultipartPlanner.planParts(file.sizeBytes, partSize)
         val client = StreamingCameraUploader.defaultHttp()
         RandomAccessFile(local, "r").use { raf ->
             for (plan in plans) {
                 if (parts.any { it.partNumber == plan.partNumber }) continue
+                val partStartMs = System.currentTimeMillis()
                 val buf = ByteArray(plan.length.toInt())
                 raf.seek(plan.offset)
                 raf.readFully(buf)
@@ -218,6 +268,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 UploadMetricsStore.update {
                     it.copy(transferAccelerationActive = presigned.transferAcceleration || accel)
                 }
+                val putStartMs = System.currentTimeMillis()
                 client.newCall(
                     Request.Builder().url(presigned.url).put(buf.toRequestBody(OCTET)).build(),
                 ).execute().use { resp ->
@@ -230,18 +281,45 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                     val eTag = resp.header("ETag")?.trim()?.trim('"') ?: error("missing ETag")
                     parts = UploadParts.merge(parts, UploadPart(plan.partNumber, eTag))
                 }
-                val speed = 0L
+                val putMs = System.currentTimeMillis() - putStartMs
+                fileSpeed.recordBytes(buf.size)
+                sessionSpeed.recordBytes(buf.size)
+                val snap = fileSpeed.snapshot()
+                val sessionSnap = sessionSpeed.snapshot()
+                PipelineLog.i(
+                    "upload",
+                    "part key=$key part=${plan.partNumber}/${plans.size} bytes=${buf.size} putMs=$putMs " +
+                        "totalMs=${System.currentTimeMillis() - partStartMs}",
+                )
                 repo.updateUploadProgress(
                     file.identityKey,
                     min(file.sizeBytes, plan.offset + plan.length),
-                    speed,
+                    snap.currentBps,
                     uploadId,
                     key!!,
                     parts,
                 )
+                UploadMetricsStore.update {
+                    it.copy(
+                        currentBps = snap.currentBps,
+                        averageBps = sessionSnap.averageBps,
+                        peakBps = maxOf(it.peakBps, snap.peakBps, sessionSnap.peakBps),
+                        bytesSent = min(file.sizeBytes, plan.offset + plan.length),
+                        totalBytes = file.sizeBytes,
+                        partsDone = parts.size,
+                        partsTotal = plans.size,
+                        network = network.snapshot(),
+                    )
+                }
+                UploadMetricsStore.pushSpeedSample(snap.currentBps)
             }
         }
+        val completeStart = System.currentTimeMillis()
         repo.api.completeMultipart(shootId, uploadRef, key!!, uploadId!!, parts, accel)
+        PipelineLog.i(
+            "upload",
+            "file complete (local) name=${file.originalName} key=$key ms=${System.currentTimeMillis() - completeStart}",
+        )
     }
 
     private fun pausedMessage(net: NetworkSnapshot): String = when {

@@ -527,7 +527,8 @@ class Repository(
                             f.captureTimeEpochMs,
                         )
                         val ext = if (f.originalName.uppercase().endsWith(".JPG")) ".JPG" else ".CR3"
-                        val s3Key = "shoots/$shootId/raw/${uploadRef.lowercase()}$ext"
+                        val s3Key = f.s3Key?.takeIf { it.isNotBlank() }
+                            ?: "shoots/$shootId/raw/${uploadRef.lowercase()}$ext"
                         put(
                             JSONObject()
                                 .put("sha256", f.sha256)
