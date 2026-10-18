@@ -13,9 +13,11 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNode from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
-import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import * as path from 'path';
+
+/** Created manually (CloudFormation cannot create SecureString parameters). */
+const GOOGLE_OAUTH_CLIENT_PARAM = '/photopipeline/google-oauth-client';
 
 /**
  * Idle-cost design: no NAT/VPC endpoints/custom KMS/Secrets Manager/REST API/always-on EC2.
@@ -75,13 +77,6 @@ export class PhotoPipelineStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
-    const googleOAuthParam = new ssm.StringParameter(this, 'GoogleOAuthClientParam', {
-      parameterName: '/photopipeline/google-oauth-client',
-      stringValue: JSON.stringify({ placeholder: true, configure: 'paste client_secret.json' }),
-      type: ssm.ParameterType.SECURE_STRING,
-      description: 'Google OAuth client JSON (Web app type for redirect flow)',
-    });
-
     const userPool = new cognito.UserPool(this, 'PhotoPipelineUserPool', {
       selfSignUpEnabled: false,
       signInAliases: { email: true },
@@ -131,7 +126,7 @@ export class PhotoPipelineStack extends cdk.Stack {
     const lambdaEnv = {
       BUCKET_NAME: bucket.bucketName,
       TABLE_NAME: table.tableName,
-      GOOGLE_OAUTH_PARAM: googleOAuthParam.parameterName,
+      GOOGLE_OAUTH_PARAM: GOOGLE_OAUTH_CLIENT_PARAM,
       USER_POOL_ID: userPool.userPoolId,
       CLIENT_ID: userPoolClient.userPoolClientId,
       WORKER_INSTANCE_PROFILE_NAME: workerInstanceProfile.ref,
@@ -188,7 +183,14 @@ export class PhotoPipelineStack extends cdk.Stack {
       ...lambdaDefaults,
       entry: path.join(__dirname, '../lambda/oauth.ts'),
     });
-    googleOAuthParam.grantRead(oauthFn);
+    oauthFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['ssm:GetParameter'],
+        resources: [
+          `arn:aws:ssm:${this.region}:${this.account}:parameter${GOOGLE_OAUTH_CLIENT_PARAM}`,
+        ],
+      }),
+    );
     oauthFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['ssm:PutParameter', 'ssm:GetParameter'],
@@ -296,7 +298,9 @@ export class PhotoPipelineStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'BucketName', { value: bucket.bucketName });
     new cdk.CfnOutput(this, 'UserPoolId', { value: userPool.userPoolId });
     new cdk.CfnOutput(this, 'UserPoolClientId', { value: userPoolClient.userPoolClientId });
-    new cdk.CfnOutput(this, 'GoogleOAuthParamName', { value: googleOAuthParam.parameterName });
+    new cdk.CfnOutput(this, 'GoogleOAuthClientSetup', {
+      value: `Create SSM param ${GOOGLE_OAUTH_CLIENT_PARAM} (SecureString) before OAuth: aws ssm put-parameter --name ${GOOGLE_OAUTH_CLIENT_PARAM} --type SecureString --value file://client_secret.json`,
+    });
     new cdk.CfnOutput(this, 'IdleCostNotes', {
       value:
         'Expect ~$0/mo idle: HTTP API/Lambda/DynamoDB/S3/SSM params only charge on use; no NAT/KMS/Secrets/Cognito MAU on basic pool.',

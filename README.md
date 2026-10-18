@@ -74,7 +74,14 @@ Reproducible bootstrap: `worker/ami/bootstrap.sh` (LightCraft **31a677fe**, Rust
 1. **Google Cloud:** Follow `gphotos/SETUP.md` — Photos Library API, OAuth client (Web type for redirect), testers, scopes `appendonly` + `readonly.appcreateddata`.
 2. **AWS:** `cd infra && npm install && npx cdk bootstrap && npx cdk deploy`
    - Set parameters **`WorkerVpcId`** and **`WorkerPublicSubnetId`** to your **default VPC** public subnet (worker needs outbound internet; **no inbound** SG rules).
-   - Put OAuth client JSON in SSM **`/photopipeline/google-oauth-client`** (SecureString).
+   - Create the Google OAuth client JSON in SSM (not managed by CDK — CloudFormation cannot create `SecureString` parameters):
+     ```bash
+     aws ssm put-parameter \
+       --name /photopipeline/google-oauth-client \
+       --type SecureString \
+       --value file://client_secret.json \
+       --overwrite
+     ```
    - Create Cognito users for the app; configure Android with HTTP API URL + client ID.
 3. **Worker AMI:** Bake Amazon Linux 2023 with `lightcraft-cli` (pin commit from feasibility report), Python worker under `/opt/photopipeline/worker`, then point user-data at `python3 -m worker.main`.
 
