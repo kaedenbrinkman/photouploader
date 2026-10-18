@@ -36,4 +36,7 @@ data class FileEntity(
     val lastError: String?,
     val s3UploadId: String?,
     val s3Key: String?,
+    /** JSON array of {partNumber,eTag} for S3 multipart resume */
+    val uploadPartsJson: String = "[]",
+    val manifestUploaded: Boolean = false,
 )

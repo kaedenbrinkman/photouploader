@@ -59,6 +59,16 @@ flowchart LR
 | `lib/photopipeline/` | Shared manifest, state machine, pricing |
 | `config/pricing.json` | Configurable pricing table for estimates |
 
+## Worker AMI
+
+Reproducible bootstrap: `worker/ami/bootstrap.sh` (LightCraft **31a677fe**, Rust **≥ 1.90**). CI runs `bash -n` and a Docker verify build (`worker/ami/Dockerfile.verify`) with `SKIP_LIGHTCRAFT_BUILD=1`. Optional Packer template: `worker/ami/packer.pkr.hcl`.
+
+## End-to-end upload path
+
+1. App imports via **CanonMtpRepository** (`MtpDevice`, partial reads for resume; camera originals untouched).
+2. **UploadWorker** multipart uploads with **ETags in Room** (`uploadPartsJson`), `list_parts` recovery, **`complete_multipart`**.
+3. App uploads **`manifest.json`** (presigned PUT) then **`finalize`**; Lambda validates manifest identity + S3 sizes.
+
 ## Deploy (not run in CI — no real credentials)
 
 1. **Google Cloud:** Follow `gphotos/SETUP.md` — Photos Library API, OAuth client (Web type for redirect), testers, scopes `appendonly` + `readonly.appcreateddata`.

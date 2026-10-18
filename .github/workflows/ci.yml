@@ -40,6 +40,15 @@ jobs:
           npm test
           npx cdk synth --quiet
 
+  worker-ami:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap script syntax
+        run: bash -n worker/ami/bootstrap.sh
+      - name: Bootstrap docker verify (stub LightCraft)
+        run: docker build -f worker/ami/Dockerfile.verify .
+
   android:
     runs-on: ubuntu-latest
     steps:

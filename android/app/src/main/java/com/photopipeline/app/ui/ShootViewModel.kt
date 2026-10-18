@@ -66,7 +66,7 @@ class ShootViewModel(private val repo: Repository, private val shootId: String) 
 
     fun submitShoot() {
         viewModelScope.launch {
-            repo.api.finalizeShoot(shootId)
+            repo.submitShoot(shootId)
             startPolling()
         }
     }

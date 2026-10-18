@@ -8,20 +8,24 @@ import androidx.work.workDataOf
 import com.photopipeline.app.api.ApiClient
 import com.photopipeline.app.api.EstimateResponse
 import com.photopipeline.app.core.fileIdentityKey
-import com.photopipeline.app.mtp.MockMtpRepository
+import com.photopipeline.app.mtp.CanonMtpRepository
 import com.photopipeline.app.mtp.MtpRepository
+import com.photopipeline.app.upload.UploadPart
+import com.photopipeline.app.upload.UploadParts
 import com.photopipeline.app.upload.UploadWorker
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
 class Repository(
     val db: AppDatabase,
     context: Context,
+    mtpOverride: MtpRepository? = null,
 ) {
     private val appContext = context.applicationContext
-    val mtp: MtpRepository = MockMtpRepository()
+    val mtp: MtpRepository = mtpOverride ?: CanonMtpRepository(context)
     private val prefs = appContext.getSharedPreferences("photopipeline", Context.MODE_PRIVATE)
 
     val api: ApiClient = ApiClient(
@@ -51,6 +55,7 @@ class Repository(
         speedBps: Long,
         uploadId: String,
         s3Key: String,
+        parts: List<UploadPart> = emptyList(),
     ) = patchFile(identityKey) {
         it.copy(
             uploadedBytes = uploadedBytes,
@@ -58,6 +63,7 @@ class Repository(
             uploadState = "UPLOADING",
             s3UploadId = uploadId,
             s3Key = s3Key,
+            uploadPartsJson = UploadParts.toJson(parts),
         )
     }
 
@@ -67,17 +73,30 @@ class Repository(
     }
 
     suspend fun importFromCamera(shootId: String, destDir: File): Int {
+        destDir.mkdirs()
         mtp.refreshConnection()
         val objects = mtp.listCr3Objects()
+        val existingKeys = db.fileDao().observeForShoot(shootId).first().map { it.identityKey }.toSet()
         val entities = mutableListOf<FileEntity>()
         for (obj in objects) {
             val path = File(destDir, obj.filename).absolutePath
-            val sha = mtp.importObject(obj, path) { }
-            val key = fileIdentityKey(obj.storageId, obj.handle, obj.sizeBytes, obj.captureTimeEpochMs, sha)
+            val partialSha = if (File(path).length() == obj.sizeBytes && File(path).exists()) {
+                sha256File(File(path))
+            } else {
+                mtp.importObject(obj, path) { }
+            }
+            val key = fileIdentityKey(
+                obj.storageId,
+                obj.handle,
+                obj.sizeBytes,
+                obj.captureTimeEpochMs,
+                partialSha,
+            )
+            if (key in existingKeys) continue
             entities += FileEntity(
                 identityKey = key,
                 shootId = shootId,
-                sha256 = sha,
+                sha256 = partialSha,
                 originalName = obj.filename,
                 sizeBytes = obj.sizeBytes,
                 storageId = obj.storageId,
@@ -93,13 +112,19 @@ class Repository(
                 s3Key = null,
             )
         }
-        db.fileDao().upsertAll(entities)
-        val totalBytes = entities.sumOf { it.sizeBytes }
+        if (entities.isNotEmpty()) db.fileDao().upsertAll(entities)
+        val allFiles = db.fileDao().observeForShoot(shootId).first()
+        val totalBytes = allFiles.sumOf { it.sizeBytes }
         val existing = getShoot(shootId)
         db.shootDao().upsert(
             (existing ?: ShootEntity(
                 shootId, shootId, "IMPORTING", "IMPORT", System.currentTimeMillis(), 0, 0, null, null, null, null,
-            )).copy(imageCount = entities.size, totalBytes = totalBytes, phase = "IMPORT", state = "IMPORTING"),
+            )).copy(
+                imageCount = allFiles.size,
+                totalBytes = totalBytes,
+                phase = "IMPORT",
+                state = "IMPORTING",
+            ),
         )
         return entities.size
     }
@@ -123,6 +148,41 @@ class Repository(
             ),
         )
         return estimate
+    }
+
+    suspend fun uploadManifestIfReady(shootId: String) {
+        val files = db.fileDao().observeForShoot(shootId).first()
+        if (files.isEmpty() || files.any { it.uploadState != "UPLOADED" }) return
+        val shoot = getShoot(shootId) ?: return
+        val userId = prefs.getString("user_id", null) ?: return
+        val manifest = JSONObject()
+            .put("shoot_id", shootId)
+            .put("user_id", userId)
+            .put("album_title", shoot.albumTitle)
+            .put("settings_hash", "develop.auto-longEdge0-q90")
+            .put(
+                "files",
+                JSONArray().apply {
+                    files.forEach { f ->
+                        put(
+                            JSONObject()
+                                .put("sha256", f.sha256)
+                                .put("size_bytes", f.sizeBytes)
+                                .put("original_name", f.originalName)
+                                .put("storage_id", f.storageId)
+                                .put("object_handle", f.objectHandle)
+                                .put("capture_time_epoch_ms", f.captureTimeEpochMs),
+                        )
+                    }
+                },
+            )
+        api.uploadManifest(shootId, manifest.toString())
+        db.shootDao().upsert(shoot.copy(phase = "MANIFEST_UPLOADED"))
+    }
+
+    suspend fun submitShoot(shootId: String) {
+        uploadManifestIfReady(shootId)
+        api.finalizeShoot(shootId)
     }
 
     suspend fun refreshBackendStatus(shootId: String) {
@@ -158,5 +218,18 @@ class Repository(
     suspend fun retryFile(identityKey: String) {
         val f = db.fileDao().getFile(identityKey) ?: return
         db.fileDao().upsert(f.copy(uploadState = "PENDING", lastError = null))
+    }
+
+    private fun sha256File(file: File): String {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buf = ByteArray(8192)
+            while (true) {
+                val n = input.read(buf)
+                if (n <= 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        return md.digest().joinToString("") { "%02x".format(it) }
     }
 }

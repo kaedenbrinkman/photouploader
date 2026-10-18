@@ -3,6 +3,7 @@ import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-
 import { EC2Client, RunInstancesCommand } from '@aws-sdk/client-ec2';
 import { GetObjectCommand, HeadObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import type { APIGatewayProxyHandlerV2 } from 'aws-lambda';
+import { ManifestValidationError, rawKeyForFile, validateManifest } from './manifest-validate';
 import { json, userIdFromEvent } from './http';
 
 const s3 = new S3Client({});
@@ -26,7 +27,13 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
   if (!meta.Item || meta.Item.userId !== userId) return json(404, { error: 'shoot not found' });
 
   const manifestKey = `shoots/${shootId}/manifest.json`;
-  let manifest: { files: ManifestFile[]; settings_hash?: string; album_title?: string };
+  let manifest: {
+    shoot_id: string;
+    user_id: string;
+    files: ManifestFile[];
+    settings_hash?: string;
+    album_title?: string;
+  };
   try {
     const obj = await s3.send(
       new GetObjectCommand({ Bucket: process.env.BUCKET_NAME!, Key: manifestKey }),
@@ -36,10 +43,16 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     return json(400, { error: 'manifest missing on S3' });
   }
 
+  try {
+    validateManifest(manifest, shootId, userId);
+  } catch (e) {
+    if (e instanceof ManifestValidationError) return json(400, { error: e.message });
+    throw e;
+  }
+
   const missing: string[] = [];
   for (const f of manifest.files ?? []) {
-    const ext = (f.original_name ?? '').toUpperCase().endsWith('.JPG') ? '.JPG' : '.CR3';
-    const key = `shoots/${shootId}/raw/${f.sha256.toLowerCase()}${ext}`;
+    const key = rawKeyForFile(shootId, f);
     try {
       const head = await s3.send(new HeadObjectCommand({ Bucket: process.env.BUCKET_NAME!, Key: key }));
       if (Number(head.ContentLength) !== Number(f.size_bytes)) missing.push(key);
@@ -91,6 +104,7 @@ export DYNAMODB_TABLE=${process.env.TABLE_NAME}
 export GPHOTOS_TOKEN_PARAM=${tokenParam}
 export SETTINGS_HASH=${settingsHash}
 export ALBUM_TITLE=${JSON.stringify(albumTitle)}
+export LIGHTCRAFT_BIN=/opt/photopipeline/lightcraft/lightcraft-cli
 cd /opt/photopipeline/worker && python3 -m worker.main
 `;
 

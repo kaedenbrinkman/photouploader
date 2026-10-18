@@ -3,6 +3,8 @@ import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from '@aws-sdk/lib-
 import {
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
+  ListPartsCommand,
+  PutObjectCommand,
   S3Client,
   UploadPartCommand,
 } from '@aws-sdk/client-s3';
@@ -75,6 +77,41 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
       }),
     );
     return json(200, { url, key, partNumber, uploadId });
+  }
+
+  if (action === 'list_parts') {
+    const { uploadId, key } = body;
+    if (!uploadId || !key) return json(400, { error: 'missing fields' });
+    const listed = await s3.send(
+      new ListPartsCommand({ Bucket: process.env.BUCKET_NAME!, Key: key, UploadId: uploadId }),
+    );
+    const parts = (listed.Parts ?? []).map((p) => ({
+      partNumber: p.PartNumber,
+      eTag: p.ETag?.replace(/"/g, '') ?? '',
+    }));
+    return json(200, { parts });
+  }
+
+  if (action === 'presign_manifest') {
+    const key = `shoots/${shootId}/manifest.json`;
+    const url = await getSignedUrl(
+      s3,
+      new PutObjectCommand({
+        Bucket: process.env.BUCKET_NAME!,
+        Key: key,
+        ContentType: 'application/json',
+      }),
+      { expiresIn: 3600 },
+    );
+    await ddb.send(
+      new UpdateCommand({
+        TableName: process.env.TABLE_NAME,
+        Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
+        UpdateExpression: 'SET manifestExpected = :t, updatedAt = :u',
+        ExpressionAttributeValues: { ':t': true, ':u': Date.now() },
+      }),
+    );
+    return json(200, { url, key });
   }
 
   if (action === 'complete_multipart') {
