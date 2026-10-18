@@ -66,16 +66,28 @@ class StreamingCameraUploader(
         val speed = TransferSpeedTracker()
         speed.reset(file.sizeBytes)
         val buffer = ByteArray(min(partSize, 16L * 1024 * 1024).toInt())
+        val mtpRef = MtpDeviceRef(mtp)
+        val recoverMtp: () -> MtpDevice? = {
+            usb.closeMtpSession()
+            usb.openMtpDevice()
+        }
         val firstIncomplete = plans.firstOrNull { it.partNumber !in completedNumbers }
         if (firstIncomplete != null && firstIncomplete.offset > 0) {
-            hashCameraRange(mtp, handle, hasher, 0, firstIncomplete.offset, buffer)
+            hashCameraRange(mtpRef, handle, hasher, 0, firstIncomplete.offset, buffer, recoverMtp)
         }
         for (plan in plans) {
             if (plan.partNumber in completedNumbers) continue
             var attempt = 0
             while (true) {
                 try {
-                    val read = MtpPartReader.readPart(mtp, handle, plan.offset, plan.length.toInt(), buffer)
+                    val read = MtpPartReader.readPart(
+                        mtpRef,
+                        handle,
+                        plan.offset,
+                        plan.length.toInt(),
+                        buffer,
+                        recoverMtp,
+                    )
                     if (read <= 0) throw IOException("MTP read 0 bytes at ${plan.offset}")
                     hasher.update(buffer, 0, read)
                     val presigned = api.presignPart(
@@ -131,17 +143,18 @@ class StreamingCameraUploader(
     }
 
     private fun hashCameraRange(
-        mtp: MtpDevice,
+        mtpRef: MtpDeviceRef,
         handle: Int,
         hasher: IncrementalHasher,
         start: Long,
         endExclusive: Long,
         buffer: ByteArray,
+        recoverMtp: () -> MtpDevice?,
     ) {
         var offset = start
         while (offset < endExclusive) {
             val len = min(buffer.size.toLong(), endExclusive - offset).toInt()
-            val read = MtpPartReader.readPart(mtp, handle, offset, len, buffer)
+            val read = MtpPartReader.readPart(mtpRef, handle, offset, len, buffer, recoverMtp)
             hasher.update(buffer, 0, read)
             offset += read
         }
