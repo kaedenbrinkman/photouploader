@@ -388,6 +388,7 @@ class ShootViewModel(
             return
         }
         safeScope.launch {
+            UploadMetricsStore.clear()
             _ui.value = _ui.value.copy(
                 busy = true,
                 uploadStartState = UploadStartState.Starting,

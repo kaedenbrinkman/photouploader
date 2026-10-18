@@ -192,11 +192,17 @@ class Repository(
         val needsCamera = pending.any { it.isCameraStreamPending() }
         if (!needsCamera) return PrepareCameraResult.Ready
 
-        ensureUsbReady()?.let { err ->
-            return PrepareCameraResult.Error(err.userMessage)
+        val manager = usb ?: return PrepareCameraResult.Error("USB manager unavailable")
+        // Prefer the singleton's open session (same as listCr3Objects) before a full re-probe.
+        var mtpOpen = manager.openMtpDevice()
+        if (mtpOpen == null) {
+            ensureUsbReady()?.let { err ->
+                return PrepareCameraResult.Error(err.userMessage)
+            }
+            mtpOpen = manager.openMtpDevice()
         }
-        if (usb?.openMtpDevice() == null) {
-            val state = usb?.accessState?.value
+        if (mtpOpen == null) {
+            val state = manager.accessState.value
             val msg = when (state) {
                 UsbAccessState.PERMISSION_REQUIRED ->
                     "USB permission required — tap Connect on the camera step or allow access when prompted."
@@ -482,7 +488,9 @@ class Repository(
                             "computeUsd" to stored.response.estimate.computeUsd,
                             "s3StandardMonthUsd" to stored.response.estimate.s3StandardMonthUsd,
                             "s3DeepArchiveMonthUsd" to stored.response.estimate.s3DeepArchiveMonthUsd,
-                            "requestsUsd" to stored.response.estimate.requestsUsd,
+                            "requestsUsd" to stored.response.estimate.requestsUsd.let {
+                                if (it.isNaN() || it.isInfinite()) 0.0 else it
+                            },
                             "transferAccelerationUsd" to stored.response.estimate.transferAccelerationUsd,
                             "perFileUsd" to stored.response.estimate.totalShootUsd / imageCount,
                             "source" to stored.source.name,

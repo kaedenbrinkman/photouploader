@@ -167,8 +167,27 @@ class UsbCameraManager(private val appContext: Context) {
 
     fun refreshProbe(log: Boolean = false): UsbAccessState {
         if (log) logDeviceList("probe")
+        // Reuse an already-open MTP session even when UsbManager.deviceList is empty (common while MTP is claimed).
+        synchronized(sessionLock) {
+            val openDev = sessionDevice
+            if (sessionMtp != null && openDev != null && UsbDeviceInspector.isCanon(openDev)) {
+                _selectedDevice.value = openDev
+                if (usbManager.hasPermission(openDev)) {
+                    _accessState.value = UsbAccessState.READY
+                    if (log) {
+                        PipelineLog.d(
+                            "usb-probe",
+                            "state=READY (existing MTP session) device=${openDev.deviceName}",
+                        )
+                    }
+                    return _accessState.value
+                }
+            }
+        }
         val canon = findCanonDevice()
-        _selectedDevice.value = canon
+        if (canon != null) {
+            _selectedDevice.value = canon
+        }
         if (canon == null) {
             _accessState.value = UsbAccessState.NO_DEVICE
             if (log) PipelineLog.d("usb-probe", "state=NO_DEVICE (no Canon in list or cache)")
@@ -310,6 +329,9 @@ class UsbCameraManager(private val appContext: Context) {
     }
 
     fun findCanonDevice(): UsbDevice? {
+        synchronized(sessionLock) {
+            sessionDevice?.takeIf { UsbDeviceInspector.isCanon(it) }?.let { return it }
+        }
         listUsbDevices().firstOrNull { UsbDeviceInspector.isCanon(it) }?.let { return it }
         _selectedDevice.value?.takeIf { UsbDeviceInspector.isCanon(it) }?.let { cached ->
             PipelineLog.w("usb", "Using cached USB_DEVICE_ATTACHED Canon (not in current deviceList)")

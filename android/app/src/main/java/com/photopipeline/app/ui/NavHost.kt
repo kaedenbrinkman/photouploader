@@ -712,35 +712,46 @@ private fun UploadStep(
             ui.uploadFailedReason?.let {
                 Text("Failed: $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
             }
-            val primaryLabel = when (ui.uploadStartState) {
-                UploadStartState.Starting -> "Starting…"
-                UploadStartState.Uploading -> "Uploading…"
-                UploadStartState.Failed -> if (ui.isResumeShoot) "Connect & resume upload" else "Retry upload"
-                UploadStartState.Idle -> when {
+            if (uploading) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.size(12.dp))
+                    Text(
+                        if (ui.uploadStartState == UploadStartState.Starting) "Starting upload…" else "Uploading…",
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                }
+            }
+            val needsManualStart = ui.isResumeShoot ||
+                ui.uploadStartState == UploadStartState.Failed ||
+                files.any { it.uploadState == "FAILED" }
+            if (needsManualStart && !uploading) {
+                val primaryLabel = when {
                     ui.isResumeShoot && usbState != UsbAccessState.READY -> "Connect & resume upload"
                     ui.isResumeShoot -> "Resume upload"
-                    else -> "Start camera → S3 upload"
+                    else -> "Retry upload"
+                }
+                val primaryAction = when {
+                    ui.isResumeShoot -> onResume
+                    else -> onRetry
+                }
+                Button(
+                    onClick = primaryAction,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !ui.busy,
+                ) {
+                    Text(primaryLabel)
                 }
             }
-            val primaryAction = when {
-                ui.isResumeShoot && ui.uploadStartState == UploadStartState.Failed -> onResume
-                ui.isResumeShoot && usbState != UsbAccessState.READY -> onResume
-                ui.isResumeShoot && ui.uploadStartState == UploadStartState.Idle -> onResume
-                ui.uploadStartState == UploadStartState.Failed -> onRetry
-                else -> onStart
-            }
-            Button(
-                onClick = primaryAction,
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !uploading && !ui.busy,
-            ) {
-                if (uploading || ui.uploadStartState == UploadStartState.Starting) {
-                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                    Spacer(Modifier.size(8.dp))
-                }
-                Text(primaryLabel)
-            }
-            UploadProgressSection(files, onRetry)
+            UploadProgressSection(
+                files = files,
+                onRetry = onRetry,
+                showRetryButton = needsManualStart && !uploading,
+            )
         }
     }
 }
@@ -974,12 +985,19 @@ fun BackendGateCard(message: String) {
     }
 }
 
+private fun JSONObject.usd(key: String, default: Double = 0.0): Double {
+    if (!has(key) || isNull(key)) return default
+    val v = optDouble(key, default)
+    return if (v.isNaN() || v.isInfinite()) default else v
+}
+
 @Composable
 fun EstimateCard(json: String) {
     val o = remember(json) { JSONObject(json) }
     val source = o.optString("source", "LOCAL")
     val imageCount = o.optInt("imageCount", 0).coerceAtLeast(1)
-    val perFile = o.optDouble("perFileUsd", o.optDouble("totalShootUsd") / imageCount)
+    val total = o.usd("totalShootUsd")
+    val perFile = o.usd("perFileUsd", total / imageCount)
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(
@@ -987,21 +1005,23 @@ fun EstimateCard(json: String) {
                 style = MaterialTheme.typography.titleSmall,
             )
             Text("~$%.4f per file × $imageCount files".format(perFile), style = MaterialTheme.typography.bodyMedium)
-            Text("Processing (compute): ~${o.optDouble("processingMinutes")} min · $${o.optDouble("computeUsd")}")
-            Text("S3 storage (standard / month): $${o.optDouble("s3StandardMonthUsd")}")
+            Text(
+                "Processing (compute): ~${o.optDouble("processingMinutes")} min · $${"%.4f".format(o.usd("computeUsd"))}",
+            )
+            Text("S3 storage (standard / month): $${"%.4f".format(o.usd("s3StandardMonthUsd"))}")
             if (o.has("s3DeepArchiveMonthUsd")) {
                 Text(
-                    "S3 deep archive (reference / month): $${o.optDouble("s3DeepArchiveMonthUsd")}",
+                    "S3 deep archive (reference / month): $${"%.4f".format(o.usd("s3DeepArchiveMonthUsd"))}",
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
-            Text("API & request overhead: $${o.optDouble("requestsUsd")}")
-            val accelUsd = o.optDouble("transferAccelerationUsd", 0.0)
+            Text("API & request overhead: $${"%.4f".format(o.usd("requestsUsd"))}")
+            val accelUsd = o.usd("transferAccelerationUsd")
             if (accelUsd > 0) {
-                Text("S3 Transfer Acceleration surcharge: $${accelUsd}")
+                Text("S3 Transfer Acceleration surcharge: $${"%.4f".format(accelUsd)}")
             }
             Text(
-                "Estimated shoot total: $${o.optDouble("totalShootUsd")}",
+                "Estimated shoot total: $${"%.4f".format(total)}",
                 style = MaterialTheme.typography.titleSmall,
             )
             o.optString("notes").takeIf { it.isNotBlank() }?.let {
@@ -1012,7 +1032,11 @@ fun EstimateCard(json: String) {
 }
 
 @Composable
-fun UploadProgressSection(files: List<com.photopipeline.app.data.FileEntity>, onRetry: () -> Unit) {
+fun UploadProgressSection(
+    files: List<com.photopipeline.app.data.FileEntity>,
+    onRetry: () -> Unit,
+    showRetryButton: Boolean = true,
+) {
     if (files.isEmpty()) return
     val done = files.count { it.uploadState == "UPLOADED" }
     val totalBytes = files.sumOf { it.sizeBytes }.coerceAtLeast(1)
@@ -1032,7 +1056,7 @@ fun UploadProgressSection(files: List<com.photopipeline.app.data.FileEntity>, on
                 )
                 f.lastError?.let { Text("Error: $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
-            if (files.any { it.uploadState == "FAILED" }) {
+            if (showRetryButton && files.any { it.uploadState == "FAILED" }) {
                 FilledTonalButton(onClick = onRetry) { Text("Retry failed uploads") }
             }
         }
