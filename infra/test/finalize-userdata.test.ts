@@ -13,10 +13,10 @@ describe('EC2 user-data bootstrap script', () => {
     expect(sh).not.toMatch(/python3 -m pip install.*requirements\.txt/);
   });
 
-  it('arms bootstrap backstop and traps errors to report_fail', () => {
-    expect(sh).toMatch(/shutdown -h \+30/);
+  it('traps errors to report_fail', () => {
     expect(sh).toMatch(/trap 'on_err \$LINENO' ERR/);
     expect(sh).toMatch(/report_fail/);
+    expect(sh).not.toMatch(/shutdown -h \+30/);
   });
 
   it('updates shoot phase BOOTSTRAPPING then RENDERING', () => {

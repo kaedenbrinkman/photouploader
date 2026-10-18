@@ -993,6 +993,14 @@ private fun ProcessingStep(
         Text("Processing on server", style = MaterialTheme.typography.titleMedium)
         Text(humanShootState(shoot))
         Text("Phase: ${serverPhase ?: shoot.phase}", style = MaterialTheme.typography.bodySmall)
+        shoot.deadlineAt?.let { deadlineMs ->
+            val stopFmt = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
+            Text(
+                "Auto-stops by ${stopFmt.format(Date(deadlineMs))}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         serverLaunchErrorCode?.let {
             Text("Error code: $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
         }

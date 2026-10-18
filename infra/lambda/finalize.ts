@@ -14,6 +14,7 @@ import {
 import { ManifestValidationError, rawKeyForFile, validateManifest } from './manifest-validate';
 import { json, userIdFromEvent } from './http';
 import { verifyWorkerArtifact } from './worker-artifacts';
+import { computeDeadlineAt, computeMaxRuntimeMinutes } from './pricing';
 import { loadWorkerSha256FromSsm } from './worker-sha-ssm';
 
 const s3 = new S3Client({});
@@ -46,6 +47,7 @@ function buildUserData(params: {
   bundleSha256: string;
   lightcraftKey: string;
   lightcraftSha256: string;
+  maxRuntimeMinutes: number;
 }): string {
   const {
     shootId,
@@ -59,8 +61,11 @@ function buildUserData(params: {
     bundleSha256,
     lightcraftKey,
     lightcraftSha256,
+    maxRuntimeMinutes,
   } = params;
   const exports = `#!/bin/bash
+sudo shutdown -h +${maxRuntimeMinutes} "photopipeline shoot runtime cap" 2>/dev/null || true
+export MAX_RUNTIME_MINUTES=${maxRuntimeMinutes}
 export SHOOT_ID=${shootId}
 export USER_ID=${userId}
 export BUCKET_NAME=${bucket}
@@ -310,6 +315,11 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     const albumTitle = manifest.album_title ?? meta.Item.albumTitle ?? shootId;
     const tokenParam = `/photopipeline/users/${userId}/gphotos-token`;
 
+    const fileCount = manifest.files?.length ?? Number(meta.Item.imageCount) ?? 1;
+    const maxRuntimeMinutes = computeMaxRuntimeMinutes(fileCount);
+    const launchAt = Date.now();
+    const deadlineAt = computeDeadlineAt(launchAt, maxRuntimeMinutes);
+
     const userData = buildUserData({
       shootId,
       userId,
@@ -322,6 +332,7 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
       bundleSha256,
       lightcraftKey,
       lightcraftSha256,
+      maxRuntimeMinutes,
     });
 
     const attempts: Array<{ spot: boolean; type: string }> = [
@@ -372,7 +383,8 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
                 Tags: [
                   { Key: 'Project', Value: 'PhotoPipeline' },
                   { Key: 'ShootId', Value: shootId },
-                  { Key: 'MaxLifetimeMinutes', Value: process.env.WORKER_MAX_LIFETIME_MINUTES ?? '120' },
+                  { Key: 'MaxLifetimeMinutes', Value: String(maxRuntimeMinutes) },
+                  { Key: 'DeadlineAt', Value: String(deadlineAt) },
                 ],
               },
             ],
@@ -384,7 +396,7 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
             TableName: process.env.TABLE_NAME,
             Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
             UpdateExpression:
-              'SET #s = :p, phase = :st, instanceId = :i, instanceType = :it, spot = :sp, workerStartedAt = :t REMOVE lastError, launchErrorCode',
+              'SET #s = :p, phase = :st, instanceId = :i, instanceType = :it, spot = :sp, workerStartedAt = :t, maxRuntimeMinutes = :mr, deadlineAt = :dl REMOVE lastError, launchErrorCode',
             ExpressionAttributeNames: { '#s': 'state' },
             ExpressionAttributeValues: {
               ':p': 'PROCESSING',
@@ -392,7 +404,9 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
               ':i': instanceId,
               ':it': attempt.type,
               ':sp': attempt.spot,
-              ':t': Date.now(),
+              ':t': launchAt,
+              ':mr': maxRuntimeMinutes,
+              ':dl': deadlineAt,
             },
           }),
         );

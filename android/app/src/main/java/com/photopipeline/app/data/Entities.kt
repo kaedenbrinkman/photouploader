@@ -16,6 +16,8 @@ data class ShootEntity(
     val backendState: String?,
     val albumId: String?,
     val actualComputeJson: String?,
+    val maxRuntimeMinutes: Int? = null,
+    val deadlineAt: Long? = null,
 )
 
 @Entity(tableName = "files")

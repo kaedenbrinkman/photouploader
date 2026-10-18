@@ -31,6 +31,8 @@ data class ShootStatusResponse(
     val lastError: String? = null,
     val launchErrorCode: String? = null,
     val albumId: String?,
+    val maxRuntimeMinutes: Int? = null,
+    val deadlineAt: Long? = null,
     val progress: ProgressDto?,
     val actualCompute: ActualComputeDto?,
     val files: List<FileStatusDto>?,

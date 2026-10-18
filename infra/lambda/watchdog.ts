@@ -4,6 +4,7 @@ import { EC2Client, DescribeInstancesCommand, TerminateInstancesCommand } from '
 import type { ScheduledHandler } from 'aws-lambda';
 import { isWorkerInstanceLive } from './ec2-instance';
 import { bootstrapStuckTimeoutMs, isBootstrapStuck } from './watchdog-bootstrap';
+import { isPastDeadline, runtimeTimeoutError } from './watchdog-runtime';
 
 const ec2 = new EC2Client({});
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -87,6 +88,50 @@ export const handler: ScheduledHandler = async () => {
     stuckKey = scan.LastEvaluatedKey;
   } while (stuckKey);
 
+  const runtimeTimeouts: string[] = [];
+  let deadlineKey: Record<string, unknown> | undefined;
+  do {
+    const scan = await ddb.send(
+      new ScanCommand({
+        TableName: table,
+        FilterExpression:
+          'begins_with(pk, :p) AND sk = :meta AND #s = :proc AND attribute_exists(deadlineAt) AND deadlineAt < :now',
+        ExpressionAttributeNames: { '#s': 'state' },
+        ExpressionAttributeValues: {
+          ':p': 'SHOOT#',
+          ':meta': 'META',
+          ':proc': 'PROCESSING',
+          ':now': now,
+        },
+        ExclusiveStartKey: deadlineKey,
+      }),
+    );
+    for (const item of scan.Items ?? []) {
+      const shootId = String(item.pk).replace(/^SHOOT#/, '');
+      const deadlineAt = item.deadlineAt as number | undefined;
+      if (!isPastDeadline(deadlineAt, now)) continue;
+      const instanceId = item.instanceId as string | undefined;
+      if (instanceId) toTerminate.add(instanceId);
+      await ddb.send(
+        new UpdateCommand({
+          TableName: table,
+          Key: { pk: item.pk, sk: item.sk },
+          UpdateExpression:
+            'SET #s = :f, phase = :ph, lastError = :e, updatedAt = :t REMOVE instanceId, instanceType, spot, workerStartedAt, launchLockUntil',
+          ExpressionAttributeNames: { '#s': 'state' },
+          ExpressionAttributeValues: {
+            ':f': 'FAILED',
+            ':ph': 'RUNTIME_TIMEOUT',
+            ':e': runtimeTimeoutError(deadlineAt!),
+            ':t': now,
+          },
+        }),
+      );
+      runtimeTimeouts.push(shootId);
+    }
+    deadlineKey = scan.LastEvaluatedKey;
+  } while (deadlineKey);
+
   if (toTerminate.size) {
     await ec2.send(new TerminateInstancesCommand({ InstanceIds: [...toTerminate] }));
   }
@@ -139,6 +184,7 @@ export const handler: ScheduledHandler = async () => {
     JSON.stringify({
       terminated: [...toTerminate],
       bootstrapStuckFails,
+      runtimeTimeouts,
       staleResets,
     }),
   );

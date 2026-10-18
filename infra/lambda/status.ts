@@ -72,6 +72,8 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     },
     estimateAtSubmit: meta.Item.estimateAtSubmit,
     actualCompute,
+    maxRuntimeMinutes: meta.Item.maxRuntimeMinutes,
+    deadlineAt: meta.Item.deadlineAt,
     files,
     results,
   });

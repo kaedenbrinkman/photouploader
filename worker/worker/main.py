@@ -92,7 +92,7 @@ def run() -> int:
         renderedCount=0,
         publishedCount=0,
     )
-    manage_shutdown_backstop(cancel=True, arm_idle_minutes=120)
+    manage_shutdown_backstop(cancel=True, arm_idle_minutes=None)
 
     try:
         manifest = load_manifest(s3, cfg.bucket, cfg.shoot_id)

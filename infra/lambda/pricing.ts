@@ -69,3 +69,28 @@ export function actualComputeCost(computeSeconds: number, instanceType: string, 
 function round(n: number) {
   return Math.round(n * 10000) / 10000;
 }
+
+const MAX_RUNTIME_MIN_FLOOR = 15;
+const MAX_RUNTIME_MIN_CEILING = 120;
+const MAX_RUNTIME_BASE_MINUTES = 10;
+const MAX_RUNTIME_SAFETY_FACTOR = 2;
+
+/** Per-shoot EC2 wall clock from config/pricing.json render estimate (2× margin, clamped 15–120). */
+export function computeMaxRuntimeMinutes(fileCount: number): number {
+  const count = Math.max(1, Math.floor(Number(fileCount) || 0));
+  const p = pricingTable as any;
+  const ec2 = p.ec2;
+  const instanceType =
+    count < 50 ? (ec2.instanceTypeOrder[1] ?? ec2.instanceTypeOrder[0]) : ec2.instanceTypeOrder[0];
+  const par = ec2.parallelism[instanceType] ?? 4;
+  const secondsPerFile = ec2.secondsPerImageAtReferenceParallelism / par;
+  const perFileMinutes = secondsPerFile / 60;
+  const estimate =
+    MAX_RUNTIME_BASE_MINUTES + Math.ceil(count * perFileMinutes * MAX_RUNTIME_SAFETY_FACTOR);
+  return Math.min(MAX_RUNTIME_MIN_CEILING, Math.max(MAX_RUNTIME_MIN_FLOOR, estimate));
+}
+
+export function computeDeadlineAt(nowMs: number, maxRuntimeMinutes: number): number {
+  const mins = Math.max(1, Math.floor(maxRuntimeMinutes));
+  return nowMs + mins * 60_000;
+}

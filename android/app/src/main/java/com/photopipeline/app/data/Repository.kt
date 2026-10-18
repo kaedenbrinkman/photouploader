@@ -660,6 +660,8 @@ class Repository(
                 phase = status.phase ?: status.state,
                 backendState = status.state,
                 albumId = status.albumId,
+                maxRuntimeMinutes = status.maxRuntimeMinutes,
+                deadlineAt = status.deadlineAt,
                 actualComputeJson = status.actualCompute?.let { ac ->
                     val sec = ac.seconds ?: 0
                     val usd = ac.usd?.takeIf { !it.isNaN() && !it.isInfinite() } ?: 0.0

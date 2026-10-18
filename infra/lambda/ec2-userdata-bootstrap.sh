@@ -3,8 +3,6 @@
 # INSTALL_ROOT (optional), LIGHTCRAFT_BIN (optional).
 set -euo pipefail
 
-sudo shutdown -h +30 "photopipeline bootstrap backstop" 2>/dev/null || true
-
 INSTALL_ROOT="${INSTALL_ROOT:-/opt/photopipeline}"
 LIGHTCRAFT_BIN="${LIGHTCRAFT_BIN:-${INSTALL_ROOT}/lightcraft/lightcraft-cli}"
 VENV="${INSTALL_ROOT}/venv"
@@ -131,14 +129,6 @@ on_err() {
 }
 trap 'on_err $LINENO' ERR
 
-cancel_bootstrap_backstop() {
-  sudo shutdown -c 2>/dev/null || true
-}
-
-arm_worker_idle_backstop() {
-  sudo shutdown -h +120 "photopipeline worker idle backstop" 2>/dev/null || true
-}
-
 set_shoot_phase BOOTSTRAPPING
 
 dnf install -y aws-cli python3 tar 2>/dev/null || yum install -y aws-cli python3 tar
@@ -164,8 +154,6 @@ chmod +x "$LC"
 mkdir -p "${INSTALL_ROOT}/lightcraft"
 mv "$LC" "$LIGHTCRAFT_BIN"
 
-cancel_bootstrap_backstop
-arm_worker_idle_backstop
 set_shoot_phase RENDERING
 
 cd "${INSTALL_ROOT}/photopipeline-worker"
