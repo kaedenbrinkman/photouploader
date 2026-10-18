@@ -14,7 +14,7 @@ log() { echo "[bootstrap] $*"; }
 
 install_prereqs() {
   if command -v dnf >/dev/null 2>&1; then
-    dnf install -y git gcc gcc-c++ make python3 python3-pip tar curl
+    dnf install -y git gcc gcc-c++ make python3 python3-pip tar
   elif command -v yum >/dev/null 2>&1; then
     yum install -y git gcc gcc-c++ make python3 python3-pip tar curl
   fi
