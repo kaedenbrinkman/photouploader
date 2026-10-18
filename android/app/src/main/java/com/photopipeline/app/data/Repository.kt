@@ -580,10 +580,10 @@ class Repository(
 
     suspend fun submitShoot(shootId: String) = finalizeShootForProcessing(shootId)
 
-    suspend fun refreshBackendStatus(shootId: String) {
-        if (!canUseBackendApi()) return
+    suspend fun refreshBackendStatus(shootId: String): com.photopipeline.app.api.ShootStatusResponse? {
+        if (!canUseBackendApi()) return null
         val status = api.fetchStatus(shootId)
-        val shoot = getShoot(shootId) ?: return
+        val shoot = getShoot(shootId) ?: return status
         status.progress?.let { p ->
             prefs.edit().putString(
                 "shoot_progress_$shootId",
@@ -608,6 +608,7 @@ class Repository(
                 },
             ),
         )
+        return status
     }
 
     fun processingProgressJson(shootId: String): String? =

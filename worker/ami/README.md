@@ -1,6 +1,23 @@
-# Worker AMI bootstrap
+# Worker runtime (stock AL2023 — no custom AMI)
 
-Builds `/opt/photopipeline/lightcraft/lightcraft-cli` from pinned LightCraft commit **31a677fe** (Rust **≥ 1.90**) and installs the Python worker.
+Production workers boot from the **latest Amazon Linux 2023** AMI. Finalize Lambda user-data downloads:
+
+- `s3://<bucket>/releases/photopipeline-worker.tar.gz` (Python worker; build with `scripts/build-worker-bundle.sh`)
+- `s3://<bucket>/releases/lightcraft-cli` (prebuilt binary + SHA256)
+
+Both checksums are required on the finalize Lambda (`WORKER_BUNDLE_SHA256`, `LIGHTCRAFT_BINARY_SHA256`).
+
+## Spot service-linked role (one-time)
+
+The finalize role can call `iam:CreateServiceLinkedRole` for `spot.amazonaws.com`. Alternatively, an account admin runs once:
+
+```bash
+aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
+```
+
+## Packer / bootstrap (dev only)
+
+`bootstrap.sh` still builds LightCraft from source for local AMI experiments; **do not** rely on a baked AMI in production.
 
 ## Quick verify (CI / local)
 

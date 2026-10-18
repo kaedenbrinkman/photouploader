@@ -28,6 +28,8 @@ data class ShootStatusResponse(
     val shootId: String,
     val state: String,
     val phase: String?,
+    val lastError: String? = null,
+    val launchErrorCode: String? = null,
     val albumId: String?,
     val progress: ProgressDto?,
     val actualCompute: ActualComputeDto?,

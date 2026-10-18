@@ -207,7 +207,7 @@ class ApiClient(
     suspend fun finalizeShoot(shootId: String) = onIo {
         val req = authorizedRequest("/shoots/$shootId/finalize").post("{}".toRequestBody(JSON)).build()
         client.newCall(req).execute().use { resp ->
-            if (resp.code !in 200..202) failHttp("finalize", resp)
+            if (resp.code !in 200..202) failFinalize(resp)
         }
     }
 
@@ -256,6 +256,21 @@ class ApiClient(
     private fun JSONObject.putTransferAcceleration(enabled: Boolean): JSONObject {
         if (enabled) put("transferAcceleration", true)
         return this
+    }
+
+    private fun failFinalize(resp: Response): Nothing {
+        val body = resp.body?.string().orEmpty()
+        var ec2: String? = null
+        var detail: String? = null
+        runCatching {
+            val o = JSONObject(body)
+            ec2 = o.optString("ec2ErrorCode").takeIf { it.isNotBlank() }
+            detail = o.optString("detail").takeIf { it.isNotBlank() }
+                ?: o.optString("error").takeIf { it.isNotBlank() }
+        }
+        val friendly = FinalizeErrorMessages.friendly(ec2, detail, resp.code)
+        PipelineLog.w("api", "finalize HTTP ${resp.code} ec2=$ec2 detail=$detail")
+        throw ApiRequestException(friendly, resp.code, ec2)
     }
 
     private fun failHttp(route: String, resp: Response): Nothing {

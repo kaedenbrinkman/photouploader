@@ -46,6 +46,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Bootstrap script syntax
         run: bash -n worker/ami/bootstrap.sh
+      - name: EC2 install script syntax
+        run: bash -n worker/ami/ec2-install-from-s3.sh
+      - name: Build worker bundle (artifact only, not uploaded)
+        run: |
+          chmod +x scripts/build-worker-bundle.sh
+          scripts/build-worker-bundle.sh
       - name: Bootstrap docker verify (stub LightCraft)
         run: docker build -f worker/ami/Dockerfile.verify .
 

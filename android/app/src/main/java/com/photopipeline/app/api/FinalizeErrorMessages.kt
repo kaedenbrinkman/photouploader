@@ -1,0 +1,21 @@
+package com.photopipeline.app.api
+
+object FinalizeErrorMessages {
+    fun friendly(ec2ErrorCode: String?, detail: String?, httpCode: Int? = null): String {
+        when (ec2ErrorCode) {
+            "PendingVerification" ->
+                return "AWS account verification pending — try again later."
+            "ServiceLinkedRoleCreationNotPermitted" ->
+                return "AWS needs a one-time Spot service role — ask your admin or retry after IAM is fixed."
+            "InsufficientInstanceCapacity" ->
+                return "AWS capacity is temporarily unavailable in this region — try again later."
+            "worker_artifacts_not_configured" ->
+                return "Server worker bundle is not deployed yet — contact the operator."
+        }
+        if (!detail.isNullOrBlank()) return detail.take(280)
+        return when (httpCode) {
+            503 -> "Processing could not start yet — try again later."
+            else -> "Processing could not start."
+        }
+    }
+}

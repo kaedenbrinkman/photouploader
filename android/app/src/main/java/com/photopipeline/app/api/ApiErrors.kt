@@ -4,4 +4,8 @@ package com.photopipeline.app.api
 class NotSignedInException : Exception("not signed in")
 
 /** HTTP or parse failure talking to the backend. */
-class ApiRequestException(message: String, val httpCode: Int? = null) : Exception(message)
+class ApiRequestException(
+    message: String,
+    val httpCode: Int? = null,
+    val ec2ErrorCode: String? = null,
+) : Exception(message)

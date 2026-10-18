@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.photopipeline.app.api.ApiRequestException
+import com.photopipeline.app.api.FinalizeErrorMessages
 import com.photopipeline.app.api.NotSignedInException
 import com.photopipeline.app.core.PipelineLog
 import com.photopipeline.app.data.CameraImportResult
@@ -76,6 +77,7 @@ data class ShootUiState(
     val autoConnectInFlight: Boolean = false,
     val finalizeState: FinalizeState = FinalizeState.Idle,
     val finalizeError: String? = null,
+    val serverProcessingError: String? = null,
 )
 
 class ShootViewModel(
@@ -137,6 +139,10 @@ class ShootViewModel(
             if (loaded != null &&
                 (loaded.backendState != null || loaded.state !in LOCAL_ONLY_STATES || loaded.albumId != null)
             ) {
+                startPolling()
+            }
+            if (fileList.isNotEmpty() && fileList.all { it.uploadState == "UPLOADED" }) {
+                recomputeStep()
                 startPolling()
             }
             if (resume) {
@@ -450,14 +456,6 @@ class ShootViewModel(
         )
     }
 
-    private fun observeAutoFinalize() {
-        safeScope.launch {
-            files.collect {
-                tryAutoFinalizeIfReady()
-            }
-        }
-    }
-
     private fun tryAutoFinalizeIfReady() {
         if (finalizeInFlight) return
         if (!repo.canUseBackendApi()) return
@@ -629,6 +627,20 @@ class ShootViewModel(
                 if (!shouldPollBackend()) break
                 var stopPolling = false
                 runCatching { repo.refreshBackendStatus(shootId) }
+                    .onSuccess { status ->
+                        status?.let {
+                            val serverMsg = FinalizeErrorMessages.friendly(
+                                it.launchErrorCode,
+                                it.lastError,
+                            ).takeIf { msg ->
+                                it.state == "READY_TO_PROCESS" || it.state == "FAILED" ||
+                                    !it.lastError.isNullOrBlank()
+                            }
+                            if (serverMsg != null) {
+                                _ui.value = _ui.value.copy(serverProcessingError = serverMsg)
+                            }
+                        }
+                    }
                     .onFailure { e ->
                         val detail = when (e) {
                             is ApiRequestException ->
@@ -656,6 +668,7 @@ class ShootViewModel(
             if (s.backendState != null || s.albumId != null) return true
             if (s.state !in LOCAL_ONLY_STATES) return true
         }
+        if (files.value.isNotEmpty() && files.value.all { it.uploadState == "UPLOADED" }) return true
         return repo.isServerShootRegistered(shootId) &&
             files.value.isNotEmpty() &&
             files.value.all { it.uploadState == "UPLOADED" }
@@ -669,7 +682,10 @@ class ShootViewModel(
             return true
         }
         val s = shoot.value ?: return false
-        if (s.state == "FAILED") return true
+        if (s.state == "FAILED" || s.state == "READY_TO_PROCESS") return true
+        if (!s.backendState.isNullOrBlank() && s.backendState in setOf("FAILED", "READY_TO_PROCESS")) {
+            return true
+        }
         // All bytes in S3 but server never left LOCAL (e.g. finalize 409 before backend fix).
         return s.state in LOCAL_ONLY_STATES &&
             s.phase.contains("MANIFEST", ignoreCase = true) &&
@@ -677,11 +693,15 @@ class ShootViewModel(
             _ui.value.uploadStartState != UploadStartState.Starting
     }
 
+    fun allFilesUploaded(): Boolean =
+        files.value.isNotEmpty() && files.value.all { it.uploadState == "UPLOADED" }
+
     private fun recomputeStep() {
         val s = shoot.value ?: return
         val fileList = files.value
         val step = when {
             s.albumId != null || (s.state in TERMINAL && s.state != "FAILED") -> ShootFlowStep.Results
+            fileList.isNotEmpty() && fileList.all { it.uploadState == "UPLOADED" } -> ShootFlowStep.Processing
             s.state !in setOf("LOCAL", "IMPORTING") && s.backendState != null -> ShootFlowStep.Processing
             fileList.isEmpty() -> ShootFlowStep.PickFiles
             else -> ShootFlowStep.Upload
@@ -724,6 +744,7 @@ fun humanShootState(shoot: ShootEntity?): String {
         "LOCAL", "IMPORTING" -> "On device"
         "UPLOADING" -> "Uploading"
         "PROCESSING" -> "Processing on server"
+        "READY_TO_PROCESS" -> "Ready to process"
         "DONE" -> "Complete"
         "FAILED" -> "Failed"
         "PARTIAL" -> "Partially complete"

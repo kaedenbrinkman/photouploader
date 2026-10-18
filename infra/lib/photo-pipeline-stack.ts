@@ -118,6 +118,10 @@ export class PhotoPipelineStack extends cdk.Stack {
       WORKER_SUBNET_ID: workerSubnetId.valueAsString,
       WORKER_AMI_ID: workerAmi.getImage(this).imageId,
       WORKER_MAX_LIFETIME_MINUTES: '120',
+      WORKER_BUNDLE_KEY: 'releases/photopipeline-worker.tar.gz',
+      WORKER_BUNDLE_SHA256: '',
+      LIGHTCRAFT_BINARY_KEY: 'releases/lightcraft-cli',
+      LIGHTCRAFT_BINARY_SHA256: '',
       AWS_ACCOUNT_ID: this.account,
     };
 
@@ -148,6 +152,15 @@ export class PhotoPipelineStack extends cdk.Stack {
       new iam.PolicyStatement({
         actions: ['ec2:RunInstances', 'ec2:CreateTags', 'ec2:DescribeInstances', 'iam:PassRole'],
         resources: ['*'],
+      }),
+    );
+    finalizeFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['iam:CreateServiceLinkedRole'],
+        resources: [`arn:aws:iam::${this.account}:role/aws-service-role/spot.amazonaws.com/*`],
+        conditions: {
+          StringLike: { 'iam:AWSServiceName': 'spot.amazonaws.com' },
+        },
       }),
     );
 

@@ -388,6 +388,7 @@ fun ShootFlowScreen(
     val ui by vm.ui.collectAsState()
     val uploadMetrics by UploadMetricsStore.metrics.collectAsState()
     val usbState by usb.accessState.collectAsState()
+    val allUploaded = files.isNotEmpty() && files.all { it.uploadState == "UPLOADED" }
     val snackbarHost = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
@@ -446,19 +447,21 @@ fun ShootFlowScreen(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            item { FlowStepper(current = ui.step) }
-            item {
-                Text(ui.statusLine, style = MaterialTheme.typography.bodyLarge)
-                if (ui.busy) {
-                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
+            if (!allUploaded) {
+                item { FlowStepper(current = ui.step) }
+                item {
+                    Text(ui.statusLine, style = MaterialTheme.typography.bodyLarge)
+                    if (ui.busy) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
+                    }
                 }
-            }
-            item {
-                Text(
-                    "USB: ${usbStatusMessage(usbState)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                item {
+                    Text(
+                        "USB: ${usbStatusMessage(usbState)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
             if (!ui.backendReady && ui.backendGateMessage.isNotBlank()) {
                 item { BackendGateCard(ui.backendGateMessage) }
@@ -530,11 +533,13 @@ fun ShootFlowScreen(
                     }
                 }
                 ShootFlowStep.Processing -> item {
+                    val processingError = ui.serverProcessingError ?: ui.finalizeError
                     ProcessingStep(
                         shoot = shoot,
                         progressJson = ui.processingProgress,
                         showRetry = vm.needsProcessingRetry(),
-                        finalizeError = ui.finalizeError,
+                        processingError = processingError,
+                        finalizeInProgress = ui.finalizeState == FinalizeState.InProgress,
                         busy = ui.busy,
                         onRetryProcessing = { vm.retryProcessing() },
                     )
@@ -849,13 +854,25 @@ private fun ProcessingRetryBlock(
     error: String?,
     busy: Boolean,
     onRetry: () -> Unit,
+    prominent: Boolean = false,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        error?.let {
-            Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        if (prominent) {
+            Button(onClick = onRetry, modifier = Modifier.fillMaxWidth(), enabled = !busy) {
+                Text("Retry processing")
+            }
         }
-        FilledTonalButton(onClick = onRetry, modifier = Modifier.fillMaxWidth(), enabled = !busy) {
-            Text("Retry processing")
+        error?.let {
+            Text(
+                it,
+                color = MaterialTheme.colorScheme.error,
+                style = if (prominent) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall,
+            )
+        }
+        if (!prominent) {
+            FilledTonalButton(onClick = onRetry, modifier = Modifier.fillMaxWidth(), enabled = !busy) {
+                Text("Retry processing")
+            }
         }
         Text(
             "Files are already in S3 — no camera needed.",
@@ -929,7 +946,8 @@ private fun ProcessingStep(
     shoot: ShootEntity?,
     progressJson: String?,
     showRetry: Boolean,
-    finalizeError: String?,
+    processingError: String?,
+    finalizeInProgress: Boolean,
     busy: Boolean,
     onRetryProcessing: () -> Unit,
 ) {
@@ -937,19 +955,37 @@ private fun ProcessingStep(
     val phases = listOf("IMPORT", "ESTIMATE", "UPLOAD", "MANIFEST", "RENDER", "PUBLISH", "DONE")
     val phase = shoot.phase.uppercase()
     val idx = phases.indexOfFirst { phase.contains(it, ignoreCase = true) }.coerceAtLeast(0)
+    val waitingToStart = shoot.state == "READY_TO_PROCESS" || shoot.state == "LOCAL"
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (showRetry) {
+            ProcessingRetryBlock(
+                error = processingError,
+                busy = busy,
+                onRetry = onRetryProcessing,
+                prominent = true,
+            )
+        }
         Text("Processing on server", style = MaterialTheme.typography.titleMedium)
         Text(humanShootState(shoot))
-        LinearProgressIndicator(progress = { (idx + 1).toFloat() / phases.size }, modifier = Modifier.fillMaxWidth())
+        if (finalizeInProgress) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.size(10.dp))
+                Text("Starting server processing…", style = MaterialTheme.typography.bodyMedium)
+            }
+        } else if (!waitingToStart) {
+            LinearProgressIndicator(progress = { (idx + 1).toFloat() / phases.size }, modifier = Modifier.fillMaxWidth())
+        }
         parseProgress(progressJson)?.let { (rendered, total, published) ->
             Text("Rendered $rendered / $total · Published $published / $total")
         }
         shoot.actualComputeJson?.let {
             val o = JSONObject(it)
             Text("Compute: ${o.optInt("seconds")}s · ~$${o.optDouble("usd")}")
-        }
-        if (showRetry) {
-            ProcessingRetryBlock(error = finalizeError, busy = busy, onRetry = onRetryProcessing)
         }
     }
 }
