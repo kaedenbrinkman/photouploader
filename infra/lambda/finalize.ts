@@ -1,5 +1,3 @@
-import { readFileSync } from 'fs';
-import { join } from 'path';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { EC2Client, RunInstancesCommand } from '@aws-sdk/client-ec2';
@@ -16,17 +14,13 @@ import { json, userIdFromEvent } from './http';
 import { verifyWorkerArtifact } from './worker-artifacts';
 import { computeDeadlineAt, computeMaxRuntimeMinutes } from './pricing';
 import { loadWorkerSha256FromSsm } from './worker-sha-ssm';
+import EC2_USERDATA_BOOTSTRAP from './ec2-userdata-bootstrap.sh';
 
 const s3 = new S3Client({});
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const ec2 = new EC2Client({});
 
 const LAUNCH_LOCK_MS = 5 * 60_000;
-
-const EC2_USERDATA_BOOTSTRAP = readFileSync(
-  join(__dirname, 'ec2-userdata-bootstrap.sh'),
-  'utf8',
-);
 
 interface ManifestFile {
   sha256: string;

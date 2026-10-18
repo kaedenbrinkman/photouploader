@@ -151,6 +151,12 @@ export class PhotoPipelineStack extends cdk.Stack {
       ...lambdaDefaults,
       entry: path.join(__dirname, '../lambda/finalize.ts'),
       timeout: cdk.Duration.seconds(60),
+      bundling: {
+        ...lambdaDefaults.bundling,
+        loader: {
+          '.sh': 'text',
+        },
+      },
       ...(finalizeReserved != null &&
       Number.isFinite(finalizeReserved) &&
       finalizeReserved > 0
