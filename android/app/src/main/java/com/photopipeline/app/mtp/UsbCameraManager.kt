@@ -34,6 +34,9 @@ class UsbCameraManager(private val appContext: Context) {
     private val _selectedDevice = MutableStateFlow<UsbDevice?>(null)
     val selectedDevice: StateFlow<UsbDevice?> = _selectedDevice.asStateFlow()
 
+    private val _cameraSnapshot = MutableStateFlow<CameraMtpSnapshot?>(null)
+    val cameraSnapshot: StateFlow<CameraMtpSnapshot?> = _cameraSnapshot.asStateFlow()
+
     private val sessionLock = Any()
     private var sessionConnection: UsbDeviceConnection? = null
     private var sessionMtp: MtpDevice? = null
@@ -283,6 +286,9 @@ class UsbCameraManager(private val appContext: Context) {
         }
         if (sessionMtp != null && sessionDevice?.deviceName == device.deviceName) {
             PipelineLog.d("mtp-session", "reuse open session for ${device.deviceName}")
+            if (_cameraSnapshot.value == null) {
+                updateCameraSnapshotLocked(sessionMtp!!)
+            }
             return sessionMtp
         }
         closeMtpSessionLocked()
@@ -304,7 +310,22 @@ class UsbCameraManager(private val appContext: Context) {
         _accessState.value = UsbAccessState.READY
         val storageIds = mtp.storageIds
         PipelineLog.d("mtp", "MtpDevice.open OK storageIds=${storageIds?.joinToString() ?: "null"}")
+        updateCameraSnapshotLocked(mtp)
         mtp
+    }
+
+    /** Re-reads MTP device info and storage from the open session (e.g. after uploads). */
+    fun refreshCameraSnapshot() = synchronized(sessionLock) {
+        val mtp = sessionMtp
+        if (mtp == null) {
+            _cameraSnapshot.value = null
+            return@synchronized
+        }
+        updateCameraSnapshotLocked(mtp)
+    }
+
+    private fun updateCameraSnapshotLocked(mtp: MtpDevice) {
+        _cameraSnapshot.value = MtpCameraInfoReader.readSnapshot(mtp)
     }
 
     fun closeMtpSession() = synchronized(sessionLock) {
@@ -325,6 +346,7 @@ class UsbCameraManager(private val appContext: Context) {
         }
         sessionConnection = null
         sessionDevice = null
+        _cameraSnapshot.value = null
     }
 
     private data class OpenedConnection(val connection: UsbDeviceConnection)

@@ -75,6 +75,7 @@ import com.photopipeline.app.data.Repository
 import com.photopipeline.app.data.ShootEntity
 import com.photopipeline.app.mtp.UsbAccessState
 import com.photopipeline.app.mtp.UsbCameraManager
+import com.photopipeline.app.ui.components.CameraConnectionCard
 import com.photopipeline.app.PhotoPipelineApp
 import com.photopipeline.app.ui.components.AccountAvatarButton
 import com.photopipeline.app.ui.components.DebugLogPanel
@@ -145,6 +146,7 @@ fun HomeScreen(
 ) {
     val shoots by repository.observeShoots().collectAsState(initial = emptyList())
     val usbState by usb.accessState.collectAsState()
+    val cameraSnapshot by usb.cameraSnapshot.collectAsState()
     val snackbarHost = remember { SnackbarHostState() }
     val context = LocalContext.current
     val activity = context as ComponentActivity
@@ -212,15 +214,11 @@ fun HomeScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item {
-                StatusCard(
-                    title = "Camera",
-                    icon = { Icon(Icons.Default.CameraAlt, null) },
-                    line1 = usbStatusMessage(usbState),
-                    line2 = if (usbState == UsbAccessState.PERMISSION_REQUIRED) {
-                        "Start a shoot — USB access is requested automatically."
-                    } else {
-                        "Canon R8 via USB — use a data-capable cable."
-                    },
+                CameraConnectionCard(
+                    usbState = usbState,
+                    camera = cameraSnapshot,
+                    permissionHint = "Start a shoot — USB access is requested automatically.",
+                    disconnectedHint = "Canon via USB — use a data-capable cable.",
                 )
             }
             if (authError.isNotBlank()) {

@@ -91,6 +91,9 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                     uploadStreaming(shootId, file)
                 }
                 repo.markFileUploaded(file.identityKey)
+                if (file.isCameraStreamUpload()) {
+                    usb.refreshCameraSnapshot()
+                }
                 filesDone++
                 UploadMetricsStore.update { it.copy(filesDone = filesDone, network = network.snapshot()) }
                 true
