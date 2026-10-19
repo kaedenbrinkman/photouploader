@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
 
 import boto3
@@ -23,7 +24,7 @@ _GPHOTOS_ROOT = _gphotos_sys_path_root()
 if str(_GPHOTOS_ROOT) not in sys.path:
     sys.path.insert(0, str(_GPHOTOS_ROOT))
 
-from gphotos.gphotos_upload import MediaUploadItem, SCOPES, upload_album  # noqa: E402
+from gphotos.gphotos_upload import MediaUploadItem, SCOPES, ensure_album, upload_album  # noqa: E402
 
 
 def load_credentials_from_ssm(param_name: str, region: str) -> Credentials:
@@ -65,6 +66,7 @@ def upload_shoot_media(
     save_ledger,
     *,
     s3_client=None,
+    ledger_lock: threading.Lock | None = None,
 ) -> dict:
     creds = load_credentials_from_ssm(token_param, region)
     return upload_album(
@@ -75,4 +77,24 @@ def upload_shoot_media(
         save_ledger=save_ledger,
         s3_client=s3_client,
         media_items=media_items,
+        ledger_lock=ledger_lock,
+    )
+
+
+def ensure_shoot_album(
+    token_param: str,
+    region: str,
+    album_title: str,
+    ledger: dict,
+    save_ledger,
+    *,
+    ledger_lock: threading.Lock | None = None,
+) -> str:
+    creds = load_credentials_from_ssm(token_param, region)
+    return ensure_album(
+        creds,
+        album_title,
+        ledger,
+        save_ledger=save_ledger,
+        ledger_lock=ledger_lock,
     )

@@ -8,6 +8,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -19,7 +20,8 @@ from worker.config import WorkerConfig
 from worker.disk_space import require_free_bytes
 from worker.dynamo_store import DynamoStore
 from worker.failure_report import format_last_error
-from worker.gphotos_client import upload_shoot_media
+from worker.gphotos_client import ensure_shoot_album, upload_shoot_media
+from worker.jpeg_resume import try_fetch_existing_jpeg
 from worker.lightcraft_runner import (
     LightcraftRenderError,
     PreviewOnlyError,
@@ -199,10 +201,31 @@ def run() -> int:
         if shoot_meta.get("albumProductUrl") and not ledger.get("album_product_url"):
             ledger["album_product_url"] = shoot_meta["albumProductUrl"]
 
+        ledger_lock = threading.Lock()
+
         def save_ledger():
-            tmp = ledger_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(ledger, indent=1))
-            tmp.replace(ledger_path)
+            with ledger_lock:
+                tmp = ledger_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(ledger, indent=1))
+                tmp.replace(ledger_path)
+
+        needs_gphotos = bool(photo_entries or video_entries)
+        if needs_gphotos:
+            ensure_shoot_album(
+                cfg.gphotos_token_param,
+                cfg.region,
+                cfg.album_title,
+                ledger,
+                save_ledger,
+                ledger_lock=ledger_lock,
+            )
+            album_meta: dict = {}
+            if ledger.get("album_id"):
+                album_meta["albumId"] = ledger["album_id"]
+            if ledger.get("album_product_url"):
+                album_meta["albumProductUrl"] = ledger["album_product_url"]
+            if album_meta:
+                store.update_shoot(cfg.shoot_id, **album_meta)
 
         render_started_at = int(time.time() * 1000)
         store.update_shoot(cfg.shoot_id, phase="RENDERING", renderStartedAt=render_started_at)
@@ -210,23 +233,44 @@ def run() -> int:
         fail_count = 0
         pipeline_workers = max(1, min(PIPELINE_WINDOW, cfg.max_parallel_renders))
 
+        def _sync_photo_gp_created(content_sha: str, file_key: str) -> bool:
+            with ledger_lock:
+                item = ledger.get("items", {}).get(content_sha, {})
+                if item.get("state") != "CREATED":
+                    return False
+                media_item_id = item.get("media_item_id")
+            store.update_image(
+                cfg.shoot_id,
+                file_key,
+                state="GP_CREATED",
+                mediaType="photo",
+                mediaItemId=media_item_id,
+            )
+            return True
+
         def pipeline_one_photo(entry: dict) -> tuple[str, str | None]:
             file_key = file_dynamo_key(cfg.shoot_id, entry, raw_s3_key)
             content_sha = entry["sha256"].lower()
             existing = store.get_image(cfg.shoot_id, file_key)
             if existing and existing.get("state") in ("GP_CREATED", "PUBLISHED"):
                 return content_sha, None
+            if _sync_photo_gp_created(content_sha, file_key):
+                return content_sha, None
             raw: Path | None = None
             out = out_dir / f"{content_sha}.jpg"
             jpeg_key = f"shoots/{cfg.shoot_id}/jpeg/{cfg.settings_hash}/{content_sha}.jpg"
             try:
-                if existing and existing.get("state") == "RENDERED" and not out.exists():
-                    try:
-                        s3.download_file(cfg.bucket, jpeg_key, str(out))
-                    except Exception:
-                        pass
-                needs_render = not out.exists()
-                if needs_render:
+                has_jpeg = try_fetch_existing_jpeg(s3, cfg.bucket, jpeg_key, out)
+                if has_jpeg:
+                    if (existing or {}).get("state") not in ("RENDERED", "GP_CREATED", "PUBLISHED"):
+                        store.update_image(
+                            cfg.shoot_id,
+                            file_key,
+                            state="RENDERED",
+                            settingsHash=cfg.settings_hash,
+                            mediaType="photo",
+                        )
+                else:
                     raw = download_one_raw(s3, cfg.bucket, cfg.shoot_id, entry, raw_dir, work)
                     render_jpeg(
                         cfg.lightcraft_bin,
@@ -247,21 +291,22 @@ def run() -> int:
                     cfg.gphotos_token_param,
                     cfg.region,
                     cfg.album_title,
+                    [
+                        MediaUploadItem(
+                            ledger_key=content_sha,
+                            filename=f"{content_sha}.jpg",
+                            content_type="image/jpeg",
+                            size_bytes=out.stat().st_size,
+                            local_path=str(out),
+                        )
+                    ],
                     [],
-                    [out],
                     ledger,
                     save_ledger,
                     s3_client=s3,
+                    ledger_lock=ledger_lock,
                 )
-                item = ledger.get("items", {}).get(content_sha, {})
-                if item.get("state") == "CREATED":
-                    store.update_image(
-                        cfg.shoot_id,
-                        file_key,
-                        state="GP_CREATED",
-                        mediaType="photo",
-                        mediaItemId=item.get("media_item_id"),
-                    )
+                _sync_photo_gp_created(content_sha, file_key)
                 return content_sha, None
             except PreviewOnlyError as e:
                 _file_error(store, cfg.shoot_id, file_key, str(e), "PREVIEW_ONLY")
@@ -342,6 +387,7 @@ def run() -> int:
             ledger,
             save_ledger,
             s3_client=s3,
+            ledger_lock=ledger_lock,
         )
         for sha, item in ledger.get("items", {}).items():
             if item.get("state") != "CREATED":

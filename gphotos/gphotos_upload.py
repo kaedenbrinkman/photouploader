@@ -8,7 +8,9 @@ import json
 import os
 import random
 import sys
+import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, Iterator
 
@@ -169,16 +171,53 @@ def _upload_bytes_resumable(
     return finalize.text
 
 
+def ensure_album(
+    credentials: Credentials,
+    album_title: str,
+    ledger: dict,
+    *,
+    save_ledger: Callable[[], None],
+    ledger_lock: threading.Lock | None = None,
+) -> str:
+    """Create the app album once; safe under concurrent worker threads."""
+    ctx = ledger_lock if ledger_lock is not None else nullcontext()
+
+    with ctx:
+        existing = ledger.get("album_id")
+        if existing:
+            return existing
+        led_album = call(
+            credentials,
+            "POST",
+            f"{API}/albums",
+            json={"album": {"title": album_title[:500]}},
+        ).json()
+        ledger["album_id"] = led_album["id"]
+        if led_album.get("productUrl"):
+            ledger["album_product_url"] = led_album["productUrl"]
+        save_ledger()
+        return ledger["album_id"]
+
+
 def _upload_item(
     credentials: Credentials,
     item: MediaUploadItem,
     ledger_item: dict,
     save_ledger: Callable[[], None],
     s3_client,
+    ledger_lock: threading.Lock | None = None,
 ) -> None:
-    if ledger_item.get("state") == "CREATED":
-        return
-    if ledger_item.get("state") != "UPLOADED" or time.time() - ledger_item.get("token_at", 0) > 20 * 3600:
+    ctx = ledger_lock if ledger_lock is not None else nullcontext()
+    with ctx:
+        if ledger_item.get("state") == "CREATED":
+            return
+        need_upload = ledger_item.get("state") != "UPLOADED" or time.time() - ledger_item.get(
+            "token_at", 0
+        ) > 20 * 3600
+        if not need_upload and ledger_item.get("upload_token"):
+            return
+
+    if need_upload:
         chunk_iter_fn, size = _byte_source(item, s3_client)
         if size > 32 * 1024 * 1024 or (item.content_type or "").startswith("video/"):
             token = _upload_bytes_resumable(
@@ -188,6 +227,8 @@ def _upload_item(
                 chunk_iter_fn(),
             )
         else:
+            if not item.local_path:
+                raise ValueError(f"MediaUploadItem {item.ledger_key} missing local_path for raw upload")
             with open(item.local_path, "rb") as f:
                 r = call(
                     credentials,
@@ -201,8 +242,11 @@ def _upload_item(
                     },
                 )
             token = r.text
-        ledger_item.update(state="UPLOADED", upload_token=token, token_at=time.time())
-        save_ledger()
+        with ctx:
+            if ledger_item.get("state") == "CREATED":
+                return
+            ledger_item.update(state="UPLOADED", upload_token=token, token_at=time.time())
+            save_ledger()
 
 
 def upload_album(
@@ -214,19 +258,17 @@ def upload_album(
     save_ledger,
     s3_client=None,
     media_items: list[MediaUploadItem] | None = None,
+    ledger_lock: threading.Lock | None = None,
 ) -> dict:
     """Upload media to a Google Photos app-created album; mutates ledger in place."""
-    if not ledger.get("album_id"):
-        led_album = call(
-            credentials,
-            "POST",
-            f"{API}/albums",
-            json={"album": {"title": album_title[:500]}},
-        ).json()
-        ledger["album_id"] = led_album["id"]
-        if led_album.get("productUrl"):
-            ledger["album_product_url"] = led_album["productUrl"]
-        save_ledger()
+    ctx = ledger_lock if ledger_lock is not None else nullcontext()
+    ensure_album(
+        credentials,
+        album_title,
+        ledger,
+        save_ledger=save_ledger,
+        ledger_lock=ledger_lock,
+    )
 
     specs: list[MediaUploadItem] = list(media_items or [])
     if not specs:
@@ -244,18 +286,23 @@ def upload_album(
     pending: list[str] = []
     for spec in specs:
         k = spec.ledger_key.lower()
-        it = ledger.setdefault("items", {}).setdefault(
-            k,
-            {
-                "path": spec.local_path or spec.s3_key or spec.filename,
-                "filename": spec.filename,
-                "state": "PENDING",
-            },
-        )
-        it.setdefault("filename", spec.filename)
-        _upload_item(credentials, spec, it, save_ledger, s3_client)
-        if it.get("state") == "UPLOADED":
-            pending.append(k)
+        with ctx:
+            it = ledger.setdefault("items", {}).setdefault(
+                k,
+                {
+                    "path": spec.local_path or spec.s3_key or spec.filename,
+                    "filename": spec.filename,
+                    "state": "PENDING",
+                },
+            )
+            it.setdefault("filename", spec.filename)
+            already_created = it.get("state") == "CREATED"
+        if already_created:
+            continue
+        _upload_item(credentials, spec, it, save_ledger, s3_client, ledger_lock=ledger_lock)
+        with ctx:
+            if ledger["items"][k].get("state") == "UPLOADED":
+                pending.append(k)
 
     for i in range(0, len(pending), 50):
         batch = pending[i : i + 50]
@@ -275,16 +322,17 @@ def upload_album(
         res = call(
             credentials, "POST", f"{API}/mediaItems:batchCreate", json=body
         ).json().get("newMediaItemResults", [])
-        for k, item_res in zip(batch, res):
-            st = item_res.get("status", {})
-            if item_res.get("mediaItem") and st.get("code", 0) == 0:
-                ledger["items"][k].update(
-                    state="CREATED", media_item_id=item_res["mediaItem"]["id"]
-                )
-                ledger["items"][k].pop("upload_token", None)
-            else:
-                ledger["items"][k].update(state="FAILED_CREATE", error=st)
-        save_ledger()
+        with ctx:
+            for k, item_res in zip(batch, res):
+                st = item_res.get("status", {})
+                if item_res.get("mediaItem") and st.get("code", 0) == 0:
+                    ledger["items"][k].update(
+                        state="CREATED", media_item_id=item_res["mediaItem"]["id"]
+                    )
+                    ledger["items"][k].pop("upload_token", None)
+                else:
+                    ledger["items"][k].update(state="FAILED_CREATE", error=st)
+            save_ledger()
 
     n = sum(1 for v in ledger.get("items", {}).values() if v["state"] == "CREATED")
     return {
