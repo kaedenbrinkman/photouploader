@@ -7,6 +7,10 @@ describe('EC2 user-data bootstrap script', () => {
     'utf8',
   );
 
+  it('uses Unix line endings in the bootstrap shell source', () => {
+    expect(sh).not.toMatch(/\r/);
+  });
+
   it('uses venv and vendored wheels instead of system pip', () => {
     expect(sh).toMatch(/python3 -m venv/);
     expect(sh).toMatch(/--no-index --find-links="\$VENDOR"/);

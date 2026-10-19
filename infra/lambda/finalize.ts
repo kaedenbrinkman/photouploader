@@ -15,6 +15,7 @@ import { verifyWorkerArtifact } from './worker-artifacts';
 import { computeDeadlineAt, computeMaxRuntimeMinutes } from './pricing';
 import { loadWorkerSha256FromSsm } from './worker-sha-ssm';
 import EC2_USERDATA_BOOTSTRAP from './ec2-userdata-bootstrap.sh';
+import { buildUserData, normalizeLinuxLineEndings } from './user-data-build';
 
 const s3 = new S3Client({});
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -27,54 +28,6 @@ interface ManifestFile {
   size_bytes: number;
   original_name?: string;
   s3_key?: string;
-}
-
-function buildUserData(params: {
-  shootId: string;
-  userId: string;
-  bucket: string;
-  table: string;
-  tokenParam: string;
-  settingsHash: string;
-  albumTitle: string;
-  bundleKey: string;
-  bundleSha256: string;
-  lightcraftKey: string;
-  lightcraftSha256: string;
-  maxRuntimeMinutes: number;
-}): string {
-  const {
-    shootId,
-    userId,
-    bucket,
-    table,
-    tokenParam,
-    settingsHash,
-    albumTitle,
-    bundleKey,
-    bundleSha256,
-    lightcraftKey,
-    lightcraftSha256,
-    maxRuntimeMinutes,
-  } = params;
-  const exports = `#!/bin/bash
-sudo shutdown -h +${maxRuntimeMinutes} "photopipeline shoot runtime cap" 2>/dev/null || true
-export MAX_RUNTIME_MINUTES=${maxRuntimeMinutes}
-export SHOOT_ID=${shootId}
-export USER_ID=${userId}
-export BUCKET_NAME=${bucket}
-export DYNAMODB_TABLE=${table}
-export GPHOTOS_TOKEN_PARAM=${tokenParam}
-export SETTINGS_HASH=${settingsHash}
-export ALBUM_TITLE=${JSON.stringify(albumTitle)}
-export WORKER_BUNDLE_KEY=${bundleKey}
-export WORKER_BUNDLE_SHA256=${bundleSha256}
-export LIGHTCRAFT_BINARY_KEY=${lightcraftKey}
-export LIGHTCRAFT_BINARY_SHA256=${lightcraftSha256}
-export LIGHTCRAFT_BIN=/opt/photopipeline/lightcraft/lightcraft-cli
-export INSTALL_ROOT=/opt/photopipeline
-`;
-  return `${exports}${EC2_USERDATA_BOOTSTRAP}`;
 }
 
 async function recordLaunchFailure(
@@ -314,20 +267,23 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     const launchAt = Date.now();
     const deadlineAt = computeDeadlineAt(launchAt, maxRuntimeMinutes);
 
-    const userData = buildUserData({
-      shootId,
-      userId,
-      bucket,
-      table: process.env.TABLE_NAME!,
-      tokenParam,
-      settingsHash,
-      albumTitle,
-      bundleKey,
-      bundleSha256,
-      lightcraftKey,
-      lightcraftSha256,
-      maxRuntimeMinutes,
-    });
+    const userData = buildUserData(
+      {
+        shootId,
+        userId,
+        bucket,
+        table: process.env.TABLE_NAME!,
+        tokenParam,
+        settingsHash,
+        albumTitle,
+        bundleKey,
+        bundleSha256,
+        lightcraftKey,
+        lightcraftSha256,
+        maxRuntimeMinutes,
+      },
+      normalizeLinuxLineEndings(EC2_USERDATA_BOOTSTRAP),
+    );
 
     const attempts: Array<{ spot: boolean; type: string }> = [
       { spot: true, type: 'c7i.4xlarge' },
