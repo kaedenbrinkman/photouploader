@@ -53,6 +53,10 @@ export class PhotoPipelineStack extends cdk.Stack {
       transferAcceleration: true,
       lifecycleRules: [
         {
+          id: 'abort-incomplete-multipart',
+          abortIncompleteMultipartUploadAfter: cdk.Duration.days(1),
+        },
+        {
           id: 'raw-deep-archive',
           prefix: 'shoots/',
           transitions: [

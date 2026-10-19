@@ -57,4 +57,5 @@ data class FileStatusDto(
     val state: String?,
     val error: String?,
     val originalName: String?,
+    val sizeBytes: Long? = null,
 )

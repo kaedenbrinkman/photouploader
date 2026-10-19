@@ -83,8 +83,12 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
 
     private fun CoroutineScope.launchForegroundRefresh(shootId: String, usesCameraStream: Boolean): Job =
         launch {
+            var ticks = 0
             while (isActive) {
                 syncUploadMetricsFromDb(shootId)
+                if (++ticks % 15 == 0) {
+                    runCatching { repo.reconcileLocalUploadsWithServer(shootId) }
+                }
                 promoteToForeground(usesCameraStream)
                 delay(1_000)
             }
@@ -225,6 +229,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             return failWorker("$n file(s) failed upload — use Retry on the shoot screen", usesCameraStream)
         }
 
+        runCatching { repo.reconcileLocalUploadsWithServer(shootId) }
         prefs.lastMeasuredUploadBps = sessionSpeed.snapshot().averageBps
         repo.uploadManifestIfReady(shootId)
         UploadMetricsStore.clear()

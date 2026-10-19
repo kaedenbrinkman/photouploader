@@ -62,6 +62,25 @@ describe('PhotoPipelineStack synth', () => {
     expect(props.ReservedConcurrentExecutions).toBe(2);
   });
 
+  it('ShootsBucket aborts incomplete multipart uploads after 1 day', () => {
+    const app = new cdk.App();
+    const stack = new PhotoPipelineStack(app, 'LifecycleStack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+    });
+    const buckets = Template.fromStack(stack).findResources('AWS::S3::Bucket');
+    const shootBucket = Object.values(buckets).find((r) => {
+      const rules = (r as { Properties?: { LifecycleConfiguration?: { Rules?: unknown[] } } })
+        .Properties?.LifecycleConfiguration?.Rules;
+      return Array.isArray(rules) &&
+        rules.some(
+          (rule) =>
+            (rule as { AbortIncompleteMultipartUpload?: { DaysAfterInitiation?: number } })
+              .AbortIncompleteMultipartUpload?.DaysAfterInitiation === 1,
+        );
+    });
+    expect(shootBucket).toBeDefined();
+  });
+
   it('worker VPC parameters are required at deploy time (no placeholder defaults)', () => {
     const app = new cdk.App();
     const stack = new PhotoPipelineStack(app, 'ParamTestStack', {

@@ -741,16 +741,19 @@ class ShootViewModel(
                             )
                         }
                         WorkInfo.State.SUCCEEDED -> {
-                            val pending = files.value.any { it.uploadState != "UPLOADED" }
-                            _ui.value = _ui.value.copy(
-                                uploadStartState = UploadStartState.Idle,
-                                statusLine = if (pending) {
-                                    "Upload pass finished — tap to retry remaining files."
-                                } else {
-                                    "All files uploaded — starting processing…"
-                                },
-                            )
-                            if (!pending) tryAutoFinalizeIfReady()
+                            safeScope.launch {
+                                runCatching { repo.reconcileLocalUploadsWithServer(shootId) }
+                                val pending = files.value.any { it.uploadState != "UPLOADED" }
+                                _ui.value = _ui.value.copy(
+                                    uploadStartState = UploadStartState.Idle,
+                                    statusLine = if (pending) {
+                                        "Upload pass finished — tap to retry remaining files."
+                                    } else {
+                                        "All files uploaded — starting processing…"
+                                    },
+                                )
+                                if (!pending) tryAutoFinalizeIfReady()
+                            }
                         }
                         WorkInfo.State.FAILED -> {
                             val reason = info.outputData.getString(UploadWorker.KEY_ERROR)
@@ -833,6 +836,7 @@ class ShootViewModel(
                 if (stopPolling) break
                 if (!transientFailure && statusApplied) {
                     recomputeStep(shoot.value, files.value)
+                    tryAutoFinalizeIfReady()
                     val state = shoot.value?.state
                     if (state in TERMINAL) break
                 } else if (!transientFailure && processingRetryStartedAtMs != null) {
@@ -871,6 +875,12 @@ class ShootViewModel(
             if (s.state !in LOCAL_ONLY_STATES) return true
         }
         if (files.value.isNotEmpty() && files.value.all { it.uploadState == "UPLOADED" }) return true
+        if (repo.isServerShootRegistered(shootId) &&
+            files.value.isNotEmpty() &&
+            files.value.any { it.uploadState != "UPLOADED" }
+        ) {
+            return true
+        }
         return repo.isServerShootRegistered(shootId) &&
             files.value.isNotEmpty() &&
             files.value.all { it.uploadState == "UPLOADED" }

@@ -21,6 +21,7 @@ import com.photopipeline.app.mtp.UsbAccessState
 import com.photopipeline.app.mtp.UsbCameraManager
 import com.photopipeline.app.mtp.UsbDebugLog
 import com.photopipeline.app.upload.MultipartPlanner
+import com.photopipeline.app.upload.UploadServerReconcile
 import com.photopipeline.app.upload.UploadPart
 import com.photopipeline.app.upload.UploadParts
 import com.photopipeline.app.upload.UploadPreferences
@@ -677,6 +678,7 @@ class Repository(
             ).apply()
         }
         cacheServerFileStatuses(shootId, status.files)
+        applyServerUploadStateToLocal(shootId, status.files, status.progress)
         val openUrl = status.albumProductUrl?.takeIf { it.startsWith("http") }
             ?: status.albumId?.let { "https://photos.google.com/lr/album/$it" }
         db.shootDao().upsert(
@@ -727,6 +729,54 @@ class Repository(
             obj.captureTimeEpochMs,
         )
         return db.fileDao().countUploadedElsewhereBySha256(shootId, metaSha) > 0
+    }
+
+    /**
+     * When local Room state lags S3/DynamoDB (e.g. 373/374 shown while server has all UPLOADED),
+     * align local file rows and return how many were fixed.
+     */
+    suspend fun reconcileLocalUploadsWithServer(shootId: String): Int {
+        if (!canUseBackendApi()) return 0
+        val status = api.fetchStatus(shootId)
+        cacheServerFileStatuses(shootId, status.files)
+        return applyServerUploadStateToLocal(shootId, status.files, status.progress)
+    }
+
+    private suspend fun applyServerUploadStateToLocal(
+        shootId: String,
+        serverFiles: List<com.photopipeline.app.api.FileStatusDto>?,
+        progress: com.photopipeline.app.api.ProgressDto?,
+    ): Int {
+        val remote = serverFiles.orEmpty()
+        if (remote.isEmpty()) return 0
+        val localFiles = db.fileDao().observeForShoot(shootId).first()
+        if (localFiles.isEmpty()) return 0
+        val uploadedShas = UploadServerReconcile.serverUploadedShaKeys(remote)
+        val markAll = UploadServerReconcile.serverReportsAllUploaded(
+            localFiles.size,
+            remote,
+            progress,
+        )
+        var updated = 0
+        for (file in localFiles) {
+            if (file.uploadState == "UPLOADED") continue
+            if (!markAll && !UploadServerReconcile.shouldMarkLocalUploaded(file, uploadedShas, remote)) {
+                continue
+            }
+            patchFile(file.identityKey) {
+                it.copy(
+                    uploadState = "UPLOADED",
+                    uploadedBytes = it.sizeBytes,
+                    lastError = null,
+                    uploadSpeedBps = 0L,
+                )
+            }
+            updated++
+        }
+        if (updated > 0) {
+            PipelineLog.i("upload", "Reconciled $updated local file(s) to UPLOADED for shoot $shootId")
+        }
+        return updated
     }
 
     fun serverFileStatuses(shootId: String): List<ServerFileStatus> {
