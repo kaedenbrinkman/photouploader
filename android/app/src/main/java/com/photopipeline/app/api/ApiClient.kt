@@ -311,15 +311,29 @@ class ApiClient(
         val body = resp.body?.string().orEmpty()
         var ec2: String? = null
         var detail: String? = null
+        var responseState: String? = null
+        var missingCount: Int? = null
         runCatching {
             val o = JSONObject(body)
             val errField = o.optString("error").takeIf { it.isNotBlank() }
             ec2 = o.optString("ec2ErrorCode").takeIf { it.isNotBlank() } ?: errField
             detail = o.optString("detail").takeIf { it.isNotBlank() } ?: errField
+            responseState = o.optString("state").takeIf { it.isNotBlank() }
+            if (o.has("missingCount")) {
+                missingCount = o.optInt("missingCount").takeIf { it > 0 }
+            } else {
+                missingCount = o.optJSONArray("missing")?.length()?.takeIf { it > 0 }
+            }
         }
-        val friendly = FinalizeErrorMessages.friendly(ec2, detail, resp.code)
+        val friendly = FinalizeErrorMessages.friendly(
+            ec2ErrorCode = ec2,
+            detail = detail,
+            httpCode = resp.code,
+            responseState = responseState,
+            missingUploadCount = missingCount,
+        )
         PipelineLog.w("api", "finalize HTTP ${resp.code} ec2=$ec2 detail=$detail")
-        throw ApiRequestException(friendly, resp.code, ec2)
+        throw ApiRequestException(friendly, resp.code, ec2, responseState, missingCount)
     }
 
     private fun failHttp(route: String, resp: Response): Nothing {

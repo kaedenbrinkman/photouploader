@@ -1,16 +1,18 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DeleteCommand, DynamoDBDocumentClient, GetCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { EC2Client } from '@aws-sdk/client-ec2';
 import { GetObjectCommand, HeadObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import type { APIGatewayProxyHandlerV2 } from 'aws-lambda';
 import { isWorkerInstanceLive } from './ec2-instance';
 import { ec2ErrorMessage } from './ec2-launch';
-import { ManifestValidationError, validateManifest } from './manifest-validate';
+import { ManifestValidationError, rawKeyForFile, validateManifest } from './manifest-validate';
 import { splitManifestFiles } from './media-kind';
 import {
+  filterS3KeysMissing,
   manifestKeysMissingFromDynamo,
   spotCheckManifestOnS3,
+  statelessPlaceholderFileKeys,
   type DynamoManifestFileRow,
 } from './manifest-upload-ready';
 import { launchWorkerForShoot } from './finalize-launch-worker';
@@ -307,10 +309,22 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     }),
   );
   const dynamoFileRows: DynamoManifestFileRow[] = (fileRowsRes.Items ?? []).map((it) => ({
+    fileKey: String(it.sk ?? '')
+      .replace(/^FILE#/, '')
+      .toLowerCase(),
     sha256: it.sha256 as string | undefined,
     state: it.state as string | undefined,
     sizeBytes: it.sizeBytes as number | undefined,
   }));
+
+  for (const placeholderKey of statelessPlaceholderFileKeys(dynamoFileRows)) {
+    await ddb.send(
+      new DeleteCommand({
+        TableName: process.env.TABLE_NAME,
+        Key: { pk: `SHOOT#${shootId}`, sk: `FILE#${placeholderKey}` },
+      }),
+    );
+  }
   const fileRows = dynamoFileRows.map((it) => ({ state: it.state }));
 
   if (meta.Item.state === 'DONE' && !canReprocessShoot(meta.Item, fileRows, { force: forceReprocess })) {
@@ -350,50 +364,73 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
       throw e;
     }
 
-    const missingFromDynamo = manifestKeysMissingFromDynamo(shootId, manifest.files ?? [], dynamoFileRows);
-    if (missingFromDynamo.length) {
-      await ddb.send(
-        new UpdateCommand({
-          TableName: process.env.TABLE_NAME,
-          Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
-          UpdateExpression: 'SET #s = :u, phase = :ph, missingKeys = :m, updatedAt = :t',
-          ExpressionAttributeNames: { '#s': 'state' },
-          ExpressionAttributeValues: {
-            ':u': 'UPLOADING',
-            ':ph': 'UPLOAD',
-            ':m': missingFromDynamo,
-            ':t': Date.now(),
-          },
-        }),
-      );
-      return json(409, { state: 'UPLOADING', missing: missingFromDynamo });
-    }
-
     const bucket = process.env.BUCKET_NAME!;
-    const spotMissing = await spotCheckManifestOnS3(manifest.files ?? [], shootId, async (key) => {
+    const manifestFiles = manifest.files ?? [];
+    const expectedSizeByKey = new Map<string, number>();
+    for (const f of manifestFiles) {
+      expectedSizeByKey.set(rawKeyForFile(shootId, f), Number(f.size_bytes));
+    }
+    const headContentLength = async (key: string) => {
       try {
         const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
         return head.ContentLength ?? null;
       } catch {
         return null;
       }
-    });
+    };
+
+    const missingFromDynamo = manifestKeysMissingFromDynamo(shootId, manifestFiles, dynamoFileRows);
+    if (missingFromDynamo.length) {
+      const s3Missing = await filterS3KeysMissing(missingFromDynamo, expectedSizeByKey, headContentLength);
+      if (s3Missing.length) {
+        await ddb.send(
+          new UpdateCommand({
+            TableName: process.env.TABLE_NAME,
+            Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
+            UpdateExpression: 'SET #s = :u, phase = :ph, missingKeys = :m, updatedAt = :t',
+            ExpressionAttributeNames: { '#s': 'state' },
+            ExpressionAttributeValues: {
+              ':u': 'UPLOADING',
+              ':ph': 'UPLOAD',
+              ':m': s3Missing,
+              ':t': Date.now(),
+            },
+          }),
+        );
+        return json(409, {
+          error: 'upload_incomplete',
+          state: 'UPLOADING',
+          missing: s3Missing,
+          missingCount: s3Missing.length,
+        });
+      }
+    }
+
+    const spotMissing = await spotCheckManifestOnS3(manifestFiles, shootId, headContentLength);
     if (spotMissing.length) {
-      await ddb.send(
-        new UpdateCommand({
-          TableName: process.env.TABLE_NAME,
-          Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
-          UpdateExpression: 'SET #s = :u, phase = :ph, missingKeys = :m, updatedAt = :t',
-          ExpressionAttributeNames: { '#s': 'state' },
-          ExpressionAttributeValues: {
-            ':u': 'UPLOADING',
-            ':ph': 'UPLOAD',
-            ':m': spotMissing,
-            ':t': Date.now(),
-          },
-        }),
-      );
-      return json(409, { state: 'UPLOADING', missing: spotMissing });
+      const s3Missing = await filterS3KeysMissing(spotMissing, expectedSizeByKey, headContentLength);
+      if (s3Missing.length) {
+        await ddb.send(
+          new UpdateCommand({
+            TableName: process.env.TABLE_NAME,
+            Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
+            UpdateExpression: 'SET #s = :u, phase = :ph, missingKeys = :m, updatedAt = :t',
+            ExpressionAttributeNames: { '#s': 'state' },
+            ExpressionAttributeValues: {
+              ':u': 'UPLOADING',
+              ':ph': 'UPLOAD',
+              ':m': s3Missing,
+              ':t': Date.now(),
+            },
+          }),
+        );
+        return json(409, {
+          error: 'upload_incomplete',
+          state: 'UPLOADING',
+          missing: s3Missing,
+          missingCount: s3Missing.length,
+        });
+      }
     }
 
     const bundleKey = process.env.WORKER_BUNDLE_KEY ?? 'releases/photopipeline-worker.tar.gz';

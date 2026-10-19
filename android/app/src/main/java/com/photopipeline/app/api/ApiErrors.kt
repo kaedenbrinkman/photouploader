@@ -8,4 +8,6 @@ class ApiRequestException(
     message: String,
     val httpCode: Int? = null,
     val ec2ErrorCode: String? = null,
+    val responseState: String? = null,
+    val missingUploadCount: Int? = null,
 ) : Exception(message)

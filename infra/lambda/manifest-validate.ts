@@ -65,6 +65,12 @@ export function validateManifest(manifest: ShootManifest, expectedShootId: strin
 }
 
 /** S3 object key for a manifest file (honors manifest s3_key when set). */
+/** 64-char upload-ref hex from shoots/{id}/raw/{ref}.ext */
+export function uploadRefFromRawS3Key(key: string): string | null {
+  const m = key.match(/\/raw\/([a-f0-9]{64})\./i);
+  return m ? m[1]!.toLowerCase() : null;
+}
+
 export function rawKeyForFile(shootId: string, f: ManifestFile): string {
   if (f.s3_key) {
     validateManifestS3Key(shootId, f.s3_key);

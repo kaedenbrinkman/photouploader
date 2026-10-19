@@ -1,7 +1,33 @@
 package com.photopipeline.app.api
 
 object FinalizeErrorMessages {
-    fun friendly(ec2ErrorCode: String?, detail: String?, httpCode: Int? = null): String {
+    fun friendly(
+        ec2ErrorCode: String?,
+        detail: String?,
+        httpCode: Int? = null,
+        responseState: String? = null,
+        missingUploadCount: Int? = null,
+    ): String {
+        if (httpCode == 409) {
+            missingUploadCount?.takeIf { it > 0 }?.let { n ->
+                return "$n file(s) need re-upload before processing can start."
+            }
+            when (ec2ErrorCode) {
+                "finalize_in_progress" ->
+                    return "Server is already starting processing — checking status…"
+                "upload_incomplete" ->
+                    return "Some files are still missing on the server — finish upload, then retry."
+            }
+            responseState?.uppercase()?.let { st ->
+                when (st) {
+                    "UPLOADING" -> return "Upload is not complete on the server yet — finish upload, then retry."
+                    "READY_TO_PROCESS" -> return "Processing could not start yet — try again in a moment."
+                    "PROCESSING", "LAUNCHING" ->
+                        return "Server is already processing this shoot — checking status…"
+                    "FAILED" -> return detail?.take(280) ?: "Previous processing failed — tap Retry."
+                }
+            }
+        }
         mapServerWorkerMessage(detail)?.let { return it }
         when (ec2ErrorCode) {
             "PendingVerification" ->

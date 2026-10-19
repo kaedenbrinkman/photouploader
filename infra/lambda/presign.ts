@@ -14,6 +14,7 @@ import type { APIGatewayProxyHandlerV2 } from 'aws-lambda';
 import { randomUUID } from 'crypto';
 import { json, userIdFromEvent } from './http';
 import { rawExtensionForName } from './media-kind';
+import { uploadRefFromRawS3Key } from './manifest-validate';
 import { completeShootMultipart, invalidPartErrorCode, isNoSuchUpload } from './presign-complete';
 
 const s3Standard = new S3Client({});
@@ -86,16 +87,17 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
       }),
       { expiresIn: 3600 },
     );
+    const uploadRef = String(sha256).toLowerCase();
     await ddb.send(
       new UpdateCommand({
         TableName: process.env.TABLE_NAME,
-        Key: { pk: `SHOOT#${shootId}`, sk: `FILE#${String(sha256).toLowerCase()}` },
+        Key: { pk: `SHOOT#${shootId}`, sk: `FILE#${uploadRef}` },
         UpdateExpression:
-          'SET #s = if_not_exists(#s, :uploading), sha256 = :sha, sizeBytes = :sz, originalName = :name, updatedAt = :u',
+          'SET #s = :uploading, sha256 = :sha, sizeBytes = :sz, originalName = :name, updatedAt = :u',
         ExpressionAttributeNames: { '#s': 'state' },
         ExpressionAttributeValues: {
           ':uploading': 'UPLOADING',
-          ':sha': String(sha256).toLowerCase(),
+          ':sha': uploadRef,
           ':sz': Number(sizeBytes ?? 0),
           ':name': originalName ?? 'unknown.cr3',
           ':u': Date.now(),
@@ -180,13 +182,21 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
       if (!result.ok) {
         return json(result.status, { ...result.body, transferAcceleration: accelerated });
       }
+      const uploadRef = uploadRefFromRawS3Key(key) ?? String(body.sha256).toLowerCase();
       await ddb.send(
         new UpdateCommand({
           TableName: process.env.TABLE_NAME,
-          Key: { pk: `SHOOT#${shootId}`, sk: `FILE#${String(body.sha256).toLowerCase()}` },
-          UpdateExpression: 'SET #s = :u, updatedAt = :t',
+          Key: { pk: `SHOOT#${shootId}`, sk: `FILE#${uploadRef}` },
+          UpdateExpression:
+            'SET #s = :u, sha256 = :sha, sizeBytes = if_not_exists(sizeBytes, :sz), originalName = if_not_exists(originalName, :name), updatedAt = :t',
           ExpressionAttributeNames: { '#s': 'state' },
-          ExpressionAttributeValues: { ':u': 'UPLOADED', ':t': Date.now() },
+          ExpressionAttributeValues: {
+            ':u': 'UPLOADED',
+            ':sha': uploadRef,
+            ':sz': Number(body.sizeBytes ?? 0),
+            ':name': (body.originalName as string | undefined) ?? 'unknown.cr3',
+            ':t': Date.now(),
+          },
         }),
       );
       return json(200, {
