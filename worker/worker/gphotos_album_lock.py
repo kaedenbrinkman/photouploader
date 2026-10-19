@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
 STALE_LOCK_SECONDS = 600
+_thread_depth = threading.local()
 
 
 def _pid_alive(pid: int) -> bool:
@@ -38,7 +40,17 @@ def album_creation_file_lock(work_dir: Path):
     """
     Serialize album POST across threads/processes on one worker host.
     Stale locks (dead pid or >10 min) are removed automatically.
+    Reentrant in the same thread (ensure_album may nest calls).
     """
+    depth = int(getattr(_thread_depth, "depth", 0) or 0)
+    if depth > 0:
+        _thread_depth.depth = depth + 1
+        try:
+            yield
+        finally:
+            _thread_depth.depth = depth
+        return
+
     lock_path = work_dir / ".gphotos_album.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     while True:
@@ -56,9 +68,11 @@ def album_creation_file_lock(work_dir: Path):
             if _lock_stale(lock_path):
                 continue
             time.sleep(0.25)
+    _thread_depth.depth = 1
     try:
         yield
     finally:
+        _thread_depth.depth = 0
         try:
             lock_path.unlink(missing_ok=True)
         except OSError:

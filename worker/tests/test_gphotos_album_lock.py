@@ -13,6 +13,12 @@ def test_stale_album_lock_expires(tmp_path: Path):
     assert not lock.exists()
 
 
+def test_album_lock_reentrant_in_same_thread(tmp_path: Path):
+    with album_creation_file_lock(tmp_path):
+        with album_creation_file_lock(tmp_path):
+            assert (tmp_path / ".gphotos_album.lock").exists()
+
+
 def test_album_lock_released_after_block(tmp_path: Path):
     with album_creation_file_lock(tmp_path):
         pid = os.getpid()

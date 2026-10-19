@@ -52,16 +52,8 @@ class TimeoutGoogleAuthRequest(GoogleAuthRequest):
 
 def build_requests_session() -> requests.Session:
     """Session with limited urllib3 retries (avoid SSL MaxRetryError loops)."""
-    retry = Retry(
-        total=2,
-        connect=2,
-        read=2,
-        status=2,
-        backoff_factor=0.5,
-        status_forcelist=(500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "HEAD", "PUT", "OPTIONS"]),
-        raise_on_status=False,
-    )
+    # Application layer (photos_api_call) owns retries; avoid urllib3 retry storms on POST.
+    retry = Retry(total=0)
     session = requests.Session()
     session.mount("https://", HTTPAdapter(max_retries=retry))
     session.mount("http://", HTTPAdapter(max_retries=retry))

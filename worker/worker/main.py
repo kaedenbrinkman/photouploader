@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from worker.dynamo_store import DynamoStore
 from worker.failure_report import format_last_error
 from worker.gphotos_album_lock import album_creation_file_lock
 from worker.gphotos_client import ensure_shoot_album, upload_shoot_media
+from worker.phase_watchdog import PhaseStallWatchdog, install_diagnostic_handlers
 from worker.jpeg_resume import try_fetch_existing_jpeg
 from worker.lightcraft_runner import (
     LightcraftRenderError,
@@ -145,6 +147,7 @@ def _file_error(store: DynamoStore, shoot_id: str, sha: str, message: str, state
 def run() -> int:
     log_path = worker_log_path()
     setup_logging(log_path)
+    install_diagnostic_handlers()
     cfg = WorkerConfig.from_env()
     s3 = boto3.client("s3", region_name=cfg.region)
     store = DynamoStore(cfg.dynamodb_table, cfg.region)
@@ -156,6 +159,37 @@ def run() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     shoot_meta = store.get_shoot(cfg.shoot_id) or {}
+    phase_state: dict[str, Any] = {"phase": shoot_meta.get("phase") or "BOOT"}
+    stall_triggered = threading.Event()
+
+    def _current_phase() -> str | None:
+        row = store.get_shoot(cfg.shoot_id) or {}
+        return (row.get("phase") or phase_state.get("phase")) if row else phase_state.get("phase")
+
+    def _on_phase_stall(msg: str, _idle_s: float) -> None:
+        if stall_triggered.is_set():
+            return
+        stall_triggered.set()
+        store.finish_run(
+            cfg.shoot_id,
+            state="FAILED",
+            phase="STALLED",
+            lastError=format_last_error(msg, log_path),
+            workerFinishedAt=int(time.time() * 1000),
+        )
+        log.error("phase stall: %s", msg)
+
+    watchdog = PhaseStallWatchdog(get_phase=_current_phase, on_stall=_on_phase_stall)
+    watchdog.start()
+
+    def touch_phase(phase: str, **extra: Any) -> None:
+        phase_state["phase"] = phase
+        watchdog.note_phase(phase)
+        if extra:
+            store.update_shoot(cfg.shoot_id, phase=phase, **extra)
+        else:
+            store.update_shoot(cfg.shoot_id, phase=phase)
+
     store.update_shoot(
         cfg.shoot_id,
         state="PROCESSING",
@@ -205,7 +239,8 @@ def run() -> int:
         if shoot_meta.get("albumProductUrl") and not ledger.get("album_product_url"):
             ledger["album_product_url"] = shoot_meta["albumProductUrl"]
 
-        ledger_lock = threading.Lock()
+        # RLock: save_ledger() is invoked while ensure_album holds the ledger lock.
+        ledger_lock = threading.RLock()
 
         def save_ledger():
             with ledger_lock:
@@ -215,7 +250,7 @@ def run() -> int:
 
         def gphotos_progress(phase: str) -> None:
             log.info("gphotos progress phase=%s", phase)
-            store.update_shoot(cfg.shoot_id, phase=phase)
+            touch_phase(phase)
 
         needs_gphotos = bool(photo_entries or video_entries)
         if needs_gphotos:

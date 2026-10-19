@@ -21,7 +21,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from gphotos.google_http import photos_api_call
+from gphotos.google_http import DEFAULT_TIMEOUT, photos_api_call
 
 log = logging.getLogger("gphotos.upload")
 
@@ -67,9 +67,11 @@ def creds(client_secret, token_path):
     return c
 
 
-def call(c, method, url, session=None, **kw):
+def call(c, method, url, session=None, timeout=None, **kw):
     """Photos Library API call with bounded retries and HTTP timeouts."""
-    return photos_api_call(c, method, url, session=session, **kw)
+    if timeout is None:
+        timeout = DEFAULT_TIMEOUT
+    return photos_api_call(c, method, url, session=session, timeout=timeout, **kw)
 
 
 def sha256_file(path: str) -> str:
@@ -186,6 +188,7 @@ def ensure_album(
             f"{API}/albums",
             json={"album": {"title": album_title[:500]}},
             session=http_session,
+            timeout=DEFAULT_TIMEOUT,
         ).json()
         with ctx:
             if ledger.get("album_id"):
