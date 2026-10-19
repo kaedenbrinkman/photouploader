@@ -58,7 +58,7 @@ Worker instances use `InstanceInitiatedShutdownBehavior=terminate`; bootstrap fa
 bash -n worker/ami/bootstrap.sh
 bash -n worker/ami/ec2-install-from-s3.sh
 docker build -f worker/ami/Dockerfile.verify .
-chmod +x scripts/build-worker-bundle.sh && scripts/build-worker-bundle.sh
+chmod +x scripts/build-worker-bundle.sh && TARGET_PY=3.9 scripts/build-worker-bundle.sh
 ```
 
 Set `SKIP_LIGHTCRAFT_BUILD=0` in the Dockerfile or on an EC2 builder instance for a full compile (~2–3 min on c7i.2xlarge).
