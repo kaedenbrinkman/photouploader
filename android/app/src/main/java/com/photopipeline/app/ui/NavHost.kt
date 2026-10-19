@@ -467,7 +467,12 @@ fun ShootFlowScreen(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            if (!allUploaded) {
+            if (
+                ui.flowReady &&
+                !allUploaded &&
+                ui.step != ShootFlowStep.Processing &&
+                ui.step != ShootFlowStep.Results
+            ) {
                 item { FlowStepper(current = ui.step) }
                 item {
                     Text(ui.statusLine, style = MaterialTheme.typography.bodyLarge)
@@ -486,13 +491,32 @@ fun ShootFlowScreen(
             if (!ui.backendReady && ui.backendGateMessage.isNotBlank()) {
                 item { BackendGateCard(ui.backendGateMessage) }
             }
+            if (!ui.flowReady) {
+                item {
+                    Column(
+                        Modifier.fillMaxWidth().padding(vertical = 48.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        CircularProgressIndicator()
+                        Spacer(Modifier.height(12.dp))
+                        Text("Loading shoot…", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+            } else {
             when (ui.step) {
                 ShootFlowStep.PickFiles -> item {
+                    val (selCount, selBytes) = vm.selectedCountAndBytes()
                     SelectFilesStep(
                         ui = ui,
                         imported = files,
                         onToggle = { vm.toggleSelection(it) },
                         onImport = { vm.importSelected() },
+                        onSelectAll = { vm.selectAllSelectable() },
+                        onDeselectAll = { vm.deselectAll() },
+                        onSelectAllForDate = { vm.selectAllForDate(it) },
+                        onDeselectAllForDate = { vm.deselectAllForDate(it) },
+                        selectedCount = selCount,
+                        selectedBytes = selBytes,
                         busy = ui.busy,
                     )
                 }
@@ -552,20 +576,26 @@ fun ShootFlowScreen(
                         }
                     }
                 }
-                ShootFlowStep.Processing -> item {
-                    val processingError = ui.serverProcessingError ?: ui.finalizeError
-                    ProcessingStep(
-                        shoot = shoot,
-                        progressJson = ui.processingProgress,
-                        showRetry = vm.needsProcessingRetry(),
-                        processingError = processingError,
-                        serverPhase = ui.serverPhase,
-                        serverLaunchErrorCode = ui.serverLaunchErrorCode,
-                        serverLastError = ui.serverLastError,
-                        finalizeInProgress = ui.finalizeState == FinalizeState.InProgress,
-                        busy = ui.busy,
-                        onRetryProcessing = { vm.retryProcessing() },
-                    )
+                ShootFlowStep.Processing -> shoot?.let { s ->
+                    item {
+                        val processingError = ui.serverProcessingError ?: ui.finalizeError
+                        ProcessingStepScreen(
+                            shoot = s,
+                            files = files,
+                            progressJson = ui.processingProgress,
+                            serverFileStatusBySha = ui.serverFileStatusBySha,
+                            showRetry = vm.needsProcessingRetry(),
+                            processingError = processingError,
+                            serverPhase = ui.serverPhase,
+                            serverLaunchErrorCode = ui.serverLaunchErrorCode,
+                            serverLastError = ui.serverLastError,
+                            finalizeInProgress = ui.finalizeState == FinalizeState.InProgress,
+                            processingStartedAtMs = ui.processingStartedAtMs,
+                            busy = ui.busy,
+                            thumbnailForHandle = { vm.readCachedThumbnail(it) },
+                            onRetryProcessing = { vm.retryProcessing() },
+                        )
+                    }
                 }
                 ShootFlowStep.Results -> item {
                     ResultsStep(
@@ -576,6 +606,7 @@ fun ShootFlowScreen(
                         onRetryProcessing = { vm.retryProcessing() },
                     )
                 }
+            }
             }
             item { DebugLogPanel() }
         }
@@ -639,97 +670,6 @@ private fun ResumeUploadIntro(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun SelectFilesStep(
-    ui: ShootUiState,
-    imported: List<com.photopipeline.app.data.FileEntity>,
-    onToggle: (Long) -> Unit,
-    onImport: () -> Unit,
-    busy: Boolean,
-) {
-    val uploadedNames = imported.map { it.originalName }.toSet()
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("${ui.selectedHandles.size} selected on camera", style = MaterialTheme.typography.titleSmall)
-        LazyVerticalGrid(
-            columns = GridCells.Fixed(3),
-            modifier = Modifier.height(280.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            items(ui.cameraObjects, key = { it.handle }) { obj ->
-                val selected = obj.handle in ui.selectedHandles
-                val already = obj.filename in uploadedNames
-                Card(
-                    onClick = { if (!already) onToggle(obj.handle) },
-                    shape = RoundedCornerShape(8.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (selected) {
-                            MaterialTheme.colorScheme.primaryContainer
-                        } else {
-                            MaterialTheme.colorScheme.surfaceContainerHighest
-                        },
-                    ),
-                ) {
-                    Column(Modifier.padding(6.dp)) {
-                        ThumbnailOrPlaceholder(ui.thumbnails[obj.handle])
-                        Text(
-                            obj.filename,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.labelSmall,
-                        )
-                        Text(
-                            when {
-                                already -> "On phone"
-                                selected -> "New · selected"
-                                else -> "New"
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-            }
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(checked = ui.selectedHandles.size == ui.cameraObjects.size, onCheckedChange = null)
-            Text("Use selection above")
-        }
-        Button(onClick = onImport, enabled = !busy && ui.selectedHandles.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
-            if (busy) {
-                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                Spacer(Modifier.size(8.dp))
-            }
-            Text("Upload ${ui.selectedHandles.size} selected files")
-        }
-    }
-}
-
-@Composable
-private fun ThumbnailOrPlaceholder(bytes: ByteArray?) {
-    if (bytes != null) {
-        val bmp = remember(bytes) {
-            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        }
-        if (bmp != null) {
-            Image(
-                bitmap = bmp.asImageBitmap(),
-                contentDescription = null,
-                modifier = Modifier.fillMaxWidth().height(72.dp),
-                contentScale = ContentScale.Crop,
-            )
-            return
-        }
-    }
-    Box(
-        Modifier.fillMaxWidth().height(72.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Icon(Icons.Default.CameraAlt, contentDescription = null)
     }
 }
 
@@ -873,7 +813,7 @@ private fun formatBytes(n: Long): String = when {
 }
 
 @Composable
-private fun ProcessingRetryBlock(
+internal fun ProcessingRetryBlock(
     error: String?,
     busy: Boolean,
     onRetry: () -> Unit,
@@ -960,78 +900,6 @@ private fun SpeedSparkline(samples: List<Long>) {
                     .fillMaxSize()
                     .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.25f + 0.75f * (v / max))),
             )
-        }
-    }
-}
-
-@Composable
-private fun ProcessingStep(
-    shoot: ShootEntity?,
-    progressJson: String?,
-    showRetry: Boolean,
-    processingError: String?,
-    serverPhase: String?,
-    serverLaunchErrorCode: String?,
-    serverLastError: String?,
-    finalizeInProgress: Boolean,
-    busy: Boolean,
-    onRetryProcessing: () -> Unit,
-) {
-    shoot ?: return
-    val phases = listOf("IMPORT", "ESTIMATE", "UPLOAD", "MANIFEST", "RENDER", "PUBLISH", "DONE")
-    val phase = (serverPhase ?: shoot.phase).uppercase()
-    val idx = phases.indexOfFirst { phase.contains(it, ignoreCase = true) }.coerceAtLeast(0)
-    val waitingToStart = shoot.state == "READY_TO_PROCESS" || shoot.state == "LOCAL"
-    val displayError = processingError ?: serverLastError?.let {
-        FinalizeErrorMessages.friendly(serverLaunchErrorCode, it)
-    }
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        if (showRetry) {
-            ProcessingRetryBlock(
-                error = displayError,
-                busy = busy,
-                onRetry = onRetryProcessing,
-                prominent = true,
-            )
-        }
-        Text("Processing on server", style = MaterialTheme.typography.titleMedium)
-        Text(humanShootState(shoot))
-        Text("Phase: ${serverPhase ?: shoot.phase}", style = MaterialTheme.typography.bodySmall)
-        shoot.deadlineAt?.let { deadlineMs ->
-            val stopFmt = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
-            Text(
-                "Auto-stops by ${stopFmt.format(Date(deadlineMs))}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        serverLaunchErrorCode?.let {
-            Text("Error code: $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-        }
-        serverLastError?.let {
-            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        if (finalizeInProgress) {
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
-                Spacer(Modifier.size(10.dp))
-                Text("Starting server processing…", style = MaterialTheme.typography.bodyMedium)
-            }
-        } else if (!waitingToStart) {
-            LinearProgressIndicator(progress = { (idx + 1).toFloat() / phases.size }, modifier = Modifier.fillMaxWidth())
-        }
-        parseProgress(progressJson)?.let { (rendered, total, published) ->
-            Text("Rendered $rendered / $total · Published $published / $total")
-        }
-        shoot.actualComputeJson?.let {
-            val o = JSONObject(it)
-            val sec = o.optInt("seconds", 0)
-            val usd = o.usd("usd", 0.0)
-            Text("Compute: ${sec}s · ~$${"%.4f".format(usd)}")
         }
     }
 }

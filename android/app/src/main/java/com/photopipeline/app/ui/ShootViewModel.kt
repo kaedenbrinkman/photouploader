@@ -29,6 +29,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
@@ -85,6 +86,11 @@ data class ShootUiState(
     val serverPhase: String? = null,
     val serverLaunchErrorCode: String? = null,
     val serverLastError: String? = null,
+    /** False until shoot/files are read — avoids PickFiles grid flash on resume/processing. */
+    val flowReady: Boolean = false,
+    val uploadedElsewhereHandles: Set<Long> = emptySet(),
+    val serverFileStatusBySha: Map<String, String> = emptyMap(),
+    val processingStartedAtMs: Long? = null,
 )
 
 class ShootViewModel(
@@ -129,34 +135,46 @@ class ShootViewModel(
                     ),
                 )
             }
+            val loadedShoot = repo.getShoot(shootId)
             val fileList = repo.observeFiles(shootId).first()
             val resume = fileList.isNotEmpty()
+            val initialStep = computeFlowStep(loadedShoot, fileList)
             _ui.value = _ui.value.copy(
+                flowReady = true,
+                step = initialStep,
                 isResumeShoot = resume,
+                processingProgress = repo.processingProgressJson(shootId),
+                serverFileStatusBySha = loadServerFileStatusMap(),
+                processingStartedAtMs = if (initialStep == ShootFlowStep.Processing) {
+                    System.currentTimeMillis()
+                } else {
+                    null
+                },
                 statusLine = if (resume) {
                     "Resume upload — connect the camera when ready."
                 } else {
                     "Plug in your Canon camera — we will list files automatically."
                 },
             )
-            recomputeStep()
             observeUploadWork()
             refreshFinalizeError()
-            val loaded = repo.getShoot(shootId)
-            if (loaded != null &&
-                (loaded.backendState != null || loaded.state !in LOCAL_ONLY_STATES || loaded.albumId != null)
+            if (loadedShoot != null &&
+                (loadedShoot.backendState != null || loadedShoot.state !in LOCAL_ONLY_STATES || loadedShoot.albumId != null)
             ) {
                 startPolling()
             }
             if (fileList.isNotEmpty() && fileList.all { it.uploadState == "UPLOADED" }) {
-                recomputeStep()
                 startPolling()
             }
-            if (resume) {
+            if (resume && initialStep == ShootFlowStep.Upload) {
                 tryAutoResumeUpload()
-            } else {
+            } else if (initialStep == ShootFlowStep.PickFiles) {
                 autoConnectAndList()
             }
+        }
+        safeScope.launch {
+            combine(repo.observeShoot(shootId), repo.observeFiles(shootId)) { s, f -> s to f }
+                .collect { (s, f) -> recomputeStep(s, f) }
         }
     }
 
@@ -271,12 +289,14 @@ class ShootViewModel(
         _ui.value = _ui.value.copy(busy = true, statusLine = "Reading files from camera…")
         when (val result = repo.listCameraMedia()) {
             is CameraImportResult.Listed -> {
-                val handles = result.objects.map { it.handle }.toSet()
+                refreshUploadedElsewhereFlags(result.objects)
+                val blocked = _ui.value.uploadedElsewhereHandles
+                val selectable = result.objects.filter { it.handle !in blocked }.map { it.handle }.toSet()
                 _ui.value = _ui.value.copy(
                     busy = false,
                     autoConnectInFlight = false,
                     cameraObjects = result.objects,
-                    selectedHandles = handles,
+                    selectedHandles = selectable,
                     statusLine = result.statusMessage,
                     step = ShootFlowStep.PickFiles,
                 )
@@ -299,19 +319,96 @@ class ShootViewModel(
             val map = mutableMapOf<Long, ByteArray>()
             for (obj in objects.take(40)) {
                 runCatching {
-                    repo.mtp.getThumbnail(obj)?.let { map[obj.handle] = it }
+                    repo.mtp.getThumbnail(obj)?.let { bytes ->
+                        map[obj.handle] = bytes
+                        persistThumbnail(obj.handle, bytes)
+                    }
                 }.onFailure { PipelineLog.w("mtp", "thumbnail ${obj.filename} failed", it) }
             }
             _ui.value = _ui.value.copy(thumbnails = map)
         }
     }
 
+    private fun persistThumbnail(handle: Long, bytes: ByteArray) {
+        val file = thumbCacheFile(handle)
+        file.parentFile?.mkdirs()
+        runCatching { file.writeBytes(bytes) }
+    }
+
+    fun readCachedThumbnail(handle: Long): ByteArray? {
+        _ui.value.thumbnails[handle]?.let { return it }
+        val file = thumbCacheFile(handle)
+        if (file.isFile) {
+            runCatching { file.readBytes() }.getOrNull()?.let { return it }
+        }
+        files.value.firstOrNull { it.objectHandle == handle }?.localPath?.let { path ->
+            val local = File(path)
+            if (local.isFile && local.length() < 512_000) {
+                runCatching { local.readBytes() }.getOrNull()?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun thumbCacheFile(handle: Long): File =
+        File(appContext.filesDir, "thumb-cache/$shootId/$handle.jpg")
+
+    private suspend fun refreshUploadedElsewhereFlags(objects: List<MtpObjectInfo>) {
+        val blocked = mutableSetOf<Long>()
+        for (obj in objects) {
+            if (repo.isCameraObjectUploadedElsewhere(shootId, obj)) {
+                blocked += obj.handle
+            }
+        }
+        _ui.value = _ui.value.copy(uploadedElsewhereHandles = blocked)
+    }
+
     fun toggleSelection(handle: Long) {
+        if (handle in _ui.value.uploadedElsewhereHandles) return
         val cur = _ui.value.selectedHandles
         _ui.value = _ui.value.copy(
             selectedHandles = if (handle in cur) cur - handle else cur + handle,
         )
     }
+
+    fun deselectAll() {
+        _ui.value = _ui.value.copy(selectedHandles = emptySet())
+    }
+
+    fun selectAllSelectable() {
+        val selectable = _ui.value.cameraObjects
+            .filter { it.handle !in _ui.value.uploadedElsewhereHandles }
+            .map { it.handle }
+            .toSet()
+        _ui.value = _ui.value.copy(selectedHandles = selectable)
+    }
+
+    fun selectAllForDate(dateKey: String) {
+        val selectable = _ui.value.cameraObjects
+            .filter { it.handle !in _ui.value.uploadedElsewhereHandles }
+            .filter { captureDateKey(it.captureTimeEpochMs) == dateKey }
+            .map { it.handle }
+            .toSet()
+        _ui.value = _ui.value.copy(selectedHandles = _ui.value.selectedHandles + selectable)
+    }
+
+    fun deselectAllForDate(dateKey: String) {
+        val onDate = _ui.value.cameraObjects
+            .filter { captureDateKey(it.captureTimeEpochMs) == dateKey }
+            .map { it.handle }
+            .toSet()
+        _ui.value = _ui.value.copy(selectedHandles = _ui.value.selectedHandles - onDate)
+    }
+
+    fun selectedCountAndBytes(): Pair<Int, Long> {
+        val selected = _ui.value.cameraObjects.filter { it.handle in _ui.value.selectedHandles }
+        return selected.size to selected.sumOf { it.sizeBytes }
+    }
+
+    private fun loadServerFileStatusMap(): Map<String, String> =
+        repo.serverFileStatuses(shootId)
+            .filter { it.sha256.isNotBlank() }
+            .associate { it.sha256.lowercase() to it.state }
 
     fun importSelected() {
         safeScope.launch {
@@ -339,7 +436,7 @@ class ShootViewModel(
                         step = ShootFlowStep.Upload,
                         statusLine = "Files queued — starting upload…",
                     )
-                    recomputeStep()
+                    recomputeStep(shoot.value, files.value)
                     observeUploadWork()
                     if (repo.canUseBackendApi()) {
                         startUpload()
@@ -505,8 +602,9 @@ class ShootViewModel(
                     finalizeError = null,
                     statusLine = "Processing on LightCraft worker.",
                     step = ShootFlowStep.Processing,
+                    processingStartedAtMs = System.currentTimeMillis(),
                 )
-                recomputeStep()
+                recomputeStep(shoot.value, files.value)
                 startPolling()
             }
             .onFailure { e ->
@@ -674,8 +772,11 @@ class ShootViewModel(
                 if (stopPolling) break
                 if (!transientFailure) {
                     val progress = repo.processingProgressJson(shootId)
-                    _ui.value = _ui.value.copy(processingProgress = progress)
-                    recomputeStep()
+                    _ui.value = _ui.value.copy(
+                        processingProgress = progress,
+                        serverFileStatusBySha = loadServerFileStatusMap(),
+                    )
+                    recomputeStep(shoot.value, files.value)
                     val state = shoot.value?.state
                     if (state in TERMINAL) break
                 }
@@ -738,18 +839,16 @@ class ShootViewModel(
     fun allFilesUploaded(): Boolean =
         files.value.isNotEmpty() && files.value.all { it.uploadState == "UPLOADED" }
 
-    private fun recomputeStep() {
-        val s = shoot.value ?: return
-        val fileList = files.value
-        val step = when {
-            s.albumId != null || (s.state in TERMINAL && s.state != "FAILED") -> ShootFlowStep.Results
-            fileList.isNotEmpty() && fileList.all { it.uploadState == "UPLOADED" } -> ShootFlowStep.Processing
-            s.state !in setOf("LOCAL", "IMPORTING") && s.backendState != null -> ShootFlowStep.Processing
-            fileList.isEmpty() -> ShootFlowStep.PickFiles
-            else -> ShootFlowStep.Upload
+    private fun recomputeStep(shootEntity: ShootEntity?, fileList: List<FileEntity>) {
+        val step = computeFlowStep(shootEntity, fileList)
+        val startedAt = when {
+            step == ShootFlowStep.Processing && _ui.value.processingStartedAtMs == null ->
+                System.currentTimeMillis()
+            step != ShootFlowStep.Processing -> null
+            else -> _ui.value.processingStartedAtMs
         }
-        if (_ui.value.step != step) {
-            _ui.value = _ui.value.copy(step = step)
+        if (_ui.value.step != step || _ui.value.processingStartedAtMs != startedAt) {
+            _ui.value = _ui.value.copy(step = step, processingStartedAtMs = startedAt)
         }
     }
 

@@ -654,6 +654,7 @@ class Repository(
                 ).toString(),
             ).apply()
         }
+        cacheServerFileStatuses(shootId, status.files)
         db.shootDao().upsert(
             shoot.copy(
                 state = status.state,
@@ -674,6 +675,69 @@ class Repository(
 
     fun processingProgressJson(shootId: String): String? =
         prefs.getString("shoot_progress_$shootId", null)
+
+    suspend fun isCameraObjectUploadedElsewhere(shootId: String, obj: MtpObjectInfo): Boolean {
+        if (
+            db.fileDao().countUploadedElsewhereByMetadata(
+                shootId,
+                obj.filename,
+                obj.sizeBytes,
+                obj.captureTimeEpochMs,
+            ) > 0
+        ) {
+            return true
+        }
+        val metaSha = metadataUploadSha256(
+            obj.storageId,
+            obj.handle,
+            obj.sizeBytes,
+            obj.captureTimeEpochMs,
+        )
+        return db.fileDao().countUploadedElsewhereBySha256(shootId, metaSha) > 0
+    }
+
+    fun serverFileStatuses(shootId: String): List<ServerFileStatus> {
+        val raw = prefs.getString(serverFileStatusKey(shootId), null) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    add(
+                        ServerFileStatus(
+                            sha256 = o.optString("sha256", ""),
+                            state = o.optString("state", ""),
+                            originalName = o.optString("originalName", ""),
+                            error = o.optString("error").takeIf { it.isNotBlank() },
+                        ),
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun cacheServerFileStatuses(
+        shootId: String,
+        files: List<com.photopipeline.app.api.FileStatusDto>?,
+    ) {
+        if (files.isNullOrEmpty()) return
+        val arr = JSONArray()
+        files.forEach { f ->
+            arr.put(
+                JSONObject(
+                    mapOf(
+                        "sha256" to (f.sha256 ?: ""),
+                        "state" to (f.state ?: ""),
+                        "originalName" to (f.originalName ?: ""),
+                        "error" to (f.error ?: ""),
+                    ),
+                ),
+            )
+        }
+        prefs.edit().putString(serverFileStatusKey(shootId), arr.toString()).apply()
+    }
+
+    private fun serverFileStatusKey(shootId: String): String = "shoot_server_files_$shootId"
 
     fun uploadWorkName(shootId: String): String = "upload-$shootId"
 
