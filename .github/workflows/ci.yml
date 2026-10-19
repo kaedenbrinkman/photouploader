@@ -8,6 +8,7 @@ on:
 jobs:
   python:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,7 +20,7 @@ jobs:
           cd lib && pytest -q
       - name: Worker tests
         run: |
-          pip install pytest
+          pip install pytest pytest-timeout
           pip install -r worker/requirements.txt
           cd worker && PYTHONPATH=. pytest -q -m "not integration"
       - name: LightCraft importPreview smoke (optional)
@@ -33,6 +34,7 @@ jobs:
 
   infra:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -47,6 +49,7 @@ jobs:
 
   worker-ami:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -71,6 +74,7 @@ jobs:
 
   android:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk
     steps:

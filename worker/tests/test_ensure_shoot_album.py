@@ -4,11 +4,10 @@ from __future__ import annotations
 import json
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 from unittest.mock import MagicMock as _MagicMock
 
 _GPHOTOS_ROOT = Path(__file__).resolve().parents[2]
@@ -54,20 +53,15 @@ def test_ensure_shoot_album_completes_with_non_reentrant_lock_pattern():
 
     ensure_mod = __import__("gphotos.gphotos_upload", fromlist=["ensure_album"])
     with patch("gphotos.gphotos_upload.call", side_effect=fake_call):
-        ex = ThreadPoolExecutor(max_workers=1)
-        try:
-            fut = ex.submit(
-                ensure_mod.ensure_album,
-                creds,
-                "Import test",
-                ledger,
-                save_ledger=save_ledger,
-                ledger_lock=ledger_lock,
-            )
-            with pytest.raises(FuturesTimeout):
-                fut.result(timeout=2.0)
-        finally:
-            ex.shutdown(wait=False, cancel_futures=True)
+        worker = threading.Thread(
+            target=ensure_mod.ensure_album,
+            args=(creds, "Import test", ledger),
+            kwargs={"save_ledger": save_ledger, "ledger_lock": ledger_lock},
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=2.0)
+        assert worker.is_alive(), "non-reentrant Lock should deadlock ensure_album"
 
 
 def test_ensure_shoot_album_e2e_mocked_under_30s(tmp_path: Path):
