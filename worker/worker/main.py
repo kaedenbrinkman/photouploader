@@ -23,6 +23,8 @@ from worker.dynamo_store import DynamoStore
 from worker.failure_report import format_last_error
 from worker.gphotos_album_lock import album_creation_file_lock
 from worker.gphotos_client import ensure_shoot_album, upload_shoot_media
+from worker.ledger_s3 import load_ledger, merge_ledger_from_file_rows, save_ledger_to_s3
+from worker.publish_meta import count_publish_progress
 from worker.phase_watchdog import PhaseStallWatchdog, install_diagnostic_handlers
 from worker.jpeg_resume import try_fetch_existing_jpeg
 from worker.lightcraft_runner import (
@@ -233,11 +235,21 @@ def run() -> int:
             if idx == 1 or idx == total or idx % 50 == 0:
                 log.info("synced FILE# rows %s/%s", idx, total)
 
-        ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {"album_id": None, "items": {}}
-        if shoot_meta.get("albumId") and not ledger.get("album_id"):
-            ledger["album_id"] = shoot_meta["albumId"]
-        if shoot_meta.get("albumProductUrl") and not ledger.get("album_product_url"):
-            ledger["album_product_url"] = shoot_meta["albumProductUrl"]
+        ledger = load_ledger(
+            s3_client=s3,
+            bucket=cfg.bucket,
+            shoot_id=cfg.shoot_id,
+            local_path=ledger_path,
+            meta_album_id=shoot_meta.get("albumId"),
+            meta_album_url=shoot_meta.get("albumProductUrl"),
+        )
+        merge_ledger_from_file_rows(
+            ledger,
+            entries=all_files,
+            file_key_for_entry=lambda e: file_dynamo_key(cfg.shoot_id, e, raw_s3_key),
+            store=store,
+            shoot_id=cfg.shoot_id,
+        )
 
         # RLock: save_ledger() is invoked while ensure_album holds the ledger lock.
         ledger_lock = threading.RLock()
@@ -247,6 +259,42 @@ def run() -> int:
                 tmp = ledger_path.with_suffix(".tmp")
                 tmp.write_text(json.dumps(ledger, indent=1))
                 tmp.replace(ledger_path)
+                save_ledger_to_s3(
+                    s3_client=s3,
+                    bucket=cfg.bucket,
+                    shoot_id=cfg.shoot_id,
+                    local_path=ledger_path,
+                )
+
+        def persist_album_meta(album_id: str, product_url: str | None) -> None:
+            meta: dict[str, Any] = {"albumId": album_id}
+            if product_url:
+                meta["albumProductUrl"] = product_url
+            store.update_shoot(cfg.shoot_id, **meta)
+
+        def flush_publish_meta(*, phase: str = "PUBLISHING_GP") -> None:
+            rendered, pub_photos, pub_videos, pub_total = count_publish_progress(
+                store,
+                cfg.shoot_id,
+                photo_file_keys,
+                video_file_keys,
+            )
+            store.update_shoot(
+                cfg.shoot_id,
+                state="PUBLISHING",
+                phase=phase,
+                renderedCount=rendered,
+                renderedPhotoCount=rendered,
+                publishedCount=pub_total,
+                publishedPhotoCount=pub_photos,
+                publishedVideoCount=pub_videos,
+            )
+
+        gphotos_hooks = {
+            "on_album_id": persist_album_meta,
+            "on_batch_created": lambda _batch, _total: flush_publish_meta(),
+            "on_publish_phase": lambda: flush_publish_meta(phase="PUBLISHING_GP"),
+        }
 
         def gphotos_progress(phase: str) -> None:
             log.info("gphotos progress phase=%s", phase)
@@ -265,6 +313,7 @@ def run() -> int:
                     ledger_lock=ledger_lock,
                     album_file_lock=album_file_lock,
                     on_progress=gphotos_progress,
+                    on_album_id=persist_album_meta,
                 )
             except Exception as e:
                 msg = format_last_error(str(e), log_path)
@@ -277,13 +326,6 @@ def run() -> int:
                     workerFinishedAt=int(time.time() * 1000),
                 )
                 return 1
-            album_meta: dict = {}
-            if ledger.get("album_id"):
-                album_meta["albumId"] = ledger["album_id"]
-            if ledger.get("album_product_url"):
-                album_meta["albumProductUrl"] = ledger["album_product_url"]
-            if album_meta:
-                store.update_shoot(cfg.shoot_id, **album_meta)
             log.info("gphotos album ready album_id=%s", ledger.get("album_id"))
 
         render_started_at = int(time.time() * 1000)
@@ -291,6 +333,14 @@ def run() -> int:
         fail_count = 0
         pipeline_workers = max(1, min(PIPELINE_WINDOW, cfg.max_parallel_renders))
         store.update_shoot(cfg.shoot_id, phase="RENDERING", renderStartedAt=render_started_at)
+        if shoot_meta.get("launchProfile") == "publish_only" and photo_count > 0:
+            reuse_rendered = _count_rendered_photos(store, cfg.shoot_id, photo_file_keys)
+            store.update_shoot(
+                cfg.shoot_id,
+                renderedCount=reuse_rendered,
+                renderedPhotoCount=reuse_rendered,
+            )
+            log.info("publish_only: seeded renderedPhotoCount=%s/%s", reuse_rendered, photo_count)
         log.info(
             "pipeline start photos=%s videos=%s workers=%s",
             photo_count,
@@ -311,6 +361,7 @@ def run() -> int:
                 mediaType="photo",
                 mediaItemId=media_item_id,
             )
+            flush_publish_meta(phase="PUBLISHING_GP")
             return True
 
         def pipeline_one_photo(entry: dict) -> tuple[str, str | None]:
@@ -372,6 +423,9 @@ def run() -> int:
                     ledger_lock=ledger_lock,
                     album_file_lock=lambda: album_creation_file_lock(work),
                     on_progress=gphotos_progress,
+                    on_album_id=gphotos_hooks["on_album_id"],
+                    on_batch_created=gphotos_hooks["on_batch_created"],
+                    on_publish_phase=gphotos_hooks["on_publish_phase"],
                 )
                 _sync_photo_gp_created(content_sha, file_key)
                 return content_sha, None
@@ -421,14 +475,14 @@ def run() -> int:
             if video_count == 0:
                 return 1
 
-        store.update_shoot(cfg.shoot_id, state="PUBLISHING", phase="PUBLISHING_GP")
+        flush_publish_meta(phase="PUBLISHING_GP")
 
         media_items: list[MediaUploadItem] = []
         for entry in video_entries:
             file_key = file_dynamo_key(cfg.shoot_id, entry, raw_s3_key)
             content_sha = entry["sha256"].lower()
             existing = store.get_image(cfg.shoot_id, file_key)
-            if existing and existing.get("state") == "PUBLISHED":
+            if existing and existing.get("state") in ("PUBLISHED", "GP_CREATED"):
                 continue
             key = raw_s3_key(cfg.shoot_id, entry)
             name = entry.get("original_name") or f"{content_sha}.mp4"
@@ -445,19 +499,25 @@ def run() -> int:
                 )
             )
 
-        result = upload_shoot_media(
-            cfg.gphotos_token_param,
-            cfg.region,
-            cfg.album_title,
-            media_items,
-            [],
-            ledger,
-            save_ledger,
-            s3_client=s3,
-            ledger_lock=ledger_lock,
-            album_file_lock=lambda: album_creation_file_lock(work),
-            on_progress=gphotos_progress,
-        )
+        if media_items:
+            result = upload_shoot_media(
+                cfg.gphotos_token_param,
+                cfg.region,
+                cfg.album_title,
+                media_items,
+                [],
+                ledger,
+                save_ledger,
+                s3_client=s3,
+                ledger_lock=ledger_lock,
+                album_file_lock=lambda: album_creation_file_lock(work),
+                on_progress=gphotos_progress,
+                on_album_id=gphotos_hooks["on_album_id"],
+                on_batch_created=gphotos_hooks["on_batch_created"],
+                on_publish_phase=gphotos_hooks["on_publish_phase"],
+            )
+        else:
+            result = {"album_id": ledger.get("album_id"), "created": 0}
         for sha, item in ledger.get("items", {}).items():
             if item.get("state") != "CREATED":
                 continue
@@ -470,6 +530,7 @@ def run() -> int:
                     mediaType="video",
                     mediaItemId=item.get("media_item_id"),
                 )
+        flush_publish_meta(phase="PUBLISHING_GP")
 
         published_count = sum(
             1

@@ -109,6 +109,9 @@ def upload_shoot_media(
     ledger_lock: threading.Lock | None = None,
     album_file_lock=None,
     on_progress: Callable[[str], None] | None = None,
+    on_album_id: Callable[[str, str | None], None] | None = None,
+    on_batch_created: Callable[[int, int], None] | None = None,
+    on_publish_phase: Callable[[], None] | None = None,
 ) -> dict:
     creds = load_credentials_from_ssm(token_param, region, on_progress=on_progress)
     return upload_album(
@@ -122,6 +125,9 @@ def upload_shoot_media(
         ledger_lock=ledger_lock,
         http_session=get_gphotos_http_session(),
         album_file_lock=album_file_lock,
+        on_album_id=on_album_id,
+        on_batch_created=on_batch_created,
+        on_publish_phase=on_publish_phase,
     )
 
 
@@ -135,6 +141,7 @@ def ensure_shoot_album(
     ledger_lock: threading.Lock | None = None,
     album_file_lock=None,
     on_progress: Callable[[str], None] | None = None,
+    on_album_id: Callable[[str, str | None], None] | None = None,
 ) -> str:
     creds = load_credentials_from_ssm(token_param, region, on_progress=on_progress)
     if on_progress:
@@ -148,4 +155,5 @@ def ensure_shoot_album(
         ledger_lock=ledger_lock,
         http_session=get_gphotos_http_session(),
         album_file_lock=album_file_lock,
+        on_album_id=on_album_id,
     )

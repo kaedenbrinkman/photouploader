@@ -92,6 +92,16 @@ fun ProcessingStepScreen(
 
         ProcessingPipelineStepper(activeIndex = activeIndex, failedIndex = failedIndex)
 
+        if (
+            pipelineUi.activeStep == ProcessingPipelineStep.Publishing &&
+            !isTerminalProcessingState(shoot.state)
+        ) {
+            Text(
+                "Publishing to Google Photos",
+                style = MaterialTheme.typography.titleMedium,
+            )
+        }
+
         statusPollError?.let { err ->
             Text(
                 err,

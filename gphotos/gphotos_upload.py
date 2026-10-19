@@ -170,6 +170,7 @@ def ensure_album(
     ledger_lock: threading.Lock | None = None,
     http_session=None,
     album_file_lock=None,
+    on_album_id: Callable[[str, str | None], None] | None = None,
 ) -> str:
     """Create the app album once; safe under concurrent worker threads."""
     ctx = ledger_lock if ledger_lock is not None else nullcontext()
@@ -180,6 +181,8 @@ def ensure_album(
             existing = ledger.get("album_id")
         if existing:
             log.info("gphotos: using existing album_id=%s", existing)
+            if on_album_id:
+                on_album_id(existing, ledger.get("album_product_url"))
             return existing
         log.info("gphotos: creating Google Photos album title=%r", album_title[:80])
         led_album = call(
@@ -198,6 +201,8 @@ def ensure_album(
                 ledger["album_product_url"] = led_album["productUrl"]
             save_ledger()
         log.info("gphotos: album created id=%s", ledger["album_id"])
+        if on_album_id:
+            on_album_id(ledger["album_id"], ledger.get("album_product_url"))
         return ledger["album_id"]
 
 
@@ -265,6 +270,9 @@ def upload_album(
     ledger_lock: threading.Lock | None = None,
     http_session=None,
     album_file_lock=None,
+    on_album_id: Callable[[str, str | None], None] | None = None,
+    on_batch_created: Callable[[int, int], None] | None = None,
+    on_publish_phase: Callable[[], None] | None = None,
 ) -> dict:
     """Upload media to a Google Photos app-created album; mutates ledger in place."""
     ctx = ledger_lock if ledger_lock is not None else nullcontext()
@@ -276,6 +284,7 @@ def upload_album(
         ledger_lock=ledger_lock,
         http_session=http_session,
         album_file_lock=album_file_lock,
+        on_album_id=on_album_id,
     )
 
     specs: list[MediaUploadItem] = list(media_items or [])
@@ -304,6 +313,10 @@ def upload_album(
                 },
             )
             it.setdefault("filename", spec.filename)
+            if (spec.content_type or "").startswith("video/"):
+                it["media_type"] = "video"
+            else:
+                it["media_type"] = "photo"
             already_created = it.get("state") == "CREATED"
         if already_created:
             continue
@@ -320,6 +333,12 @@ def upload_album(
             if ledger["items"][k].get("state") == "UPLOADED":
                 pending.append(k)
 
+    if pending and on_publish_phase:
+        on_publish_phase()
+
+    total_created = sum(
+        1 for v in ledger.get("items", {}).values() if v.get("state") == "CREATED"
+    )
     for i in range(0, len(pending), 50):
         batch = pending[i : i + 50]
         body = {
@@ -342,6 +361,7 @@ def upload_album(
             json=body,
             session=http_session,
         ).json().get("newMediaItemResults", [])
+        created_in_batch = 0
         with ctx:
             for k, item_res in zip(batch, res):
                 st = item_res.get("status", {})
@@ -350,9 +370,13 @@ def upload_album(
                         state="CREATED", media_item_id=item_res["mediaItem"]["id"]
                     )
                     ledger["items"][k].pop("upload_token", None)
+                    created_in_batch += 1
                 else:
                     ledger["items"][k].update(state="FAILED_CREATE", error=st)
             save_ledger()
+        if on_batch_created and created_in_batch:
+            total_created += created_in_batch
+            on_batch_created(created_in_batch, total_created)
 
     n = sum(1 for v in ledger.get("items", {}).values() if v["state"] == "CREATED")
     return {

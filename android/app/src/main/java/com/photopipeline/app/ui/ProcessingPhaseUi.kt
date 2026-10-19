@@ -75,7 +75,8 @@ fun resolveProcessingPipelineStep(
         finalizeInProgress || st == "READY_TO_PROCESS" || p.contains("LAUNCH") -> ProcessingPipelineStep.StartingServer
         p == "GP_LOADING_TOKEN" || p == "GP_REFRESH_TOKEN" || p == "GP_SAVING_TOKEN" || p == "GP_TOKEN_READY" ->
             ProcessingPipelineStep.SettingUp
-        p.startsWith("GP_") || p.contains("PUBLISH") -> ProcessingPipelineStep.Publishing
+        st == "PUBLISHING" || p.contains("PUBLISHING") || p.startsWith("GP_") || p.contains("PUBLISH") ->
+            ProcessingPipelineStep.Publishing
         p.contains("BOOTSTRAP") || p.contains("SETUP") || p.contains("INSTALL") -> ProcessingPipelineStep.SettingUp
         st == "DONE" || st == "PARTIAL" || p.contains("DONE") -> ProcessingPipelineStep.Done
         p.contains("RENDER") || st == "PROCESSING" -> ProcessingPipelineStep.Rendering
@@ -116,9 +117,10 @@ fun computeFlowStep(shoot: com.photopipeline.app.data.ShootEntity?, files: List<
     if (shoot == null) {
         return if (files.isEmpty()) ShootFlowStep.PickFiles else ShootFlowStep.Upload
     }
-    val terminal = setOf("DONE", "FAILED", "PARTIAL")
     return when {
-        shoot.albumId != null || (shoot.state in terminal && shoot.state != "FAILED") -> ShootFlowStep.Results
+        shoot.state == "DONE" || shoot.state == "PARTIAL" -> ShootFlowStep.Results
+        shoot.state == "FAILED" -> ShootFlowStep.Processing
+        shoot.state == "PUBLISHING" || shoot.phase.contains("PUBLISH", ignoreCase = true) -> ShootFlowStep.Processing
         files.isNotEmpty() && files.all { it.uploadState == "UPLOADED" } -> ShootFlowStep.Processing
         shoot.state !in setOf("LOCAL", "IMPORTING") && shoot.backendState != null -> ShootFlowStep.Processing
         files.isEmpty() -> ShootFlowStep.PickFiles

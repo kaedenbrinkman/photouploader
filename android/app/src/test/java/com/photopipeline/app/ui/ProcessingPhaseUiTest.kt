@@ -47,6 +47,42 @@ class ProcessingPhaseUiTest {
     }
 
     @Test
+    fun computeFlowStep_staysOnProcessingWhenAlbumIdSetButStillPublishing() {
+        val shoot = ShootEntity(
+            shootId = "290f9d10",
+            albumTitle = "t",
+            state = "PUBLISHING",
+            phase = "PUBLISHING_GP",
+            createdAt = 0,
+            imageCount = 80,
+            totalBytes = 1,
+            estimateJson = null,
+            backendState = "PUBLISHING",
+            albumId = "album-live",
+            actualComputeJson = null,
+        )
+        assertEquals(ShootFlowStep.Processing, computeFlowStep(shoot, emptyList()))
+    }
+
+    @Test
+    fun computeFlowStep_doneUsesStateNotAlbumIdAlone() {
+        val shoot = ShootEntity(
+            shootId = "s1",
+            albumTitle = "t",
+            state = "DONE",
+            phase = "DONE",
+            createdAt = 0,
+            imageCount = 1,
+            totalBytes = 1,
+            estimateJson = null,
+            backendState = "DONE",
+            albumId = "album-1",
+            actualComputeJson = null,
+        )
+        assertEquals(ShootFlowStep.Results, computeFlowStep(shoot, emptyList()))
+    }
+
+    @Test
     fun computeFlowStep_processingWhenAllUploaded() {
         val shoot = ShootEntity(
             shootId = "s1",

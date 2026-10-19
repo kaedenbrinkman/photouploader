@@ -12,11 +12,13 @@ from google.oauth2.credentials import Credentials
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from gphotos.adaptive_pace import parse_retry_after_seconds, photos_api_pacer
+
 log = logging.getLogger("gphotos.http")
 
 # (connect, read) seconds — fail fast on hung TLS/handshake.
 DEFAULT_TIMEOUT: tuple[float, float] = (15.0, 120.0)
-MAX_CALL_ATTEMPTS = 4
+MAX_CALL_ATTEMPTS = 8
 MAX_TOKEN_REFRESHES = 2
 
 _NON_RETRYABLE_EXC = (
@@ -95,8 +97,10 @@ def photos_api_call(
     last_exc: Exception | None = None
     last_status: int | None = None
 
+    pacer = photos_api_pacer()
     for attempt in range(MAX_CALL_ATTEMPTS):
         try:
+            pacer.wait_turn()
             if not credentials.valid:
                 if refreshes >= MAX_TOKEN_REFRESHES:
                     raise RuntimeError(
@@ -113,8 +117,17 @@ def photos_api_call(
             last_status = r.status_code
 
             if r.status_code == 429:
-                sleep_s = max(5.0, min(60.0, 2**attempt * 3 + random.random()))
-                log.warning("gphotos: rate limited %s %s; sleep %.1fs", method, url, sleep_s)
+                retry_after = parse_retry_after_seconds(r.headers.get("Retry-After"))
+                sleep_s = pacer.on_rate_limited(retry_after)
+                if retry_after is None:
+                    sleep_s = max(sleep_s, min(60.0, 2**attempt * 3 + random.random()))
+                log.warning(
+                    "gphotos: rate limited %s %s; sleep %.1fs (Retry-After=%s)",
+                    method,
+                    url,
+                    sleep_s,
+                    r.headers.get("Retry-After"),
+                )
                 time.sleep(sleep_s)
                 kw["headers"] = headers
                 continue
@@ -140,6 +153,7 @@ def photos_api_call(
                 continue
 
             r.raise_for_status()
+            pacer.on_success()
             return r
         except _NON_RETRYABLE_EXC as e:
             log.error("gphotos: non-retryable HTTP error %s %s: %s", method, url, e)
