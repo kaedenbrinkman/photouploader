@@ -141,10 +141,13 @@ class ShootViewModel(
             val fileList = repo.observeFiles(shootId).first()
             val resume = fileList.isNotEmpty()
             val initialStep = computeFlowStep(loadedShoot, fileList)
+            val initialUploadState = queryUploadStartState()
+            val uploadActive = isUploadWorkerActive(initialUploadState)
             _ui.value = _ui.value.copy(
                 flowReady = true,
                 step = initialStep,
                 isResumeShoot = resume,
+                uploadStartState = initialUploadState,
                 processingProgress = repo.processingProgressJson(shootId),
                 serverFileStatusBySha = loadServerFileStatusMap(),
                 processingStartedAtMs = repo.processingWorkerStartedAtMs(shootId)
@@ -153,11 +156,12 @@ class ShootViewModel(
                     } else {
                         null
                     },
-                statusLine = if (resume) {
-                    "Resume upload — connect the camera when ready."
-                } else {
-                    "Plug in your Canon camera — we will list files automatically."
-                },
+                statusLine = uploadStatusLine(
+                    resume = resume,
+                    step = initialStep,
+                    uploadActive = uploadActive,
+                    usbReady = usb.accessState.value == UsbAccessState.READY,
+                ),
             )
             observeUploadWork()
             refreshFinalizeError()
@@ -705,6 +709,20 @@ class ShootViewModel(
         }
     }
 
+    private suspend fun queryUploadStartState(): UploadStartState {
+        val info = WorkManager.getInstance(appContext)
+            .getWorkInfosForUniqueWorkFlow(repo.uploadWorkName(shootId))
+            .first()
+            .firstOrNull()
+        return when (info?.state) {
+            WorkInfo.State.ENQUEUED,
+            WorkInfo.State.RUNNING,
+            -> UploadStartState.Uploading
+            WorkInfo.State.FAILED -> UploadStartState.Failed
+            else -> UploadStartState.Idle
+        }
+    }
+
     private fun observeUploadWork() {
         workObserveJob?.cancel()
         workObserveJob = safeScope.launch {
@@ -719,6 +737,7 @@ class ShootViewModel(
                             _ui.value = _ui.value.copy(
                                 uploadStartState = UploadStartState.Uploading,
                                 uploadFailedReason = null,
+                                statusLine = "Uploading to S3 — keep USB connected.",
                             )
                         }
                         WorkInfo.State.SUCCEEDED -> {
@@ -941,11 +960,38 @@ fun humanShootState(shoot: ShootEntity?): String {
     }
 }
 
+fun isUploadWorkerActive(uploadStartState: UploadStartState): Boolean =
+    uploadStartState == UploadStartState.Uploading ||
+        uploadStartState == UploadStartState.Starting
+
+fun uploadStatusLine(
+    resume: Boolean,
+    step: ShootFlowStep,
+    uploadActive: Boolean,
+    usbReady: Boolean,
+): String = when {
+    uploadActive -> "Uploading to S3 — keep USB connected."
+    resume && step == ShootFlowStep.Upload && usbReady ->
+        "Resume upload — use the button below when you are ready."
+    resume -> "Resume upload — connect the camera when ready."
+    else -> "Plug in your Canon camera — we will list files automatically."
+}
+
+fun capProgressCounts(rendered: Int, total: Int, published: Int): Triple<Int, Int, Int> {
+    val safeTotal = total.coerceAtLeast(0)
+    val cap = if (safeTotal > 0) safeTotal else Int.MAX_VALUE
+    return Triple(
+        minOf(rendered.coerceAtLeast(0), cap),
+        safeTotal,
+        minOf(published.coerceAtLeast(0), cap),
+    )
+}
+
 fun parseProgress(json: String?): Triple<Int, Int, Int>? {
     if (json.isNullOrBlank()) return null
     return runCatching {
         val o = JSONObject(json)
-        Triple(
+        capProgressCounts(
             o.optInt("renderedCount"),
             o.optInt("totalFiles"),
             o.optInt("publishedCount"),

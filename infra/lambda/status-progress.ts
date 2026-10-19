@@ -33,9 +33,12 @@ export function mergeProgress(
   uploadCompleteCount: number;
 } {
   const fromFiles = progressCountsFromFiles(files);
-  const totalFiles = meta.totalFiles ?? files.length;
-  const renderedCount = Math.max(meta.renderedCount ?? 0, fromFiles.renderedCount);
-  const publishedCount = Math.max(meta.publishedCount ?? 0, fromFiles.publishedCount);
+  const totalFiles = Math.max(meta.totalFiles ?? 0, files.length) || files.length;
+  const cap = (n: number) => (totalFiles > 0 ? Math.min(totalFiles, n) : n);
+  const renderedCount =
+    files.length > 0 ? cap(fromFiles.renderedCount) : cap(meta.renderedCount ?? 0);
+  const publishedCount =
+    files.length > 0 ? cap(fromFiles.publishedCount) : cap(meta.publishedCount ?? 0);
   const uploadCompleteCount = files.filter(
     (f) => f.state === 'UPLOADED' || f.state === 'GP_CREATED',
   ).length;

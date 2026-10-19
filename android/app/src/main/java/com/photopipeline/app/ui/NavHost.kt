@@ -397,6 +397,7 @@ fun ShootFlowScreen(
     val uploadMetrics by UploadMetricsStore.metrics.collectAsState()
     val usbState by usb.accessState.collectAsState()
     val allUploaded = files.isNotEmpty() && files.all { it.uploadState == "UPLOADED" }
+    val uploadWorkerActive = isUploadWorkerActive(ui.uploadStartState)
     val snackbarHost = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
@@ -477,8 +478,7 @@ fun ShootFlowScreen(
                     )
                 }
                 ShootFlowStep.Upload -> {
-                    val uploading = ui.uploadStartState == UploadStartState.Uploading ||
-                        ui.uploadStartState == UploadStartState.Starting
+                    val uploading = isUploadWorkerActive(ui.uploadStartState)
                     val failed = files.count { it.uploadState == "FAILED" }
                     val pending = files.count { it.uploadState != "UPLOADED" }
                     val uploaded = files.size - pending
@@ -536,18 +536,23 @@ fun ShootFlowScreen(
                 ui.step != ShootFlowStep.Results
             ) {
                 item { FlowStepper(current = ui.step) }
-                item {
-                    Text(ui.statusLine, style = MaterialTheme.typography.bodyLarge)
-                    if (ui.busy) {
-                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
+                val hideUploadChrome = ui.step == ShootFlowStep.Upload && uploadWorkerActive
+                if (!hideUploadChrome) {
+                    item {
+                        Text(ui.statusLine, style = MaterialTheme.typography.bodyLarge)
+                        if (ui.busy && !uploadWorkerActive) {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
+                        }
                     }
-                }
-                item {
-                    Text(
-                        "USB: ${usbStatusMessage(usbState)}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    if (ui.step != ShootFlowStep.Upload || !uploadWorkerActive) {
+                        item {
+                            Text(
+                                "USB: ${usbStatusMessage(usbState)}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
                 }
             }
             if (!ui.backendReady && ui.backendGateMessage.isNotBlank()) {
@@ -583,15 +588,20 @@ fun ShootFlowScreen(
                     )
                 }
                 ShootFlowStep.Upload -> {
-                    item {
-                        if (ui.isResumeShoot) {
-                            ResumeUploadIntro(files = files, usbState = usbState)
-                        } else {
-                            Text(
-                                "Keep USB connected until every file finishes uploading.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.primary,
-                            )
+                    if (!uploadWorkerActive) {
+                        item {
+                            if (ui.isResumeShoot) {
+                                ResumeUploadIntro(
+                                    files = files,
+                                    cameraReady = usbState == UsbAccessState.READY,
+                                )
+                            } else {
+                                Text(
+                                    "Keep USB connected until every file finishes uploading.",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
                         }
                     }
                     item {
@@ -721,19 +731,18 @@ private fun FlowStepper(current: ShootFlowStep) {
 @Composable
 private fun ResumeUploadIntro(
     files: List<com.photopipeline.app.data.FileEntity>,
-    usbState: UsbAccessState,
+    cameraReady: Boolean,
 ) {
     val pending = files.count { it.uploadState != "UPLOADED" }
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text("Resume import", style = MaterialTheme.typography.titleMedium)
         Text(
-            "$pending of ${files.size} files still need upload. We rematch camera files by name and size when USB reconnects.",
+            if (cameraReady) {
+                "$pending of ${files.size} files still need upload. Camera is connected — tap Resume below."
+            } else {
+                "$pending of ${files.size} files still need upload. Connect the camera via USB, then tap Resume."
+            },
             style = MaterialTheme.typography.bodyMedium,
-        )
-        Text(
-            "USB: ${usbStatusMessage(usbState)}",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
@@ -781,20 +790,6 @@ private fun UploadStep(
             }
             ui.uploadFailedReason?.let {
                 Text("Failed: $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
-            }
-            if (uploading) {
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
-                    Spacer(Modifier.size(12.dp))
-                    Text(
-                        if (ui.uploadStartState == UploadStartState.Starting) "Starting upload…" else "Uploading…",
-                        style = MaterialTheme.typography.titleMedium,
-                    )
-                }
             }
             val needsManualStart = ui.isResumeShoot ||
                 ui.uploadStartState == UploadStartState.Failed ||

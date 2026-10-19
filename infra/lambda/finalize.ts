@@ -364,7 +364,7 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
             TableName: process.env.TABLE_NAME,
             Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
             UpdateExpression:
-              'SET #s = :p, phase = :st, instanceId = :i, instanceType = :it, spot = :sp, workerStartedAt = :t, maxRuntimeMinutes = :mr, deadlineAt = :dl REMOVE lastError, launchErrorCode',
+              'SET #s = :p, phase = :st, instanceId = :i, instanceType = :it, spot = :sp, workerStartedAt = :t, maxRuntimeMinutes = :mr, deadlineAt = :dl, renderedCount = :rc REMOVE lastError, launchErrorCode',
             ExpressionAttributeNames: { '#s': 'state' },
             ExpressionAttributeValues: {
               ':p': 'PROCESSING',
@@ -375,6 +375,7 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
               ':t': launchAt,
               ':mr': maxRuntimeMinutes,
               ':dl': deadlineAt,
+              ':rc': 0,
             },
           }),
         );

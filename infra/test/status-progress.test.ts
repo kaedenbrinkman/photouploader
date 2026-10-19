@@ -17,12 +17,19 @@ describe('progressCountsFromFiles', () => {
 });
 
 describe('mergeProgress', () => {
-  it('uses max of meta and per-file counts', () => {
+  it('derives counts from per-file states capped at total', () => {
     const files = [{ state: 'RENDERED' }, { state: 'RENDERED' }];
     const merged = mergeProgress(files, { totalFiles: 13, renderedCount: 0, publishedCount: 0 });
     expect(merged.renderedCount).toBe(2);
     expect(merged.totalFiles).toBe(13);
     expect(merged.uploadCompleteCount).toBe(0);
+  });
+
+  it('ignores inflated meta renderedCount when file rows exist', () => {
+    const files = Array.from({ length: 13 }, () => ({ state: 'RENDERED' }));
+    const merged = mergeProgress(files, { totalFiles: 13, renderedCount: 26, publishedCount: 99 });
+    expect(merged.renderedCount).toBe(13);
+    expect(merged.publishedCount).toBe(0);
   });
 });
 

@@ -92,6 +92,15 @@ def manage_shutdown_backstop(*, cancel: bool, arm_idle_minutes: int | None = Non
         log.exception("shutdown backstop update failed")
 
 
+def _count_rendered_files(store: DynamoStore, shoot_id: str, raws: list[Path]) -> int:
+    n = 0
+    for raw in raws:
+        st = (store.get_image(shoot_id, raw.stem.lower()) or {}).get("state")
+        if st in ("RENDERED", "GP_CREATED"):
+            n += 1
+    return n
+
+
 def _file_error(store: DynamoStore, shoot_id: str, sha: str, message: str, state: str) -> None:
     store.update_image(
         shoot_id,
@@ -133,7 +142,6 @@ def run() -> int:
         render_started_at = int(time.time() * 1000)
         store.update_shoot(cfg.shoot_id, phase="RENDERING", renderStartedAt=render_started_at)
         rendered: list[Path] = []
-        rendered_count = 0
         already_published = sum(
             1
             for raw in raws
@@ -188,10 +196,15 @@ def run() -> int:
                         first_error = err
                 if out:
                     rendered.append(out)
-                    rendered_count += 1
-                    store.update_shoot(cfg.shoot_id, renderedCount=rendered_count, phase="RENDERING")
+                rendered_count = _count_rendered_files(store, cfg.shoot_id, raws)
+                store.update_shoot(
+                    cfg.shoot_id,
+                    renderedCount=min(rendered_count, total),
+                    phase="RENDERING",
+                )
                 log.info("processed %s err=%s (%s/%s)", sha, err, rendered_count, total)
 
+        rendered_count = _count_rendered_files(store, cfg.shoot_id, raws)
         if rendered_count == 0:
             summary = f"{first_error or 'render failed'}; {fail_count}/{total} failed"
             store.update_shoot(
@@ -262,7 +275,7 @@ def run() -> int:
             "phase": final_state,
             "albumId": result.get("album_id"),
             "resultsS3Key": results_key,
-            "renderedCount": rendered_count,
+            "renderedCount": min(rendered_count, total),
             "publishedCount": published_count,
             "workerFinishedAt": t1,
         }
