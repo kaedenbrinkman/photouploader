@@ -1,27 +1,29 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
-import { EC2Client, RunInstancesCommand } from '@aws-sdk/client-ec2';
+import { EC2Client } from '@aws-sdk/client-ec2';
 import { GetObjectCommand, HeadObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import type { APIGatewayProxyHandlerV2 } from 'aws-lambda';
 import { isWorkerInstanceLive } from './ec2-instance';
+import { ec2ErrorMessage } from './ec2-launch';
+import { ManifestValidationError, validateManifest } from './manifest-validate';
+import { splitManifestFiles } from './media-kind';
 import {
-  ec2ErrorCode,
-  ec2ErrorMessage,
-  isRetryableEc2LaunchError,
-} from './ec2-launch';
-import { ManifestValidationError, rawKeyForFile, validateManifest } from './manifest-validate';
+  manifestKeysMissingFromDynamo,
+  spotCheckManifestOnS3,
+  type DynamoManifestFileRow,
+} from './manifest-upload-ready';
+import { launchWorkerForShoot } from './finalize-launch-worker';
 import { json, userIdFromEvent } from './http';
 import { verifyWorkerArtifact } from './worker-artifacts';
-import { splitManifestFiles } from './media-kind';
 import { computeDeadlineAt, computeMaxRuntimeMinutes } from './pricing';
 import { loadWorkerSha256FromSsm } from './worker-sha-ssm';
-import EC2_USERDATA_BOOTSTRAP from './ec2-userdata-bootstrap.sh';
-import { buildUserData, normalizeLinuxLineEndings } from './user-data-build';
 import { canReprocessShoot } from './finalize-eligibility';
 
 const s3 = new S3Client({});
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const ec2 = new EC2Client({});
+const lambda = new LambdaClient({});
 
 const LAUNCH_LOCK_MS = 5 * 60_000;
 
@@ -30,6 +32,22 @@ interface ManifestFile {
   size_bytes: number;
   original_name?: string;
   s3_key?: string;
+}
+
+interface LaunchWorkerPayload {
+  launchWorker: true;
+  shootId: string;
+  userId: string;
+}
+
+function isLaunchWorkerEvent(event: unknown): event is LaunchWorkerPayload {
+  return Boolean(
+    event &&
+      typeof event === 'object' &&
+      (event as LaunchWorkerPayload).launchWorker === true &&
+      typeof (event as LaunchWorkerPayload).shootId === 'string' &&
+      typeof (event as LaunchWorkerPayload).userId === 'string',
+  );
 }
 
 async function recordLaunchFailure(
@@ -61,10 +79,7 @@ async function recordLaunchFailure(
   }
 }
 
-async function resetStaleProcessing(
-  shootId: string,
-  reason: string,
-): Promise<void> {
+async function resetStaleProcessing(shootId: string, reason: string): Promise<void> {
   await ddb.send(
     new UpdateCommand({
       TableName: process.env.TABLE_NAME,
@@ -82,7 +97,7 @@ async function resetStaleProcessing(
   );
 }
 
-/** Single atomic lock + READY_TO_PROCESS immediately before RunInstances. */
+/** Single atomic lock + READY_TO_PROCESS immediately before async worker launch. */
 async function acquireLaunchLockAndMarkReady(shootId: string): Promise<boolean> {
   const now = Date.now();
   try {
@@ -99,7 +114,7 @@ async function acquireLaunchLockAndMarkReady(shootId: string): Promise<boolean> 
           ':u': now + LAUNCH_LOCK_MS,
           ':now': now,
           ':v': 'READY_TO_PROCESS',
-          ':q': 'READY_TO_PROCESS',
+          ':q': 'LAUNCHING',
           ':t': now,
           ':processing': 'PROCESSING',
         },
@@ -117,7 +132,8 @@ async function releaseLaunchLock(shootId: string): Promise<void> {
     new UpdateCommand({
       TableName: process.env.TABLE_NAME,
       Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
-      UpdateExpression: 'REMOVE launchLockUntil',
+      UpdateExpression: 'REMOVE launchLockUntil SET phase = :ph',
+      ExpressionAttributeValues: { ':ph': 'READY_TO_PROCESS' },
     }),
   );
 }
@@ -136,7 +152,136 @@ async function ensureArtifactsReady(
   return { ok: true };
 }
 
+async function loadManifest(shootId: string): Promise<
+  | {
+      ok: true;
+      manifest: {
+        shoot_id: string;
+        user_id: string;
+        files: ManifestFile[];
+        settings_hash?: string;
+        album_title?: string;
+      };
+    }
+  | { ok: false }
+> {
+  const manifestKey = `shoots/${shootId}/manifest.json`;
+  try {
+    const obj = await s3.send(
+      new GetObjectCommand({ Bucket: process.env.BUCKET_NAME!, Key: manifestKey }),
+    );
+    const manifest = JSON.parse(await obj.Body!.transformToString());
+    return { ok: true, manifest };
+  } catch {
+    return { ok: false };
+  }
+}
+
+async function enqueueAsyncLaunch(shootId: string, userId: string): Promise<void> {
+  const fn = process.env.AWS_LAMBDA_FUNCTION_NAME;
+  if (!fn) throw new Error('AWS_LAMBDA_FUNCTION_NAME not set');
+  await lambda.send(
+    new InvokeCommand({
+      FunctionName: fn,
+      InvocationType: 'Event',
+      Payload: Buffer.from(JSON.stringify({ launchWorker: true, shootId, userId } satisfies LaunchWorkerPayload)),
+    }),
+  );
+}
+
+async function handleLaunchWorker(payload: LaunchWorkerPayload) {
+  const { shootId, userId } = payload;
+  const meta = await ddb.send(
+    new GetCommand({ TableName: process.env.TABLE_NAME, Key: { pk: `SHOOT#${shootId}`, sk: 'META' } }),
+  );
+  if (!meta.Item || meta.Item.userId !== userId) {
+    console.error(JSON.stringify({ msg: 'launchWorker unauthorized or missing', shootId }));
+    return;
+  }
+
+  if (meta.Item.state === 'PROCESSING') {
+    const instanceId = meta.Item.instanceId as string | undefined;
+    if (instanceId && (await isWorkerInstanceLive(instanceId))) {
+      return;
+    }
+  }
+
+  const loaded = await loadManifest(shootId);
+  if (!loaded.ok) {
+    await recordLaunchFailure(shootId, 'READY_TO_PROCESS', 'READY_TO_PROCESS', 'manifest missing on S3');
+    await releaseLaunchLock(shootId);
+    return;
+  }
+
+  const bucket = process.env.BUCKET_NAME!;
+  const bundleKey = process.env.WORKER_BUNDLE_KEY ?? 'releases/photopipeline-worker.tar.gz';
+  const lightcraftKey = process.env.LIGHTCRAFT_BINARY_KEY ?? 'releases/lightcraft-cli';
+
+  let bundleSha256: string;
+  let lightcraftSha256: string;
+  try {
+    const sha = await loadWorkerSha256FromSsm();
+    bundleSha256 = sha.bundleSha256;
+    lightcraftSha256 = sha.lightcraftSha256;
+  } catch (e) {
+    await recordLaunchFailure(
+      shootId,
+      'READY_TO_PROCESS',
+      'READY_TO_PROCESS',
+      ec2ErrorMessage(e),
+      'worker_sha_ssm_missing',
+    );
+    await releaseLaunchLock(shootId);
+    return;
+  }
+
+  const tokenParam = `/photopipeline/users/${userId}/gphotos-token`;
+  const result = await launchWorkerForShoot({
+    shootId,
+    userId,
+    manifest: loaded.manifest,
+    meta: meta.Item,
+    bucket,
+    tableName: process.env.TABLE_NAME!,
+    bundleKey,
+    bundleSha256,
+    lightcraftKey,
+    lightcraftSha256,
+    ddb,
+    ec2,
+    workerAmiId: process.env.WORKER_AMI_ID!,
+    workerInstanceProfileName: process.env.WORKER_INSTANCE_PROFILE_NAME!,
+    workerSubnetId: process.env.WORKER_SUBNET_ID!,
+    workerSecurityGroupId: process.env.WORKER_SECURITY_GROUP_ID!,
+    tokenParam,
+  });
+
+  if (!result.ok) {
+    await recordLaunchFailure(shootId, result.failState, result.failPhase, result.detail, result.code);
+    await releaseLaunchLock(shootId);
+  }
+}
+
+async function respondLaunchInProgress(shootId: string) {
+  const fresh = await ddb.send(
+    new GetCommand({ TableName: process.env.TABLE_NAME, Key: { pk: `SHOOT#${shootId}`, sk: 'META' } }),
+  );
+  const state = (fresh.Item?.state as string) ?? 'READY_TO_PROCESS';
+  const phase = (fresh.Item?.phase as string) ?? 'LAUNCHING';
+  return json(202, {
+    state,
+    phase,
+    instanceId: fresh.Item?.instanceId,
+    launchAccepted: true,
+  });
+}
+
 export const handler: APIGatewayProxyHandlerV2 = async (event) => {
+  if (isLaunchWorkerEvent(event)) {
+    await handleLaunchWorker(event);
+    return { statusCode: 200, body: '' };
+  }
+
   const userId = userIdFromEvent(event);
   const shootId = event.pathParameters?.shootId;
   if (!userId || !shootId) return json(401, { error: 'unauthorized' });
@@ -161,7 +306,12 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
       ExpressionAttributeValues: { ':pk': `SHOOT#${shootId}`, ':f': 'FILE#' },
     }),
   );
-  const fileRows = (fileRowsRes.Items ?? []).map((it) => ({ state: it.state as string | undefined }));
+  const dynamoFileRows: DynamoManifestFileRow[] = (fileRowsRes.Items ?? []).map((it) => ({
+    sha256: it.sha256 as string | undefined,
+    state: it.state as string | undefined,
+    sizeBytes: it.sizeBytes as number | undefined,
+  }));
+  const fileRows = dynamoFileRows.map((it) => ({ state: it.state }));
 
   if (meta.Item.state === 'DONE' && !canReprocessShoot(meta.Item, fileRows, { force: forceReprocess })) {
     return json(202, { state: 'DONE', instanceId: meta.Item.instanceId });
@@ -180,24 +330,18 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     );
   }
 
+  const phase = meta.Item.phase as string | undefined;
+  const lockUntil = meta.Item.launchLockUntil as number | undefined;
+  if (phase === 'LAUNCHING' && lockUntil != null && lockUntil > Date.now()) {
+    return respondLaunchInProgress(shootId);
+  }
+
   let lockHeld = false;
+  let releaseLockAfter = false;
   try {
-    const manifestKey = `shoots/${shootId}/manifest.json`;
-    let manifest: {
-      shoot_id: string;
-      user_id: string;
-      files: ManifestFile[];
-      settings_hash?: string;
-      album_title?: string;
-    };
-    try {
-      const obj = await s3.send(
-        new GetObjectCommand({ Bucket: process.env.BUCKET_NAME!, Key: manifestKey }),
-      );
-      manifest = JSON.parse(await obj.Body!.transformToString());
-    } catch {
-      return json(400, { error: 'manifest missing on S3' });
-    }
+    const loaded = await loadManifest(shootId);
+    if (!loaded.ok) return json(400, { error: 'manifest missing on S3' });
+    const manifest = loaded.manifest;
 
     try {
       validateManifest(manifest, shootId, userId);
@@ -206,33 +350,54 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
       throw e;
     }
 
-    const missing: string[] = [];
-    for (const f of manifest.files ?? []) {
-      const key = rawKeyForFile(shootId, f);
-      try {
-        const head = await s3.send(new HeadObjectCommand({ Bucket: process.env.BUCKET_NAME!, Key: key }));
-        if (Number(head.ContentLength) !== Number(f.size_bytes)) missing.push(key);
-      } catch {
-        missing.push(key);
-      }
-    }
-
-    if (missing.length) {
+    const missingFromDynamo = manifestKeysMissingFromDynamo(shootId, manifest.files ?? [], dynamoFileRows);
+    if (missingFromDynamo.length) {
       await ddb.send(
         new UpdateCommand({
           TableName: process.env.TABLE_NAME,
           Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
           UpdateExpression: 'SET #s = :u, phase = :ph, missingKeys = :m, updatedAt = :t',
           ExpressionAttributeNames: { '#s': 'state' },
-          ExpressionAttributeValues: { ':u': 'UPLOADING', ':ph': 'UPLOAD', ':m': missing, ':t': Date.now() },
+          ExpressionAttributeValues: {
+            ':u': 'UPLOADING',
+            ':ph': 'UPLOAD',
+            ':m': missingFromDynamo,
+            ':t': Date.now(),
+          },
         }),
       );
-      return json(409, { state: 'UPLOADING', missing });
+      return json(409, { state: 'UPLOADING', missing: missingFromDynamo });
+    }
+
+    const bucket = process.env.BUCKET_NAME!;
+    const spotMissing = await spotCheckManifestOnS3(manifest.files ?? [], shootId, async (key) => {
+      try {
+        const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+        return head.ContentLength ?? null;
+      } catch {
+        return null;
+      }
+    });
+    if (spotMissing.length) {
+      await ddb.send(
+        new UpdateCommand({
+          TableName: process.env.TABLE_NAME,
+          Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
+          UpdateExpression: 'SET #s = :u, phase = :ph, missingKeys = :m, updatedAt = :t',
+          ExpressionAttributeNames: { '#s': 'state' },
+          ExpressionAttributeValues: {
+            ':u': 'UPLOADING',
+            ':ph': 'UPLOAD',
+            ':m': spotMissing,
+            ':t': Date.now(),
+          },
+        }),
+      );
+      return json(409, { state: 'UPLOADING', missing: spotMissing });
     }
 
     const bundleKey = process.env.WORKER_BUNDLE_KEY ?? 'releases/photopipeline-worker.tar.gz';
     const lightcraftKey = process.env.LIGHTCRAFT_BINARY_KEY ?? 'releases/lightcraft-cli';
-    const bucket = process.env.BUCKET_NAME!;
 
     let bundleSha256: string;
     let lightcraftSha256: string;
@@ -273,149 +438,32 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     }
 
     if (!(await acquireLaunchLockAndMarkReady(shootId))) {
-      return json(409, { error: 'finalize_in_progress', state: meta.Item.state ?? 'READY_TO_PROCESS' });
+      return respondLaunchInProgress(shootId);
     }
     lockHeld = true;
 
-    const settingsHash = manifest.settings_hash ?? meta.Item.settingsHash ?? 'develop.auto-longEdge0-q90';
-    const albumTitle = manifest.album_title ?? meta.Item.albumTitle ?? shootId;
-    const tokenParam = `/photopipeline/users/${userId}/gphotos-token`;
+    try {
+      await enqueueAsyncLaunch(shootId, userId);
+    } catch (e) {
+      releaseLockAfter = true;
+      const detail = ec2ErrorMessage(e);
+      await recordLaunchFailure(shootId, 'READY_TO_PROCESS', 'READY_TO_PROCESS', detail, 'launch_enqueue_failed');
+      return json(503, { error: 'failed_to_launch_worker', detail, state: 'READY_TO_PROCESS' });
+    }
 
+    lockHeld = false;
     const split = splitManifestFiles(manifest.files ?? []);
     const maxRuntimeMinutes = computeMaxRuntimeMinutes(split.photoCount, split.videoBytes);
     const launchAt = Date.now();
-    const deadlineAt = computeDeadlineAt(launchAt, maxRuntimeMinutes);
-
-    const userData = buildUserData(
-      {
-        shootId,
-        userId,
-        bucket,
-        table: process.env.TABLE_NAME!,
-        tokenParam,
-        settingsHash,
-        albumTitle,
-        bundleKey,
-        bundleSha256,
-        lightcraftKey,
-        lightcraftSha256,
-        maxRuntimeMinutes,
-      },
-      normalizeLinuxLineEndings(EC2_USERDATA_BOOTSTRAP),
-    );
-
-    const attempts: Array<{ spot: boolean; type: string }> = [
-      { spot: true, type: 'c7i.4xlarge' },
-      { spot: true, type: 'c7i.2xlarge' },
-      { spot: false, type: 'c7i.4xlarge' },
-      { spot: false, type: 'c7i.2xlarge' },
-    ];
-
-    let lastError: unknown;
-    let lastCode: string | undefined;
-    for (const attempt of attempts) {
-      console.log(
-        JSON.stringify({
-          msg: 'finalize launch attempt',
-          shootId,
-          spot: attempt.spot,
-          instanceType: attempt.type,
-        }),
-      );
-      try {
-        const run = await ec2.send(
-          new RunInstancesCommand({
-            ImageId: process.env.WORKER_AMI_ID!,
-            MinCount: 1,
-            MaxCount: 1,
-            InstanceType: attempt.type,
-            IamInstanceProfile: { Name: process.env.WORKER_INSTANCE_PROFILE_NAME! },
-            InstanceInitiatedShutdownBehavior: 'terminate',
-            InstanceMarketOptions: attempt.spot
-              ? {
-                  MarketType: 'spot',
-                  SpotOptions: { SpotInstanceType: 'one-time', InstanceInterruptionBehavior: 'terminate' },
-                }
-              : undefined,
-            NetworkInterfaces: [
-              {
-                DeviceIndex: 0,
-                SubnetId: process.env.WORKER_SUBNET_ID!,
-                Groups: [process.env.WORKER_SECURITY_GROUP_ID!],
-                AssociatePublicIpAddress: true,
-              },
-            ],
-            UserData: Buffer.from(userData).toString('base64'),
-            TagSpecifications: [
-              {
-                ResourceType: 'instance',
-                Tags: [
-                  { Key: 'Project', Value: 'PhotoPipeline' },
-                  { Key: 'ShootId', Value: shootId },
-                  { Key: 'MaxLifetimeMinutes', Value: String(maxRuntimeMinutes) },
-                  { Key: 'DeadlineAt', Value: String(deadlineAt) },
-                ],
-              },
-            ],
-          }),
-        );
-        const instanceId = run.Instances?.[0]?.InstanceId;
-        await ddb.send(
-          new UpdateCommand({
-            TableName: process.env.TABLE_NAME,
-            Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
-            UpdateExpression:
-              'SET #s = :p, phase = :st, instanceId = :i, instanceType = :it, spot = :sp, workerStartedAt = :t, maxRuntimeMinutes = :mr, deadlineAt = :dl, renderedCount = :rc REMOVE lastError, launchErrorCode',
-            ExpressionAttributeNames: { '#s': 'state' },
-            ExpressionAttributeValues: {
-              ':p': 'PROCESSING',
-              ':st': 'INSTANCE_STARTING',
-              ':i': instanceId,
-              ':it': attempt.type,
-              ':sp': attempt.spot,
-              ':t': launchAt,
-              ':mr': maxRuntimeMinutes,
-              ':dl': deadlineAt,
-              ':rc': 0,
-            },
-          }),
-        );
-        return json(202, { state: 'PROCESSING', instanceId, instanceType: attempt.type, spot: attempt.spot });
-      } catch (e) {
-        lastError = e;
-        lastCode = ec2ErrorCode(e);
-        console.error(
-          JSON.stringify({
-            msg: 'finalize launch attempt failed',
-            shootId,
-            spot: attempt.spot,
-            instanceType: attempt.type,
-            ec2ErrorCode: lastCode,
-            error: ec2ErrorMessage(e),
-          }),
-        );
-      }
-    }
-
-    const retryable = isRetryableEc2LaunchError(lastError);
-    const detail = ec2ErrorMessage(lastError);
-    const code = lastCode ?? ec2ErrorCode(lastError);
-    const failState = retryable ? 'READY_TO_PROCESS' : 'FAILED';
-    const failPhase = retryable ? 'READY_TO_PROCESS' : 'FAILED';
-
-    await recordLaunchFailure(shootId, failState, failPhase, detail, code);
-
-    if (retryable) {
-      return json(503, {
-        error: 'failed_to_launch_worker',
-        ec2ErrorCode: code,
-        detail,
-        state: 'READY_TO_PROCESS',
-      });
-    }
-    return json(500, { error: 'failed_to_launch_worker', ec2ErrorCode: code, detail, state: 'FAILED' });
+    return json(202, {
+      state: 'READY_TO_PROCESS',
+      phase: 'LAUNCHING',
+      launchAccepted: true,
+      maxRuntimeMinutes,
+      deadlineAt: computeDeadlineAt(launchAt, maxRuntimeMinutes),
+    });
   } finally {
-    if (lockHeld) {
+    if (lockHeld && releaseLockAfter) {
       await releaseLaunchLock(shootId);
     }
   }

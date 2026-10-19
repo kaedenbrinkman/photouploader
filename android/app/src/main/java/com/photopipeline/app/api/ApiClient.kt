@@ -11,7 +11,9 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import java.util.concurrent.TimeUnit
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -22,6 +24,12 @@ class ApiClient(
     private val baseUrl: String
         get() = baseUrlProvider().trim().trimEnd('/')
     private val client = OkHttpClient.Builder().build()
+    private val finalizeClient = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .writeTimeout(45, TimeUnit.SECONDS)
+        .callTimeout(60, TimeUnit.SECONDS)
+        .build()
     private val moshi: Moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
     private val estimateAdapter: JsonAdapter<EstimateResponse> = moshi.adapter(EstimateResponse::class.java)
     private val statusAdapter: JsonAdapter<ShootStatusResponse> = moshi.adapter(ShootStatusResponse::class.java)
@@ -232,9 +240,24 @@ class ApiClient(
 
     suspend fun finalizeShoot(shootId: String) = onIo {
         val req = authorizedRequest("/shoots/$shootId/finalize").post("{}".toRequestBody(JSON)).build()
-        client.newCall(req).execute().use { resp ->
+        finalizeClient.newCall(req).execute().use { resp ->
             if (resp.code !in 200..202) failFinalize(resp)
         }
+    }
+
+    suspend fun pollStatusForProcessingStart(
+        shootId: String,
+        attempts: Int = 12,
+        delayMs: Long = 2_500L,
+    ): ShootStatusResponse? {
+        repeat(attempts) {
+            val status = runCatching { fetchStatus(shootId) }.getOrNull()
+            if (status != null && FinalizeStartRecovery.processingAppearsStarted(status)) {
+                return status
+            }
+            delay(delayMs)
+        }
+        return null
     }
 
     suspend fun fetchStatus(shootId: String): ShootStatusResponse = onIo {

@@ -11,6 +11,7 @@ import com.photopipeline.app.api.NotSignedInException
 import com.photopipeline.app.core.AppDefaults
 import com.photopipeline.app.core.PipelineLog
 import com.photopipeline.app.api.ApiRequestException
+import com.photopipeline.app.api.FinalizeStartRecovery
 import com.photopipeline.app.core.cameraFileIdentityKey
 import com.photopipeline.app.core.cameraFileMatchKey
 import com.photopipeline.app.core.metadataUploadSha256
@@ -646,14 +647,27 @@ class Repository(
             api.finalizeShoot(shootId)
             clearFinalizeError(shootId)
         } catch (e: ApiRequestException) {
-            val msg = e.message ?: "Finalize failed (HTTP ${e.httpCode ?: "?"})"
+            if (recoverFinalizeMaybeStarted(shootId, e)) return
+            val msg = FinalizeStartRecovery.friendlyFailureMessage(e)
             setFinalizeError(shootId, msg)
             throw e
         } catch (e: Exception) {
-            val msg = e.message ?: "Finalize failed"
+            if (recoverFinalizeMaybeStarted(shootId, e)) return
+            val msg = FinalizeStartRecovery.friendlyFailureMessage(e)
             setFinalizeError(shootId, msg)
             throw e
         }
+    }
+
+    private suspend fun recoverFinalizeMaybeStarted(shootId: String, e: Throwable): Boolean {
+        if (!FinalizeStartRecovery.isMaybeStartedFailure(e)) return false
+        val status = api.pollStatusForProcessingStart(shootId)
+        if (status != null && FinalizeStartRecovery.processingAppearsStarted(status)) {
+            clearFinalizeError(shootId)
+            refreshBackendStatus(shootId)
+            return true
+        }
+        return false
     }
 
     suspend fun submitShoot(shootId: String) = finalizeShootForProcessing(shootId)

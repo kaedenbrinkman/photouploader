@@ -193,6 +193,14 @@ export class PhotoPipelineStack extends cdk.Stack {
         ],
       }),
     );
+    finalizeFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['lambda:InvokeFunction'],
+        resources: [
+          `arn:aws:lambda:${this.region}:${this.account}:function:*FinalizeFn*`,
+        ],
+      }),
+    );
 
     const statusFn = new lambdaNode.NodejsFunction(this, 'StatusFn', {
       ...lambdaDefaults,

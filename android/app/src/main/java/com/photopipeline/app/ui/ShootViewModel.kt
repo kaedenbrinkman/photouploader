@@ -625,7 +625,9 @@ class ShootViewModel(
             finalizeError = null,
             statusLine = "Starting server processing…",
         )
-        runCatching { repo.finalizeShootForProcessing(shootId) }
+        runCatching {
+            repo.finalizeShootForProcessing(shootId)
+        }
             .onSuccess {
                 finalizeInFlight = false
                 autoFinalizeScheduled = false
@@ -645,7 +647,8 @@ class ShootViewModel(
                 if (!userInitiated) autoFinalizeScheduled = false
                 val msg = when (e) {
                     is NotSignedInException -> repo.backendGateMessage()
-                    else -> repo.getFinalizeError(shootId) ?: e.message ?: "Processing could not start"
+                    else -> repo.getFinalizeError(shootId)
+                        ?: com.photopipeline.app.api.FinalizeStartRecovery.friendlyFailureMessage(e)
                 }
                 PipelineLog.e("finalize", "finalize failed shootId=$shootId: $msg", e)
                 _ui.value = _ui.value.copy(
