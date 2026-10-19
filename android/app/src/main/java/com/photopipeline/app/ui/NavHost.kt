@@ -263,16 +263,16 @@ fun HomeScreen(
                     onClick = { onNewShoot(newShootId()) },
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text("Start new shoot")
+                    Text("Import from camera")
                 }
             }
             item {
-                Text("Past shoots", style = MaterialTheme.typography.titleMedium)
+                Text("Past imports", style = MaterialTheme.typography.titleMedium)
             }
             if (shoots.isEmpty()) {
                 item {
                     Text(
-                        "No shoots yet. Connect your camera and start a new shoot.",
+                        "No imports yet. Connect your camera and tap Import from camera.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -422,7 +422,14 @@ fun ShootFlowScreen(
         contentWindowInsets = WindowInsets(0),
         topBar = {
             TopAppBar(
-                title = { Text(shoot?.albumTitle ?: "Shoot") },
+                title = {
+                    Text(
+                        when {
+                            ui.isResumeShoot -> shoot?.albumTitle ?: "Resume import"
+                            else -> "Import from camera"
+                        },
+                    )
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -599,7 +606,7 @@ fun ShootFlowScreen(
 
 @Composable
 private fun FlowStepper(current: ShootFlowStep) {
-    val labels = listOf("Select", "Upload", "Process", "Done")
+    val labels = listOf("Import", "Upload", "Process", "Done")
     val index = when (current) {
         ShootFlowStep.PickFiles -> 0
         ShootFlowStep.Upload -> 1
@@ -622,7 +629,7 @@ private fun ResumeUploadIntro(
 ) {
     val pending = files.count { it.uploadState != "UPLOADED" }
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text("Resume shoot", style = MaterialTheme.typography.titleMedium)
+        Text("Resume import", style = MaterialTheme.typography.titleMedium)
         Text(
             "$pending of ${files.size} files still need upload. We rematch camera files by name and size when USB reconnects.",
             style = MaterialTheme.typography.bodyMedium,

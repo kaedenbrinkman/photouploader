@@ -116,7 +116,7 @@ class ShootViewModel(
                 repo.db.shootDao().upsert(
                     ShootEntity(
                         shootId = shootId,
-                        albumTitle = "Shoot ${shootId.take(8)}",
+                        albumTitle = "Import ${shootId.take(8)}",
                         state = "LOCAL",
                         phase = "CONNECT",
                         createdAt = System.currentTimeMillis(),
