@@ -30,6 +30,7 @@ _GPHOTOS_ROOT = _gphotos_sys_path_root()
 if str(_GPHOTOS_ROOT) not in sys.path:
     sys.path.insert(0, str(_GPHOTOS_ROOT))
 
+from gphotos.batch_create import BatchCreateQueue  # noqa: E402
 from gphotos.gphotos_upload import MediaUploadItem, SCOPES, ensure_album, upload_album  # noqa: E402
 
 _session_lock = threading.Lock()
@@ -112,6 +113,9 @@ def upload_shoot_media(
     on_album_id: Callable[[str, str | None], None] | None = None,
     on_batch_created: Callable[[int, int], None] | None = None,
     on_publish_phase: Callable[[], None] | None = None,
+    defer_batch_create: bool = False,
+    skip_ensure_album: bool = False,
+    batch_queue: BatchCreateQueue | None = None,
 ) -> dict:
     creds = load_credentials_from_ssm(token_param, region, on_progress=on_progress)
     return upload_album(
@@ -128,7 +132,48 @@ def upload_shoot_media(
         on_album_id=on_album_id,
         on_batch_created=on_batch_created,
         on_publish_phase=on_publish_phase,
+        defer_batch_create=defer_batch_create,
+        skip_ensure_album=skip_ensure_album,
+        batch_queue=batch_queue,
     )
+
+
+def flush_batch_create_queue(
+    token_param: str,
+    region: str,
+    ledger: dict,
+    queue: BatchCreateQueue,
+    save_ledger,
+    *,
+    ledger_lock: threading.Lock | None = None,
+    on_batch_created: Callable[[int, int], None] | None = None,
+    on_publish_phase: Callable[[], None] | None = None,
+    retry_failed: bool = False,
+) -> tuple[int, list[str]]:
+    creds = load_credentials_from_ssm(token_param, region)
+    session = get_gphotos_http_session()
+    if on_publish_phase:
+        on_publish_phase()
+    created, failed = queue.flush(
+        creds,
+        ledger,
+        save_ledger=save_ledger,
+        ledger_lock=ledger_lock,
+        session=session,
+        on_batch_created=on_batch_created,
+    )
+    if retry_failed:
+        extra, failed2 = queue.retry_failed(
+            creds,
+            ledger,
+            save_ledger=save_ledger,
+            ledger_lock=ledger_lock,
+            session=session,
+            on_batch_created=on_batch_created,
+        )
+        created += extra
+        failed = failed2
+    return created, failed
 
 
 def ensure_shoot_album(

@@ -22,6 +22,14 @@ def redact_log_line(line: str) -> str:
     return line
 
 
+def human_last_error(message: str, *, max_chars: int = 280) -> str:
+    """Short user-facing META.lastError (no traceback)."""
+    line = (message or "Processing failed").strip().splitlines()[0].strip()
+    if len(line) > max_chars:
+        return line[: max_chars - 3] + "..."
+    return line
+
+
 def format_last_error(message: str, log_path: Path | None, *, tail_lines: int = 50, max_chars: int = 3500) -> str:
     msg = message.strip() or "worker failed"
     if log_path and log_path.is_file():

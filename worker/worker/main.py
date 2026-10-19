@@ -20,9 +20,10 @@ from gphotos.gphotos_upload import MediaUploadItem
 from worker.config import WorkerConfig
 from worker.disk_space import require_free_bytes
 from worker.dynamo_store import DynamoStore
-from worker.failure_report import format_last_error
+from gphotos.batch_create import BatchCreateQueue
+from worker.failure_report import human_last_error
 from worker.gphotos_album_lock import album_creation_file_lock
-from worker.gphotos_client import ensure_shoot_album, upload_shoot_media
+from worker.gphotos_client import ensure_shoot_album, flush_batch_create_queue, upload_shoot_media
 from worker.ledger_s3 import load_ledger, merge_ledger_from_file_rows, save_ledger_to_s3
 from worker.publish_meta import count_publish_progress
 from worker.phase_watchdog import PhaseStallWatchdog, install_diagnostic_handlers
@@ -176,7 +177,7 @@ def run() -> int:
             cfg.shoot_id,
             state="FAILED",
             phase="STALLED",
-            lastError=format_last_error(msg, log_path),
+            lastError=human_last_error(msg),
             workerFinishedAt=int(time.time() * 1000),
         )
         log.error("phase stall: %s", msg)
@@ -290,11 +291,60 @@ def run() -> int:
                 publishedVideoCount=pub_videos,
             )
 
+        batch_queue = BatchCreateQueue()
         gphotos_hooks = {
             "on_album_id": persist_album_meta,
             "on_batch_created": lambda _batch, _total: flush_publish_meta(),
             "on_publish_phase": lambda: flush_publish_meta(phase="PUBLISHING_GP"),
         }
+
+        def _sync_ledger_file_row(content_sha: str, file_key: str, media_type: str) -> None:
+            with ledger_lock:
+                item = ledger.get("items", {}).get(content_sha.lower(), {})
+            st = item.get("state")
+            if st == "CREATED":
+                store.update_image(
+                    cfg.shoot_id,
+                    file_key,
+                    state="GP_CREATED" if media_type == "photo" else "PUBLISHED",
+                    mediaType=media_type,
+                    mediaItemId=item.get("media_item_id"),
+                )
+            elif st == "FAILED_CREATE":
+                err = item.get("error") or {}
+                msg = err.get("message") if isinstance(err, dict) else str(err)
+                store.update_image(
+                    cfg.shoot_id,
+                    file_key,
+                    state="GP_FAILED",
+                    mediaType=media_type,
+                    lastError=human_last_error(msg or "Google Photos publish failed"),
+                )
+
+        def _sync_all_ledger_rows() -> None:
+            for entry in photo_entries:
+                fk = file_dynamo_key(cfg.shoot_id, entry, raw_s3_key)
+                _sync_ledger_file_row(entry["sha256"].lower(), fk, "photo")
+            for entry in video_entries:
+                fk = file_dynamo_key(cfg.shoot_id, entry, raw_s3_key)
+                _sync_ledger_file_row(entry["sha256"].lower(), fk, "video")
+            flush_publish_meta(phase="PUBLISHING_GP")
+
+        def _run_batch_flush(*, retry_failed: bool) -> None:
+            if not needs_gphotos:
+                return
+            flush_batch_create_queue(
+                cfg.gphotos_token_param,
+                cfg.region,
+                ledger,
+                batch_queue,
+                save_ledger,
+                ledger_lock=ledger_lock,
+                on_batch_created=gphotos_hooks["on_batch_created"],
+                on_publish_phase=gphotos_hooks["on_publish_phase"],
+                retry_failed=retry_failed,
+            )
+            _sync_all_ledger_rows()
 
         def gphotos_progress(phase: str) -> None:
             log.info("gphotos progress phase=%s", phase)
@@ -316,7 +366,7 @@ def run() -> int:
                     on_album_id=persist_album_meta,
                 )
             except Exception as e:
-                msg = format_last_error(str(e), log_path)
+                msg = human_last_error(str(e))
                 log.exception("gphotos ensure album failed")
                 store.finish_run(
                     cfg.shoot_id,
@@ -348,30 +398,14 @@ def run() -> int:
             pipeline_workers,
         )
 
-        def _sync_photo_gp_created(content_sha: str, file_key: str) -> bool:
-            with ledger_lock:
-                item = ledger.get("items", {}).get(content_sha, {})
-                if item.get("state") != "CREATED":
-                    return False
-                media_item_id = item.get("media_item_id")
-            store.update_image(
-                cfg.shoot_id,
-                file_key,
-                state="GP_CREATED",
-                mediaType="photo",
-                mediaItemId=media_item_id,
-            )
-            flush_publish_meta(phase="PUBLISHING_GP")
-            return True
-
         def pipeline_one_photo(entry: dict) -> tuple[str, str | None]:
             file_key = file_dynamo_key(cfg.shoot_id, entry, raw_s3_key)
             content_sha = entry["sha256"].lower()
             existing = store.get_image(cfg.shoot_id, file_key)
             if existing and existing.get("state") in ("GP_CREATED", "PUBLISHED"):
                 return content_sha, None
-            if _sync_photo_gp_created(content_sha, file_key):
-                return content_sha, None
+            if existing and existing.get("state") == "GP_FAILED":
+                return content_sha, existing.get("lastError")
             raw: Path | None = None
             out = out_dir / f"{content_sha}.jpg"
             jpeg_key = f"shoots/{cfg.shoot_id}/jpeg/{cfg.settings_hash}/{content_sha}.jpg"
@@ -424,10 +458,10 @@ def run() -> int:
                     album_file_lock=lambda: album_creation_file_lock(work),
                     on_progress=gphotos_progress,
                     on_album_id=gphotos_hooks["on_album_id"],
-                    on_batch_created=gphotos_hooks["on_batch_created"],
-                    on_publish_phase=gphotos_hooks["on_publish_phase"],
+                    defer_batch_create=True,
+                    skip_ensure_album=True,
+                    batch_queue=batch_queue,
                 )
-                _sync_photo_gp_created(content_sha, file_key)
                 return content_sha, None
             except PreviewOnlyError as e:
                 _file_error(store, cfg.shoot_id, file_key, str(e), "PREVIEW_ONLY")
@@ -435,6 +469,11 @@ def run() -> int:
             except LightcraftRenderError as e:
                 _file_error(store, cfg.shoot_id, file_key, str(e), "FAILED_RENDER")
                 return content_sha, str(e)
+            except Exception as e:
+                log.exception("photo publish pipeline failed sha=%s", content_sha)
+                short = human_last_error(str(e))
+                _file_error(store, cfg.shoot_id, file_key, short, "GP_FAILED")
+                return content_sha, short
             finally:
                 if raw is not None:
                     _safe_unlink(raw)
@@ -459,8 +498,12 @@ def run() -> int:
                     log.info("pipeline photo %s err=%s (%s/%s)", sha, err, rendered_count, photo_count)
 
         rendered_photo_count = _count_rendered_photos(store, cfg.shoot_id, photo_file_keys)
-        if photo_count > 0 and rendered_photo_count == 0:
-            summary = f"{first_error or 'render failed'}; {fail_count}/{photo_count} photo(s) failed"
+        _run_batch_flush(retry_failed=False)
+
+        if photo_count > 0 and rendered_photo_count == 0 and video_count == 0:
+            summary = human_last_error(
+                f"{first_error or 'Render failed'} ({fail_count}/{photo_count} photos)",
+            )
             store.finish_run(
                 cfg.shoot_id,
                 state="FAILED",
@@ -472,8 +515,7 @@ def run() -> int:
                 workerFinishedAt=int(time.time() * 1000),
             )
             log.error("no photo renders succeeded: %s", summary)
-            if video_count == 0:
-                return 1
+            return 1
 
         flush_publish_meta(phase="PUBLISHING_GP")
 
@@ -500,36 +542,41 @@ def run() -> int:
             )
 
         if media_items:
-            result = upload_shoot_media(
-                cfg.gphotos_token_param,
-                cfg.region,
-                cfg.album_title,
-                media_items,
-                [],
-                ledger,
-                save_ledger,
-                s3_client=s3,
-                ledger_lock=ledger_lock,
-                album_file_lock=lambda: album_creation_file_lock(work),
-                on_progress=gphotos_progress,
-                on_album_id=gphotos_hooks["on_album_id"],
-                on_batch_created=gphotos_hooks["on_batch_created"],
-                on_publish_phase=gphotos_hooks["on_publish_phase"],
-            )
-        else:
-            result = {"album_id": ledger.get("album_id"), "created": 0}
-        for sha, item in ledger.get("items", {}).items():
-            if item.get("state") != "CREATED":
-                continue
-            file_key = video_content_sha_to_key.get(sha)
-            if file_key:
-                store.update_image(
-                    cfg.shoot_id,
-                    file_key,
-                    state="PUBLISHED",
-                    mediaType="video",
-                    mediaItemId=item.get("media_item_id"),
+            try:
+                upload_shoot_media(
+                    cfg.gphotos_token_param,
+                    cfg.region,
+                    cfg.album_title,
+                    media_items,
+                    [],
+                    ledger,
+                    save_ledger,
+                    s3_client=s3,
+                    ledger_lock=ledger_lock,
+                    album_file_lock=lambda: album_creation_file_lock(work),
+                    on_progress=gphotos_progress,
+                    on_album_id=gphotos_hooks["on_album_id"],
+                    defer_batch_create=True,
+                    skip_ensure_album=True,
+                    batch_queue=batch_queue,
                 )
+            except Exception as e:
+                log.exception("video upload staging failed")
+                for entry in video_entries:
+                    fk = file_dynamo_key(cfg.shoot_id, entry, raw_s3_key)
+                    _file_error(
+                        store,
+                        cfg.shoot_id,
+                        fk,
+                        human_last_error(str(e)),
+                        "GP_FAILED",
+                    )
+
+        _run_batch_flush(retry_failed=True)
+        result = {
+            "album_id": ledger.get("album_id"),
+            "album_product_url": ledger.get("album_product_url"),
+        }
         flush_publish_meta(phase="PUBLISHING_GP")
 
         published_count = sum(
@@ -556,7 +603,17 @@ def run() -> int:
             ContentType="application/json",
         )
 
-        final_state = "DONE" if published_count >= 1 else "PARTIAL"
+        gp_failed = sum(
+            1
+            for fk in photo_file_keys | video_file_keys
+            if (store.get_image(cfg.shoot_id, fk) or {}).get("state") == "GP_FAILED"
+        )
+        if published_count >= total and gp_failed == 0 and fail_count == 0:
+            final_state = "DONE"
+        elif published_count > 0 or gp_failed > 0 or fail_count > 0:
+            final_state = "PARTIAL"
+        else:
+            final_state = "FAILED"
         album_updates: dict = {
             "state": final_state,
             "phase": final_state,
@@ -569,11 +626,11 @@ def run() -> int:
         }
         if result.get("album_product_url"):
             album_updates["albumProductUrl"] = result.get("album_product_url")
-        if final_state == "PARTIAL":
-            album_updates["lastError"] = (
-                f"Published {published_count}/{total}; {fail_count} photo render failure(s)"
-                if fail_count
-                else f"Published {published_count}/{total}"
+        if final_state in ("PARTIAL", "FAILED"):
+            album_updates["lastError"] = human_last_error(
+                f"Published {published_count}/{total} files"
+                + (f"; {gp_failed} Google Photos failed" if gp_failed else "")
+                + (f"; {fail_count} render failed" if fail_count else ""),
             )
         store.finish_run(cfg.shoot_id, **album_updates)
         log.info("done: %s state=%s published=%s", body, final_state, published_count)
@@ -584,7 +641,7 @@ def run() -> int:
             cfg.shoot_id,
             state="FAILED",
             phase="FAILED",
-            lastError=format_last_error(str(e), log_path),
+            lastError=human_last_error(str(e)),
             workerFinishedAt=int(time.time() * 1000),
         )
         return 1

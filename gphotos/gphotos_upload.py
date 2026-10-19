@@ -21,7 +21,8 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from gphotos.google_http import DEFAULT_TIMEOUT, photos_api_call
+from gphotos.batch_create import BatchCreateQueue, run_batch_create_for_keys
+from gphotos.google_http import DEFAULT_TIMEOUT, build_requests_session, photos_api_call
 
 log = logging.getLogger("gphotos.upload")
 
@@ -258,48 +259,18 @@ def _upload_item(
             save_ledger()
 
 
-def upload_album(
+def _stage_specs_upload_tokens(
     credentials: Credentials,
-    album_title: str,
-    file_paths: list[str],
+    specs: list[MediaUploadItem],
     ledger: dict,
     *,
     save_ledger,
-    s3_client=None,
-    media_items: list[MediaUploadItem] | None = None,
-    ledger_lock: threading.Lock | None = None,
-    http_session=None,
-    album_file_lock=None,
-    on_album_id: Callable[[str, str | None], None] | None = None,
-    on_batch_created: Callable[[int, int], None] | None = None,
-    on_publish_phase: Callable[[], None] | None = None,
-) -> dict:
-    """Upload media to a Google Photos app-created album; mutates ledger in place."""
+    s3_client,
+    ledger_lock: threading.Lock | None,
+    http_session,
+) -> list[str]:
+    """Upload bytes only; return ledger keys awaiting batchCreate."""
     ctx = ledger_lock if ledger_lock is not None else nullcontext()
-    ensure_album(
-        credentials,
-        album_title,
-        ledger,
-        save_ledger=save_ledger,
-        ledger_lock=ledger_lock,
-        http_session=http_session,
-        album_file_lock=album_file_lock,
-        on_album_id=on_album_id,
-    )
-
-    specs: list[MediaUploadItem] = list(media_items or [])
-    if not specs:
-        for p in file_paths:
-            specs.append(
-                MediaUploadItem(
-                    ledger_key=sha256_file(p),
-                    filename=os.path.basename(p),
-                    content_type="image/jpeg",
-                    size_bytes=os.path.getsize(p),
-                    local_path=p,
-                )
-            )
-
     pending: list[str] = []
     for spec in specs:
         k = spec.ledger_key.lower()
@@ -317,68 +288,113 @@ def upload_album(
                 it["media_type"] = "video"
             else:
                 it["media_type"] = "photo"
-            already_created = it.get("state") == "CREATED"
-        if already_created:
+            if it.get("state") == "CREATED":
+                continue
+        try:
+            _upload_item(
+                credentials,
+                spec,
+                ledger["items"][k],
+                save_ledger,
+                s3_client,
+                ledger_lock=ledger_lock,
+                http_session=http_session,
+            )
+        except Exception as e:
+            log.exception("upload bytes failed for %s", k)
+            with ctx:
+                ledger["items"][k].update(state="FAILED_CREATE", error={"message": str(e)[:200]})
+                save_ledger()
             continue
-        _upload_item(
-            credentials,
-            spec,
-            it,
-            save_ledger,
-            s3_client,
-            ledger_lock=ledger_lock,
-            http_session=http_session,
-        )
         with ctx:
             if ledger["items"][k].get("state") == "UPLOADED":
                 pending.append(k)
+    return pending
+
+
+def upload_album(
+    credentials: Credentials,
+    album_title: str,
+    file_paths: list[str],
+    ledger: dict,
+    *,
+    save_ledger,
+    s3_client=None,
+    media_items: list[MediaUploadItem] | None = None,
+    ledger_lock: threading.Lock | None = None,
+    http_session=None,
+    album_file_lock=None,
+    on_album_id: Callable[[str, str | None], None] | None = None,
+    on_batch_created: Callable[[int, int], None] | None = None,
+    on_publish_phase: Callable[[], None] | None = None,
+    defer_batch_create: bool = False,
+    skip_ensure_album: bool = False,
+    batch_queue: BatchCreateQueue | None = None,
+) -> dict:
+    """Upload media to a Google Photos app-created album; mutates ledger in place."""
+    ctx = ledger_lock if ledger_lock is not None else nullcontext()
+    if not skip_ensure_album:
+        ensure_album(
+            credentials,
+            album_title,
+            ledger,
+            save_ledger=save_ledger,
+            ledger_lock=ledger_lock,
+            http_session=http_session,
+            album_file_lock=album_file_lock,
+            on_album_id=on_album_id,
+        )
+
+    specs: list[MediaUploadItem] = list(media_items or [])
+    if not specs:
+        for p in file_paths:
+            specs.append(
+                MediaUploadItem(
+                    ledger_key=sha256_file(p),
+                    filename=os.path.basename(p),
+                    content_type="image/jpeg",
+                    size_bytes=os.path.getsize(p),
+                    local_path=p,
+                )
+            )
+
+    pending = _stage_specs_upload_tokens(
+        credentials,
+        specs,
+        ledger,
+        save_ledger=save_ledger,
+        s3_client=s3_client,
+        ledger_lock=ledger_lock,
+        http_session=http_session,
+    )
+    if batch_queue:
+        for k in pending:
+            batch_queue.enqueue(k)
+
+    if defer_batch_create:
+        n = sum(1 for v in ledger.get("items", {}).values() if v.get("state") == "CREATED")
+        return {
+            "album_id": ledger["album_id"],
+            "album_product_url": ledger.get("album_product_url"),
+            "created": n,
+            "total": len(ledger.get("items", {})),
+            "pending_batch_keys": pending,
+        }
 
     if pending and on_publish_phase:
         on_publish_phase()
 
-    total_created = sum(
-        1 for v in ledger.get("items", {}).values() if v.get("state") == "CREATED"
+    run_batch_create_for_keys(
+        credentials,
+        ledger,
+        pending,
+        save_ledger=save_ledger,
+        ledger_lock=ledger_lock,
+        session=http_session or build_requests_session(),
+        on_batch_created=on_batch_created,
     )
-    for i in range(0, len(pending), 50):
-        batch = pending[i : i + 50]
-        body = {
-            "albumId": ledger["album_id"],
-            "newMediaItems": [
-                {
-                    "simpleMediaItem": {
-                        "fileName": ledger["items"][k].get("filename")
-                        or os.path.basename(ledger["items"][k].get("path", f"media-{k[:8]}")),
-                        "uploadToken": ledger["items"][k]["upload_token"],
-                    }
-                }
-                for k in batch
-            ],
-        }
-        res = call(
-            credentials,
-            "POST",
-            f"{API}/mediaItems:batchCreate",
-            json=body,
-            session=http_session,
-        ).json().get("newMediaItemResults", [])
-        created_in_batch = 0
-        with ctx:
-            for k, item_res in zip(batch, res):
-                st = item_res.get("status", {})
-                if item_res.get("mediaItem") and st.get("code", 0) == 0:
-                    ledger["items"][k].update(
-                        state="CREATED", media_item_id=item_res["mediaItem"]["id"]
-                    )
-                    ledger["items"][k].pop("upload_token", None)
-                    created_in_batch += 1
-                else:
-                    ledger["items"][k].update(state="FAILED_CREATE", error=st)
-            save_ledger()
-        if on_batch_created and created_in_batch:
-            total_created += created_in_batch
-            on_batch_created(created_in_batch, total_created)
 
-    n = sum(1 for v in ledger.get("items", {}).values() if v["state"] == "CREATED")
+    n = sum(1 for v in ledger.get("items", {}).values() if v.get("state") == "CREATED")
     return {
         "album_id": ledger["album_id"],
         "album_product_url": ledger.get("album_product_url"),

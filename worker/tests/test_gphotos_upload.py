@@ -59,7 +59,20 @@ def test_upload_album_ledger_key_is_manifest_sha_not_jpeg_hash(tmp_path):
     def save_ledger():
         saved.append(json.loads(json.dumps(ledger)))
 
-    with patch("gphotos.gphotos_upload.call", side_effect=_mock_call_album):
+    def _mock_batch_http(credentials, body, *, session, max_wait_s=600):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "newMediaItemResults": [
+                {"status": {"code": 0}, "mediaItem": {"id": "media-1"}},
+            ]
+        }
+        return resp
+
+    with patch("gphotos.gphotos_upload.call", side_effect=_mock_call_album), patch(
+        "gphotos.batch_create._batch_create_http",
+        side_effect=_mock_batch_http,
+    ):
         upload_album(
             MagicMock(),
             "title",
