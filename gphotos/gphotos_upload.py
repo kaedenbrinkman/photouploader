@@ -14,10 +14,16 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, Iterator
 
+import logging
+
 import requests
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+
+from gphotos.google_http import photos_api_call
+
+log = logging.getLogger("gphotos.upload")
 
 SCOPES = [
     "https://www.googleapis.com/auth/photoslibrary.appendonly",
@@ -61,27 +67,9 @@ def creds(client_secret, token_path):
     return c
 
 
-def call(c, method, url, **kw):
-    r = None
-    for attempt in range(8):
-        if not c.valid:
-            c.refresh(Request())
-        h = kw.pop("headers", {})
-        h["Authorization"] = f"Bearer {c.token}"
-        r = requests.request(method, url, headers=h, timeout=300, **kw)
-        kw["headers"] = h
-        if r.status_code == 429:
-            time.sleep(max(30, 2**attempt * 5) + random.random())
-            continue
-        if r.status_code >= 500:
-            time.sleep(2**attempt + random.random())
-            continue
-        if r.status_code == 401:
-            c.refresh(Request())
-            continue
-        r.raise_for_status()
-        return r
-    raise RuntimeError(f"giving up on {method} {url}: {r.status_code if r else '?'}")
+def call(c, method, url, session=None, **kw):
+    """Photos Library API call with bounded retries and HTTP timeouts."""
+    return photos_api_call(c, method, url, session=session, **kw)
 
 
 def sha256_file(path: str) -> str:
@@ -178,24 +166,35 @@ def ensure_album(
     *,
     save_ledger: Callable[[], None],
     ledger_lock: threading.Lock | None = None,
+    http_session=None,
+    album_file_lock=None,
 ) -> str:
     """Create the app album once; safe under concurrent worker threads."""
     ctx = ledger_lock if ledger_lock is not None else nullcontext()
+    file_lock_ctx = album_file_lock() if album_file_lock is not None else nullcontext()
 
-    with ctx:
-        existing = ledger.get("album_id")
+    with file_lock_ctx:
+        with ctx:
+            existing = ledger.get("album_id")
         if existing:
+            log.info("gphotos: using existing album_id=%s", existing)
             return existing
+        log.info("gphotos: creating Google Photos album title=%r", album_title[:80])
         led_album = call(
             credentials,
             "POST",
             f"{API}/albums",
             json={"album": {"title": album_title[:500]}},
+            session=http_session,
         ).json()
-        ledger["album_id"] = led_album["id"]
-        if led_album.get("productUrl"):
-            ledger["album_product_url"] = led_album["productUrl"]
-        save_ledger()
+        with ctx:
+            if ledger.get("album_id"):
+                return ledger["album_id"]
+            ledger["album_id"] = led_album["id"]
+            if led_album.get("productUrl"):
+                ledger["album_product_url"] = led_album["productUrl"]
+            save_ledger()
+        log.info("gphotos: album created id=%s", ledger["album_id"])
         return ledger["album_id"]
 
 
@@ -206,6 +205,7 @@ def _upload_item(
     save_ledger: Callable[[], None],
     s3_client,
     ledger_lock: threading.Lock | None = None,
+    http_session=None,
 ) -> None:
     ctx = ledger_lock if ledger_lock is not None else nullcontext()
     with ctx:
@@ -240,6 +240,7 @@ def _upload_item(
                         "X-Goog-Upload-Content-Type": item.content_type,
                         "X-Goog-Upload-Protocol": "raw",
                     },
+                    session=http_session,
                 )
             token = r.text
         with ctx:
@@ -259,6 +260,8 @@ def upload_album(
     s3_client=None,
     media_items: list[MediaUploadItem] | None = None,
     ledger_lock: threading.Lock | None = None,
+    http_session=None,
+    album_file_lock=None,
 ) -> dict:
     """Upload media to a Google Photos app-created album; mutates ledger in place."""
     ctx = ledger_lock if ledger_lock is not None else nullcontext()
@@ -268,6 +271,8 @@ def upload_album(
         ledger,
         save_ledger=save_ledger,
         ledger_lock=ledger_lock,
+        http_session=http_session,
+        album_file_lock=album_file_lock,
     )
 
     specs: list[MediaUploadItem] = list(media_items or [])
@@ -299,7 +304,15 @@ def upload_album(
             already_created = it.get("state") == "CREATED"
         if already_created:
             continue
-        _upload_item(credentials, spec, it, save_ledger, s3_client, ledger_lock=ledger_lock)
+        _upload_item(
+            credentials,
+            spec,
+            it,
+            save_ledger,
+            s3_client,
+            ledger_lock=ledger_lock,
+            http_session=http_session,
+        )
         with ctx:
             if ledger["items"][k].get("state") == "UPLOADED":
                 pending.append(k)
@@ -320,7 +333,11 @@ def upload_album(
             ],
         }
         res = call(
-            credentials, "POST", f"{API}/mediaItems:batchCreate", json=body
+            credentials,
+            "POST",
+            f"{API}/mediaItems:batchCreate",
+            json=body,
+            session=http_session,
         ).json().get("newMediaItemResults", [])
         with ctx:
             for k, item_res in zip(batch, res):

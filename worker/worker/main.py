@@ -20,6 +20,7 @@ from worker.config import WorkerConfig
 from worker.disk_space import require_free_bytes
 from worker.dynamo_store import DynamoStore
 from worker.failure_report import format_last_error
+from worker.gphotos_album_lock import album_creation_file_lock
 from worker.gphotos_client import ensure_shoot_album, upload_shoot_media
 from worker.jpeg_resume import try_fetch_existing_jpeg
 from worker.lightcraft_runner import (
@@ -184,7 +185,8 @@ def run() -> int:
             videoCount=video_count,
             phase="RENDERING",
         )
-        for entry in all_files:
+        store.update_shoot(cfg.shoot_id, phase="SYNCING_FILES")
+        for idx, entry in enumerate(all_files, start=1):
             file_key = file_dynamo_key(cfg.shoot_id, entry, raw_s3_key)
             media_type = "video" if is_video_manifest_entry(entry) else "photo"
             store.update_image(
@@ -194,6 +196,8 @@ def run() -> int:
                 originalName=entry.get("original_name"),
                 contentSha256=entry["sha256"].lower(),
             )
+            if idx == 1 or idx == total or idx % 50 == 0:
+                log.info("synced FILE# rows %s/%s", idx, total)
 
         ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {"album_id": None, "items": {}}
         if shoot_meta.get("albumId") and not ledger.get("album_id"):
@@ -209,16 +213,35 @@ def run() -> int:
                 tmp.write_text(json.dumps(ledger, indent=1))
                 tmp.replace(ledger_path)
 
+        def gphotos_progress(phase: str) -> None:
+            log.info("gphotos progress phase=%s", phase)
+            store.update_shoot(cfg.shoot_id, phase=phase)
+
         needs_gphotos = bool(photo_entries or video_entries)
         if needs_gphotos:
-            ensure_shoot_album(
-                cfg.gphotos_token_param,
-                cfg.region,
-                cfg.album_title,
-                ledger,
-                save_ledger,
-                ledger_lock=ledger_lock,
-            )
+            album_file_lock = lambda: album_creation_file_lock(work)
+            try:
+                ensure_shoot_album(
+                    cfg.gphotos_token_param,
+                    cfg.region,
+                    cfg.album_title,
+                    ledger,
+                    save_ledger,
+                    ledger_lock=ledger_lock,
+                    album_file_lock=album_file_lock,
+                    on_progress=gphotos_progress,
+                )
+            except Exception as e:
+                msg = format_last_error(str(e), log_path)
+                log.exception("gphotos ensure album failed")
+                store.finish_run(
+                    cfg.shoot_id,
+                    state="FAILED",
+                    phase="GP_FAILED",
+                    lastError=msg,
+                    workerFinishedAt=int(time.time() * 1000),
+                )
+                return 1
             album_meta: dict = {}
             if ledger.get("album_id"):
                 album_meta["albumId"] = ledger["album_id"]
@@ -226,12 +249,19 @@ def run() -> int:
                 album_meta["albumProductUrl"] = ledger["album_product_url"]
             if album_meta:
                 store.update_shoot(cfg.shoot_id, **album_meta)
+            log.info("gphotos album ready album_id=%s", ledger.get("album_id"))
 
         render_started_at = int(time.time() * 1000)
-        store.update_shoot(cfg.shoot_id, phase="RENDERING", renderStartedAt=render_started_at)
         first_error: str | None = None
         fail_count = 0
         pipeline_workers = max(1, min(PIPELINE_WINDOW, cfg.max_parallel_renders))
+        store.update_shoot(cfg.shoot_id, phase="RENDERING", renderStartedAt=render_started_at)
+        log.info(
+            "pipeline start photos=%s videos=%s workers=%s",
+            photo_count,
+            video_count,
+            pipeline_workers,
+        )
 
         def _sync_photo_gp_created(content_sha: str, file_key: str) -> bool:
             with ledger_lock:
@@ -305,6 +335,8 @@ def run() -> int:
                     save_ledger,
                     s3_client=s3,
                     ledger_lock=ledger_lock,
+                    album_file_lock=lambda: album_creation_file_lock(work),
+                    on_progress=gphotos_progress,
                 )
                 _sync_photo_gp_created(content_sha, file_key)
                 return content_sha, None
@@ -388,6 +420,8 @@ def run() -> int:
             save_ledger,
             s3_client=s3,
             ledger_lock=ledger_lock,
+            album_file_lock=lambda: album_creation_file_lock(work),
+            on_progress=gphotos_progress,
         )
         for sha, item in ledger.get("items", {}).items():
             if item.get("state") != "CREATED":
