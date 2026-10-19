@@ -11,6 +11,7 @@ if str(_GPHOTOS_ROOT) not in sys.path:
     sys.path.insert(0, str(_GPHOTOS_ROOT))
 
 for _mod in (
+    "requests",
     "google",
     "google.auth",
     "google.auth.transport",
