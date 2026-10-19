@@ -81,6 +81,8 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     albumId,
     albumProductUrl: albumOpenUrl(albumId, albumProductUrl),
     instanceId: meta.Item.instanceId,
+    instanceType: meta.Item.instanceType,
+    spot: meta.Item.spot,
     missingKeys: meta.Item.missingKeys,
     progress,
     estimateAtSubmit: meta.Item.estimateAtSubmit,

@@ -13,6 +13,24 @@ class LocalPricingEstimator private constructor(private val table: PricingTable)
 
     constructor(pricingJsonString: String) : this(parse(pricingJsonString))
 
+    val ec2: Ec2Pricing get() = table.ec2
+
+    fun runningActualCompute(
+        workerStartedAtMs: Long?,
+        workerFinishedAtMs: Long?,
+        instanceType: String?,
+        spot: Boolean?,
+        nowMs: Long,
+    ): RunningComputeEstimate.RunningCost? =
+        RunningComputeEstimate.runningActualCompute(
+            workerStartedAtMs,
+            workerFinishedAtMs,
+            instanceType,
+            spot,
+            nowMs,
+            table.ec2,
+        )
+
     fun estimateShoot(
         photoCount: Int,
         videoCount: Int,

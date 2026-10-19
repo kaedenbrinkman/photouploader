@@ -93,6 +93,8 @@ data class ShootUiState(
     val uploadedElsewhereHandles: Set<Long> = emptySet(),
     val serverFileStatusBySha: Map<String, String> = emptyMap(),
     val processingStartedAtMs: Long? = null,
+    val workerInstanceType: String? = null,
+    val workerSpot: Boolean? = null,
 )
 
 class ShootViewModel(
@@ -156,6 +158,8 @@ class ShootViewModel(
                     } else {
                         null
                     },
+                workerInstanceType = repo.processingWorkerInstanceType(shootId),
+                workerSpot = repo.processingWorkerSpot(shootId),
                 statusLine = uploadStatusLine(
                     resume = resume,
                     step = initialStep,
@@ -816,6 +820,8 @@ class ShootViewModel(
                                 serverLaunchErrorCode = it.launchErrorCode,
                                 serverLastError = it.lastError,
                                 processingStartedAtMs = workerStarted,
+                                workerInstanceType = it.instanceType ?: repo.processingWorkerInstanceType(shootId),
+                                workerSpot = it.spot ?: repo.processingWorkerSpot(shootId),
                                 serverProcessingError = if (!it.lastError.isNullOrBlank()) friendly else null,
                                 finalizeError = if (clearedStaleClientError) null else _ui.value.finalizeError,
                                 finalizeState = if (clearedStaleClientError && _ui.value.finalizeState == FinalizeState.Failed) {

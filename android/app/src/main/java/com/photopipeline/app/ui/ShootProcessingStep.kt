@@ -29,6 +29,8 @@ import androidx.compose.ui.unit.dp
 import com.photopipeline.app.api.FinalizeErrorMessages
 import com.photopipeline.app.data.FileEntity
 import com.photopipeline.app.data.ShootEntity
+import com.photopipeline.app.pricing.Ec2Pricing
+import com.photopipeline.app.pricing.RunningComputeEstimate
 import kotlinx.coroutines.delay
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -49,6 +51,9 @@ fun ProcessingStepScreen(
     serverLastError: String?,
     finalizeInProgress: Boolean,
     processingStartedAtMs: Long?,
+    workerInstanceType: String?,
+    workerSpot: Boolean?,
+    ec2Pricing: Ec2Pricing?,
     busy: Boolean,
     thumbnailForHandle: (Long) -> ByteArray?,
     onRetryProcessing: () -> Unit,
@@ -137,10 +142,22 @@ fun ProcessingStepScreen(
             }
         }
 
-        shoot.actualComputeJson?.let {
+        val runningCost = ec2Pricing?.let { ec2 ->
+            RunningComputeEstimate.runningActualCompute(
+                workerStartedAtMs = processingStartedAtMs,
+                workerFinishedAtMs = null,
+                instanceType = workerInstanceType,
+                spot = workerSpot,
+                nowMs = nowMs,
+                ec2 = ec2,
+            )
+        } ?: shoot.actualComputeJson?.let {
             val o = JSONObject(it)
             val sec = o.optInt("seconds", 0)
             val usd = o.optDouble("usd", 0.0)
+            RunningComputeEstimate.RunningCost(sec, usd)
+        }
+        runningCost?.let { (sec, usd) ->
             Text(
                 "Running cost · ${sec}s · ~$${"%.4f".format(usd)}",
                 style = MaterialTheme.typography.bodyMedium,

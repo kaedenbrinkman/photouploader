@@ -15,6 +15,7 @@ import com.photopipeline.app.api.FinalizeStartRecovery
 import com.photopipeline.app.core.cameraFileIdentityKey
 import com.photopipeline.app.core.cameraFileMatchKey
 import com.photopipeline.app.core.metadataUploadSha256
+import com.photopipeline.app.pricing.Ec2Pricing
 import com.photopipeline.app.pricing.LocalPricingEstimator
 import com.photopipeline.app.mtp.MtpRepository
 import com.photopipeline.app.mtp.MtpObjectInfo
@@ -47,6 +48,8 @@ class Repository(
     private val appContext = context.applicationContext
     val mtp: MtpRepository = mtpOverride ?: error("MtpRepository required")
     private val prefs = appContext.getSharedPreferences("photopipeline", Context.MODE_PRIVATE)
+
+    val ec2Pricing: Ec2Pricing get() = localPricing.ec2
     private val googleHttp = OkHttpClient.Builder().build()
 
     val api: ApiClient = ApiClient(
@@ -721,6 +724,8 @@ class Repository(
             }
             status.workerStartedAt?.let { put("workerStartedAt", it) }
             status.renderStartedAt?.let { put("renderStartedAt", it) }
+            status.instanceType?.let { put("instanceType", it) }
+            if (status.spot != null) put("spot", status.spot)
         }
         if (progressPayload.isNotEmpty()) {
             prefs.edit().putString(
@@ -759,6 +764,21 @@ class Repository(
         return runCatching {
             val o = JSONObject(raw)
             o.optLong("workerStartedAt").takeIf { it > 0L }
+        }.getOrNull()
+    }
+
+    fun processingWorkerInstanceType(shootId: String): String? {
+        val raw = processingProgressJson(shootId) ?: return null
+        return runCatching {
+            JSONObject(raw).optString("instanceType").takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
+
+    fun processingWorkerSpot(shootId: String): Boolean? {
+        val raw = processingProgressJson(shootId) ?: return null
+        return runCatching {
+            val o = JSONObject(raw)
+            if (!o.has("spot")) null else o.optBoolean("spot")
         }.getOrNull()
     }
 
