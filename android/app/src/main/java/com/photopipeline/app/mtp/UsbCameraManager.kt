@@ -211,6 +211,9 @@ class UsbCameraManager(private val appContext: Context) {
                 _selectedDevice.value = openDev
                 if (usbManager.hasPermission(openDev)) {
                     _accessState.value = UsbAccessState.READY
+                    if (_cameraSnapshot.value == null) {
+                        updateCameraSnapshotLocked(sessionMtp!!)
+                    }
                     if (log) {
                         PipelineLog.d(
                             "usb-probe",
@@ -240,6 +243,9 @@ class UsbCameraManager(private val appContext: Context) {
         synchronized(sessionLock) {
             if (sessionMtp != null && sessionDevice?.deviceName == canon.deviceName) {
                 _accessState.value = UsbAccessState.READY
+                if (_cameraSnapshot.value == null) {
+                    updateCameraSnapshotLocked(sessionMtp!!)
+                }
                 if (log) PipelineLog.d("usb-probe", "state=READY (existing MTP session)")
                 return _accessState.value
             }
@@ -297,7 +303,7 @@ class UsbCameraManager(private val appContext: Context) {
     private fun autoRequestUsbPermissionIfNeeded() {
         val device = findCanonDevice() ?: return
         if (usbManager.hasPermission(device)) {
-            if (_accessState.value != UsbAccessState.READY) {
+            if (_accessState.value != UsbAccessState.READY || _cameraSnapshot.value == null) {
                 refreshProbe(log = false)
             }
             return
@@ -317,6 +323,30 @@ class UsbCameraManager(private val appContext: Context) {
     suspend fun requestPermissionSuspend(): Boolean = suspendCancellableCoroutine { cont ->
         requestPermission { granted ->
             if (cont.isActive) cont.resume(granted)
+        }
+    }
+
+    /**
+     * Home screen entry: probe USB, show the permission dialog while the activity is visible,
+     * then open MTP and populate [cameraSnapshot] without starting a shoot.
+     */
+    suspend fun ensureHomeCameraConnection() {
+        refreshProbe(log = true)
+        when (_accessState.value) {
+            UsbAccessState.PERMISSION_REQUIRED -> {
+                if (!requestPermissionSuspend()) return
+                refreshProbe(log = true)
+            }
+            UsbAccessState.PERMISSION_DENIED -> {
+                if (!requestPermissionSuspend()) return
+                refreshProbe(log = true)
+            }
+            else -> Unit
+        }
+        val device = findCanonDevice() ?: return
+        if (!usbManager.hasPermission(device)) return
+        if (_accessState.value != UsbAccessState.READY || _cameraSnapshot.value == null) {
+            refreshProbe(log = true)
         }
     }
 

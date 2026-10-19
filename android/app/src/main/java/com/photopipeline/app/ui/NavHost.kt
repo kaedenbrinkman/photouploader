@@ -97,6 +97,9 @@ import com.photopipeline.app.core.AppDefaults
 import androidx.compose.foundation.background
 import androidx.compose.material3.Switch
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -172,6 +175,20 @@ fun HomeScreen(
     DisposableEffect(signInHelper) {
         signInHelper.bindCoordinator()
         onDispose { signInHelper.unbindCoordinator() }
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(usbState) {
+        usb.ensureHomeCameraConnection()
+    }
+    DisposableEffect(lifecycleOwner, usb) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                scope.launch { usb.ensureHomeCameraConnection() }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     Scaffold(
