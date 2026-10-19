@@ -1,5 +1,6 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DeleteCommand, DynamoDBDocumentClient, GetCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { deleteStatelessFilePlaceholders } from './file-placeholder-cleanup';
 import { EC2Client } from '@aws-sdk/client-ec2';
 import { GetObjectCommand, HeadObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
@@ -12,7 +13,6 @@ import {
   filterS3KeysMissing,
   manifestKeysMissingFromDynamo,
   spotCheckManifestOnS3,
-  statelessPlaceholderFileKeys,
   type DynamoManifestFileRow,
 } from './manifest-upload-ready';
 import { launchWorkerForShoot } from './finalize-launch-worker';
@@ -301,14 +301,17 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     forceReprocess = false;
   }
 
-  const fileRowsRes = await ddb.send(
+  const tableName = process.env.TABLE_NAME!;
+  await deleteStatelessFilePlaceholders(ddb, tableName, shootId);
+
+  const fileRowsResClean = await ddb.send(
     new QueryCommand({
-      TableName: process.env.TABLE_NAME,
+      TableName: tableName,
       KeyConditionExpression: 'pk = :pk AND begins_with(sk, :f)',
       ExpressionAttributeValues: { ':pk': `SHOOT#${shootId}`, ':f': 'FILE#' },
     }),
   );
-  const dynamoFileRows: DynamoManifestFileRow[] = (fileRowsRes.Items ?? []).map((it) => ({
+  const dynamoFileRowsClean: DynamoManifestFileRow[] = (fileRowsResClean.Items ?? []).map((it) => ({
     fileKey: String(it.sk ?? '')
       .replace(/^FILE#/, '')
       .toLowerCase(),
@@ -316,16 +319,7 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     state: it.state as string | undefined,
     sizeBytes: it.sizeBytes as number | undefined,
   }));
-
-  for (const placeholderKey of statelessPlaceholderFileKeys(dynamoFileRows)) {
-    await ddb.send(
-      new DeleteCommand({
-        TableName: process.env.TABLE_NAME,
-        Key: { pk: `SHOOT#${shootId}`, sk: `FILE#${placeholderKey}` },
-      }),
-    );
-  }
-  const fileRows = dynamoFileRows.map((it) => ({ state: it.state }));
+  const fileRows = dynamoFileRowsClean.map((it) => ({ state: it.state }));
 
   if (meta.Item.state === 'DONE' && !canReprocessShoot(meta.Item, fileRows, { force: forceReprocess })) {
     return json(202, { state: 'DONE', instanceId: meta.Item.instanceId });
@@ -379,7 +373,7 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
       }
     };
 
-    const missingFromDynamo = manifestKeysMissingFromDynamo(shootId, manifestFiles, dynamoFileRows);
+    const missingFromDynamo = manifestKeysMissingFromDynamo(shootId, manifestFiles, dynamoFileRowsClean);
     if (missingFromDynamo.length) {
       const s3Missing = await filterS3KeysMissing(missingFromDynamo, expectedSizeByKey, headContentLength);
       if (s3Missing.length) {

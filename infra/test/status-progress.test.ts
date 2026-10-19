@@ -23,6 +23,18 @@ describe('progressCountsFromFiles', () => {
       publishedVideoCount: 1,
     });
   });
+
+  it('ignores stateless placeholder FILE rows', () => {
+    const files = [
+      { state: 'GP_CREATED', mediaType: 'photo' },
+      { mediaType: 'photo' },
+      { state: '', mediaType: 'photo' },
+      ...Array.from({ length: 370 }, () => ({ state: undefined, mediaType: 'photo' as const })),
+    ];
+    const counts = progressCountsFromFiles(files);
+    expect(counts.photoCount).toBe(1);
+    expect(counts.publishedPhotoCount).toBe(1);
+  });
 });
 
 describe('mergeProgress', () => {
@@ -33,6 +45,23 @@ describe('mergeProgress', () => {
     expect(merged.totalFiles).toBe(13);
     expect(merged.uploadCompleteCount).toBe(0);
     expect(merged.photoCount).toBe(2);
+  });
+
+  it('prefers META photoCount over inflated stateless FILE rows', () => {
+    const files = [
+      { state: 'RENDERED', mediaType: 'photo' },
+      ...Array.from({ length: 370 }, () => ({ mediaType: 'photo' as const })),
+    ];
+    const merged = mergeProgress(files, {
+      totalFiles: 374,
+      photoCount: 362,
+      videoCount: 12,
+      renderedPhotoCount: 40,
+    });
+    expect(merged.photoCount).toBe(362);
+    expect(merged.videoCount).toBe(12);
+    expect(merged.totalFiles).toBe(374);
+    expect(merged.renderedPhotoCount).toBe(1);
   });
 
   it('ignores inflated meta renderedCount when file rows exist', () => {

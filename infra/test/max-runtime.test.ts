@@ -13,6 +13,12 @@ describe('computeMaxRuntimeMinutes', () => {
     expect(large).toBeLessThanOrEqual(120);
   });
 
+  it('allows enough wall clock for a 362-photo CR3 shoot', () => {
+    const mins = computeMaxRuntimeMinutes(362);
+    expect(mins).toBeGreaterThanOrEqual(45);
+    expect(mins).toBeLessThanOrEqual(120);
+  });
+
   it('adds runtime for large video byte volume', () => {
     const photosOnly = computeMaxRuntimeMinutes(10, 0);
     const withVideo = computeMaxRuntimeMinutes(10, 20 * 1024 ** 3);

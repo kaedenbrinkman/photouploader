@@ -110,7 +110,10 @@ export function computeMaxRuntimeMinutes(photoCount: number, videoBytes = 0): nu
   const instanceType =
     totalFiles < 50 ? (ec2.instanceTypeOrder[1] ?? ec2.instanceTypeOrder[0]) : ec2.instanceTypeOrder[0];
   const par = ec2.parallelism[instanceType] ?? 4;
-  const secondsPerFile = ec2.secondsPerImageAtReferenceParallelism / par;
+  const runtimeSecondsPerPhoto =
+    Number(ec2.maxRuntimeSecondsPerPhotoAtParallelism) ||
+    ec2.secondsPerImageAtReferenceParallelism * 3;
+  const secondsPerFile = runtimeSecondsPerPhoto / par;
   const photoMinutes =
     photos > 0 ? Math.ceil(photos * (secondsPerFile / 60) * MAX_RUNTIME_SAFETY_FACTOR) : 0;
   const secondsPerGb = Number(ec2.videoUploadSecondsPerGb ?? 90);

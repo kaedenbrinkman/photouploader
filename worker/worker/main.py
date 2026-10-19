@@ -26,6 +26,7 @@ from worker.lightcraft_runner import (
     render_jpeg,
     validate_jpeg,
 )
+from worker.file_keys import file_dynamo_key
 from worker.media_kind import (
     content_type_for_name,
     is_video_manifest_entry,
@@ -119,10 +120,10 @@ def manage_shutdown_backstop(*, cancel: bool, arm_idle_minutes: int | None = Non
         log.exception("shutdown backstop update failed")
 
 
-def _count_rendered_photos(store: DynamoStore, shoot_id: str, photo_shas: set[str]) -> int:
+def _count_rendered_photos(store: DynamoStore, shoot_id: str, photo_keys: set[str]) -> int:
     n = 0
-    for sha in photo_shas:
-        st = (store.get_image(shoot_id, sha) or {}).get("state")
+    for file_key in photo_keys:
+        st = (store.get_image(shoot_id, file_key) or {}).get("state")
         if st in ("RENDERED", "GP_CREATED", "PUBLISHED"):
             n += 1
     return n
@@ -166,8 +167,11 @@ def run() -> int:
         manifest = load_manifest(s3, cfg.bucket, cfg.shoot_id)
         all_files = manifest.get("files", [])
         photo_entries, video_entries, _video_bytes = split_manifest_files(all_files)
-        photo_shas = {f["sha256"].lower() for f in photo_entries}
-        video_shas = {f["sha256"].lower() for f in video_entries}
+        photo_file_keys = {file_dynamo_key(cfg.shoot_id, f, raw_s3_key) for f in photo_entries}
+        video_file_keys = {file_dynamo_key(cfg.shoot_id, f, raw_s3_key) for f in video_entries}
+        video_content_sha_to_key = {
+            f["sha256"].lower(): file_dynamo_key(cfg.shoot_id, f, raw_s3_key) for f in video_entries
+        }
         total = len(all_files)
         photo_count = len(photo_entries)
         video_count = len(video_entries)
@@ -179,13 +183,14 @@ def run() -> int:
             phase="RENDERING",
         )
         for entry in all_files:
-            sha = entry["sha256"].lower()
+            file_key = file_dynamo_key(cfg.shoot_id, entry, raw_s3_key)
             media_type = "video" if is_video_manifest_entry(entry) else "photo"
             store.update_image(
                 cfg.shoot_id,
-                sha,
+                file_key,
                 mediaType=media_type,
                 originalName=entry.get("original_name"),
+                contentSha256=entry["sha256"].lower(),
             )
 
         ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {"album_id": None, "items": {}}
@@ -206,34 +211,38 @@ def run() -> int:
         pipeline_workers = max(1, min(PIPELINE_WINDOW, cfg.max_parallel_renders))
 
         def pipeline_one_photo(entry: dict) -> tuple[str, str | None]:
-            sha = entry["sha256"].lower()
-            existing = store.get_image(cfg.shoot_id, sha)
+            file_key = file_dynamo_key(cfg.shoot_id, entry, raw_s3_key)
+            content_sha = entry["sha256"].lower()
+            existing = store.get_image(cfg.shoot_id, file_key)
             if existing and existing.get("state") in ("GP_CREATED", "PUBLISHED"):
-                return sha, None
+                return content_sha, None
             raw: Path | None = None
-            out = out_dir / f"{sha}.jpg"
+            out = out_dir / f"{content_sha}.jpg"
+            jpeg_key = f"shoots/{cfg.shoot_id}/jpeg/{cfg.settings_hash}/{content_sha}.jpg"
             try:
-                raw = download_one_raw(s3, cfg.bucket, cfg.shoot_id, entry, raw_dir, work)
-                if not out.exists():
+                if existing and existing.get("state") == "RENDERED" and not out.exists():
+                    try:
+                        s3.download_file(cfg.bucket, jpeg_key, str(out))
+                    except Exception:
+                        pass
+                needs_render = not out.exists()
+                if needs_render:
+                    raw = download_one_raw(s3, cfg.bucket, cfg.shoot_id, entry, raw_dir, work)
                     render_jpeg(
                         cfg.lightcraft_bin,
                         raw,
                         out,
                         settings_hash=cfg.settings_hash,
                     )
-                validate_jpeg(out)
-                store.update_image(
-                    cfg.shoot_id,
-                    sha,
-                    state="RENDERED",
-                    settingsHash=cfg.settings_hash,
-                    mediaType="photo",
-                )
-                s3.upload_file(
-                    str(out),
-                    cfg.bucket,
-                    f"shoots/{cfg.shoot_id}/jpeg/{cfg.settings_hash}/{sha}.jpg",
-                )
+                    validate_jpeg(out)
+                    store.update_image(
+                        cfg.shoot_id,
+                        file_key,
+                        state="RENDERED",
+                        settingsHash=cfg.settings_hash,
+                        mediaType="photo",
+                    )
+                    s3.upload_file(str(out), cfg.bucket, jpeg_key)
                 upload_shoot_media(
                     cfg.gphotos_token_param,
                     cfg.region,
@@ -244,22 +253,22 @@ def run() -> int:
                     save_ledger,
                     s3_client=s3,
                 )
-                item = ledger.get("items", {}).get(sha, {})
+                item = ledger.get("items", {}).get(content_sha, {})
                 if item.get("state") == "CREATED":
                     store.update_image(
                         cfg.shoot_id,
-                        sha,
+                        file_key,
                         state="GP_CREATED",
                         mediaType="photo",
                         mediaItemId=item.get("media_item_id"),
                     )
-                return sha, None
+                return content_sha, None
             except PreviewOnlyError as e:
-                _file_error(store, cfg.shoot_id, sha, str(e), "PREVIEW_ONLY")
-                return sha, str(e)
+                _file_error(store, cfg.shoot_id, file_key, str(e), "PREVIEW_ONLY")
+                return content_sha, str(e)
             except LightcraftRenderError as e:
-                _file_error(store, cfg.shoot_id, sha, str(e), "FAILED_RENDER")
-                return sha, str(e)
+                _file_error(store, cfg.shoot_id, file_key, str(e), "FAILED_RENDER")
+                return content_sha, str(e)
             finally:
                 if raw is not None:
                     _safe_unlink(raw)
@@ -274,7 +283,7 @@ def run() -> int:
                         fail_count += 1
                         if first_error is None:
                             first_error = err
-                    rendered_count = _count_rendered_photos(store, cfg.shoot_id, photo_shas)
+                    rendered_count = _count_rendered_photos(store, cfg.shoot_id, photo_file_keys)
                     store.update_shoot(
                         cfg.shoot_id,
                         renderedCount=rendered_count,
@@ -283,7 +292,7 @@ def run() -> int:
                     )
                     log.info("pipeline photo %s err=%s (%s/%s)", sha, err, rendered_count, photo_count)
 
-        rendered_photo_count = _count_rendered_photos(store, cfg.shoot_id, photo_shas)
+        rendered_photo_count = _count_rendered_photos(store, cfg.shoot_id, photo_file_keys)
         if photo_count > 0 and rendered_photo_count == 0:
             summary = f"{first_error or 'render failed'}; {fail_count}/{photo_count} photo(s) failed"
             store.finish_run(
@@ -304,17 +313,18 @@ def run() -> int:
 
         media_items: list[MediaUploadItem] = []
         for entry in video_entries:
-            sha = entry["sha256"].lower()
-            existing = store.get_image(cfg.shoot_id, sha)
+            file_key = file_dynamo_key(cfg.shoot_id, entry, raw_s3_key)
+            content_sha = entry["sha256"].lower()
+            existing = store.get_image(cfg.shoot_id, file_key)
             if existing and existing.get("state") == "PUBLISHED":
                 continue
             key = raw_s3_key(cfg.shoot_id, entry)
-            name = entry.get("original_name") or f"{sha}.mp4"
+            name = entry.get("original_name") or f"{content_sha}.mp4"
             size = int(entry.get("size_bytes") or 0)
             require_free_bytes(work, min(size, 512 * 1024 * 1024))
             media_items.append(
                 MediaUploadItem(
-                    ledger_key=sha,
+                    ledger_key=content_sha,
                     filename=os.path.basename(name),
                     content_type=content_type_for_name(name),
                     size_bytes=size,
@@ -336,10 +346,11 @@ def run() -> int:
         for sha, item in ledger.get("items", {}).items():
             if item.get("state") != "CREATED":
                 continue
-            if sha in video_shas:
+            file_key = video_content_sha_to_key.get(sha)
+            if file_key:
                 store.update_image(
                     cfg.shoot_id,
-                    sha,
+                    file_key,
                     state="PUBLISHED",
                     mediaType="video",
                     mediaItemId=item.get("media_item_id"),
@@ -347,8 +358,8 @@ def run() -> int:
 
         published_count = sum(
             1
-            for sha in photo_shas | video_shas
-            if (store.get_image(cfg.shoot_id, sha) or {}).get("state") in ("GP_CREATED", "PUBLISHED")
+            for file_key in photo_file_keys | video_file_keys
+            if (store.get_image(cfg.shoot_id, file_key) or {}).get("state") in ("GP_CREATED", "PUBLISHED")
         )
 
         results_key = f"shoots/{cfg.shoot_id}/results.json"

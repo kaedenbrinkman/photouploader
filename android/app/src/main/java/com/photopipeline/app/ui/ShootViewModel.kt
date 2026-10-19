@@ -631,13 +631,16 @@ class ShootViewModel(
             .onSuccess {
                 finalizeInFlight = false
                 autoFinalizeScheduled = false
+                repo.clearFinalizeError(shootId)
                 _ui.value = _ui.value.copy(
                     busy = false,
                     finalizeState = FinalizeState.Idle,
                     finalizeError = null,
+                    serverProcessingError = null,
+                    serverLastError = null,
                     statusLine = "Processing on LightCraft worker.",
                     step = ShootFlowStep.Processing,
-                    processingStartedAtMs = System.currentTimeMillis(),
+                    processingStartedAtMs = repo.processingWorkerStartedAtMs(shootId),
                 )
                 recomputeStep(shoot.value, files.value)
                 startPolling()
@@ -802,29 +805,23 @@ class ShootViewModel(
                             statusApplied = true
                             val friendly = FinalizeErrorMessages.friendly(it.launchErrorCode, it.lastError)
                             val workerStarted = it.workerStartedAt ?: repo.processingWorkerStartedAtMs(shootId)
-                            if (
-                                (it.state == "FAILED" || it.state == "PARTIAL") &&
-                                !it.lastError.isNullOrBlank()
-                            ) {
+                            val clearedStaleClientError = it.lastError.isNullOrBlank()
+                            if (clearedStaleClientError) {
+                                repo.clearFinalizeError(shootId)
+                            } else if (it.state == "FAILED" || it.state == "PARTIAL") {
                                 repo.clearFinalizeError(shootId)
                             }
                             _ui.value = _ui.value.copy(
                                 serverPhase = it.phase,
                                 serverLaunchErrorCode = it.launchErrorCode,
                                 serverLastError = it.lastError,
-                                processingStartedAtMs = workerStarted ?: _ui.value.processingStartedAtMs,
-                                serverProcessingError = when {
-                                    !it.lastError.isNullOrBlank() -> friendly
-                                    it.state == "READY_TO_PROCESS" || it.state == "FAILED" -> friendly
-                                    else -> null
-                                },
-                                finalizeError = if (
-                                    !it.lastError.isNullOrBlank() &&
-                                    (it.state == "FAILED" || it.state == "PARTIAL" || it.state == "PROCESSING")
-                                ) {
-                                    null
+                                processingStartedAtMs = workerStarted,
+                                serverProcessingError = if (!it.lastError.isNullOrBlank()) friendly else null,
+                                finalizeError = if (clearedStaleClientError) null else _ui.value.finalizeError,
+                                finalizeState = if (clearedStaleClientError && _ui.value.finalizeState == FinalizeState.Failed) {
+                                    FinalizeState.Idle
                                 } else {
-                                    _ui.value.finalizeError
+                                    _ui.value.finalizeState
                                 },
                                 processingProgress = repo.processingProgressJson(shootId),
                                 serverFileStatusBySha = loadServerFileStatusMap(),
@@ -906,10 +903,18 @@ class ShootViewModel(
         if (_ui.value.finalizeState == FinalizeState.InProgress) return false
         val fileList = files.value
         if (fileList.isEmpty() || fileList.any { it.uploadState != "UPLOADED" }) return false
-        if (_ui.value.finalizeState == FinalizeState.Failed || repo.getFinalizeError(shootId) != null) {
+        val s = shoot.value ?: return false
+        val staleFinalizeOnly = repo.getFinalizeError(shootId) != null &&
+            _ui.value.serverLastError.isNullOrBlank() &&
+            s.state == "PROCESSING"
+        if (staleFinalizeOnly) {
+            repo.clearFinalizeError(shootId)
+        }
+        if (_ui.value.finalizeState == FinalizeState.Failed ||
+            (repo.getFinalizeError(shootId) != null && !staleFinalizeOnly)
+        ) {
             return true
         }
-        val s = shoot.value ?: return false
         if (s.state == "PARTIAL") return true
         if (s.state == "DONE") {
             parseProgress(repo.processingProgressJson(shootId))?.let { (_, total, published) ->
@@ -935,10 +940,9 @@ class ShootViewModel(
     private fun recomputeStep(shootEntity: ShootEntity?, fileList: List<FileEntity>) {
         val step = computeFlowStep(shootEntity, fileList)
         val startedAt = when {
-            step == ShootFlowStep.Processing && _ui.value.processingStartedAtMs == null ->
-                System.currentTimeMillis()
             step != ShootFlowStep.Processing -> null
-            else -> _ui.value.processingStartedAtMs
+            else -> repo.processingWorkerStartedAtMs(shootId)
+                ?: _ui.value.processingStartedAtMs
         }
         if (_ui.value.step != step || _ui.value.processingStartedAtMs != startedAt) {
             _ui.value = _ui.value.copy(step = step, processingStartedAtMs = startedAt)

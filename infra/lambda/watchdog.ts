@@ -112,6 +112,11 @@ export const handler: ScheduledHandler = async () => {
       if (!isPastDeadline(deadlineAt, now)) continue;
       const instanceId = item.instanceId as string | undefined;
       if (instanceId) toTerminate.add(instanceId);
+      const rendered = Number(item.renderedCount ?? 0);
+      const published = Number(item.publishedCount ?? 0);
+      const hasProgress = rendered > 0 || published > 0;
+      const endState = hasProgress ? 'PARTIAL' : 'FAILED';
+      const endPhase = hasProgress ? 'READY_TO_PROCESS' : 'RUNTIME_TIMEOUT';
       await ddb.send(
         new UpdateCommand({
           TableName: table,
@@ -120,8 +125,8 @@ export const handler: ScheduledHandler = async () => {
             'SET #s = :f, phase = :ph, lastError = :e, updatedAt = :t REMOVE instanceId, instanceType, spot, workerStartedAt, launchLockUntil',
           ExpressionAttributeNames: { '#s': 'state' },
           ExpressionAttributeValues: {
-            ':f': 'FAILED',
-            ':ph': 'RUNTIME_TIMEOUT',
+            ':f': endState,
+            ':ph': endPhase,
             ':e': runtimeTimeoutError(deadlineAt!),
             ':t': now,
           },

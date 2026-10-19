@@ -8,6 +8,12 @@ function isVideoRow(f: StatusFileRow): boolean {
   return String(f.mediaType ?? '').toLowerCase() === 'video';
 }
 
+export function fileRowHasState(f: StatusFileRow): boolean {
+  const st = f.state;
+  if (st == null) return false;
+  return String(st).trim().length > 0;
+}
+
 export function progressCountsFromFiles(files: StatusFileRow[]): {
   renderedCount: number;
   publishedCount: number;
@@ -25,6 +31,7 @@ export function progressCountsFromFiles(files: StatusFileRow[]): {
   let publishedPhotoCount = 0;
   let publishedVideoCount = 0;
   for (const f of files) {
+    if (!fileRowHasState(f)) continue;
     const st = String(f.state ?? '');
     const video = isVideoRow(f);
     if (video) {
@@ -80,28 +87,35 @@ export function mergeProgress(
   publishedPhotoCount: number;
   publishedVideoCount: number;
 } {
-  const fromFiles = progressCountsFromFiles(files);
-  const totalFiles = Math.max(meta.totalFiles ?? 0, files.length) || files.length;
+  const activeFiles = files.filter(fileRowHasState);
+  const fromFiles = progressCountsFromFiles(activeFiles);
+  const metaTotal = meta.totalFiles ?? 0;
+  const metaPhotos = meta.photoCount ?? 0;
+  const metaVideos = meta.videoCount ?? 0;
+  const totalFiles =
+    metaTotal > 0
+      ? metaTotal
+      : Math.max(fromFiles.photoCount + fromFiles.videoCount, activeFiles.length);
+  const photoCount = metaPhotos > 0 ? metaPhotos : fromFiles.photoCount;
+  const videoCount = metaVideos > 0 ? metaVideos : fromFiles.videoCount;
   const cap = (n: number) => (totalFiles > 0 ? Math.min(totalFiles, n) : n);
-  const photoCount = files.length > 0 ? fromFiles.photoCount : Math.max(0, meta.photoCount ?? 0);
-  const videoCount = files.length > 0 ? fromFiles.videoCount : Math.max(0, meta.videoCount ?? 0);
   const renderedCount =
-    files.length > 0 ? cap(fromFiles.renderedCount) : cap(meta.renderedCount ?? 0);
+    activeFiles.length > 0 ? cap(fromFiles.renderedCount) : cap(meta.renderedCount ?? 0);
   const publishedCount =
-    files.length > 0 ? cap(fromFiles.publishedCount) : cap(meta.publishedCount ?? 0);
+    activeFiles.length > 0 ? cap(fromFiles.publishedCount) : cap(meta.publishedCount ?? 0);
   const renderedPhotoCount =
-    files.length > 0
+    activeFiles.length > 0
       ? Math.min(photoCount, fromFiles.renderedPhotoCount)
       : Math.min(photoCount, meta.renderedPhotoCount ?? 0);
   const publishedPhotoCount =
-    files.length > 0
+    activeFiles.length > 0
       ? Math.min(photoCount, fromFiles.publishedPhotoCount)
       : Math.min(photoCount, meta.publishedPhotoCount ?? 0);
   const publishedVideoCount =
-    files.length > 0
+    activeFiles.length > 0
       ? Math.min(videoCount, fromFiles.publishedVideoCount)
       : Math.min(videoCount, meta.publishedVideoCount ?? 0);
-  const uploadCompleteCount = files.filter(
+  const uploadCompleteCount = activeFiles.filter(
     (f) =>
       f.state === 'UPLOADED' ||
       f.state === 'GP_CREATED' ||
