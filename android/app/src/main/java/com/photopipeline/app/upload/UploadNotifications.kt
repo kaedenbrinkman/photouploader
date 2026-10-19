@@ -7,6 +7,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.work.ForegroundInfo
+import com.photopipeline.app.R
 
 object UploadNotifications {
     private const val CHANNEL = "uploads"
@@ -22,21 +23,20 @@ object UploadNotifications {
      */
     fun foregroundInfo(
         context: Context,
-        speedBps: Long = 0,
-        etaSeconds: Long? = null,
-        filesDone: Int = 0,
-        filesTotal: Int = 0,
+        progress: UploadProgressSnapshot,
         useConnectedDevice: Boolean = true,
     ): ForegroundInfo {
         createChannel(context)
-        val speedMbps = speedBps * 8.0 / 1_000_000.0
-        val eta = etaSeconds?.let { " · ETA ${it / 60}m ${it % 60}s" } ?: ""
+        val speedLine = formatUploadMbps(progress.averageBps)
+        val etaLine = UploadEtaEstimator.formatEta(progress.etaSeconds)
         val notification = NotificationCompat.Builder(context, CHANNEL)
-            .setContentTitle("Uploading from camera → S3")
+            .setContentTitle("Uploading from camera")
             .setContentText(
-                "Files $filesDone/$filesTotal · ${"%.1f".format(speedMbps)} Mbps$eta",
+                "${formatUploadBytes(progress.bytesSent)} / ${formatUploadBytes(progress.totalBytes)} · " +
+                    "${progress.filesDone}/${progress.filesTotal} files · $speedLine · $etaLine",
             )
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setProgress(progress.totalBytes, progress.bytesSent, false)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .build()
@@ -55,4 +55,23 @@ object UploadNotifications {
             )
         }
     }
+}
+
+private fun NotificationCompat.Builder.setProgress(
+    totalBytes: Long,
+    bytesSent: Long,
+    indeterminate: Boolean,
+): NotificationCompat.Builder {
+    if (indeterminate) {
+        return setProgress(0, 0, true)
+    }
+    if (totalBytes <= 0L) {
+        return setProgress(0, 0, false)
+    }
+    if (totalBytes <= Int.MAX_VALUE) {
+        return setProgress(totalBytes.toInt(), bytesSent.coerceIn(0L, totalBytes).toInt(), false)
+    }
+    val max = 1000
+    val progress = ((bytesSent * max) / totalBytes).toInt().coerceIn(0, max)
+    return setProgress(max, progress, false)
 }

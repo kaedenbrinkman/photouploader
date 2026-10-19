@@ -15,8 +15,13 @@ import com.photopipeline.app.data.PrepareCameraResult
 import com.photopipeline.app.mtp.UsbAccessState
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import java.io.File
@@ -43,14 +48,20 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
 
     override suspend fun doWork(): Result {
         val shootId = inputData.getString("shootId") ?: return failWorker("missing shootId in work input")
+        val allShootFiles = repo.observeFiles(shootId).first()
         val files = repo.getPendingFiles(shootId)
         if (files.isEmpty()) return Result.success()
         val usesCameraStream = files.any { it.isCameraStreamUpload() }
-        sessionSpeed.reset(files.sumOf { it.sizeBytes }.coerceAtLeast(1))
+        val sessionTotalBytes = allShootFiles.sumOf { it.sizeBytes }.coerceAtLeast(1)
+        val bytesAlreadyUploaded = allShootFiles.sumOf { it.uploadedBytes }
+        sessionSpeed.reset((sessionTotalBytes - bytesAlreadyUploaded).coerceAtLeast(1))
         UploadMetricsStore.update {
             it.copy(
                 shootId = shootId,
-                filesTotal = files.size,
+                filesTotal = allShootFiles.size,
+                filesDone = allShootFiles.count { f -> f.uploadState == "UPLOADED" },
+                totalBytes = sessionTotalBytes,
+                bytesSent = bytesAlreadyUploaded,
                 network = network.snapshot(),
                 transferAccelerationActive = prefs.transferAcceleration,
                 lastError = null,
@@ -60,6 +71,30 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         }
         promoteToForeground(usesCameraStream)
 
+        return coroutineScope {
+            val foregroundRefresh = launchForegroundRefresh(shootId, usesCameraStream)
+            try {
+                runUploadWork(shootId, files, usesCameraStream)
+            } finally {
+                foregroundRefresh.cancel()
+            }
+        }
+    }
+
+    private fun CoroutineScope.launchForegroundRefresh(shootId: String, usesCameraStream: Boolean): Job =
+        launch {
+            while (isActive) {
+                syncUploadMetricsFromDb(shootId)
+                promoteToForeground(usesCameraStream)
+                delay(1_000)
+            }
+        }
+
+    private suspend fun runUploadWork(
+        shootId: String,
+        files: List<FileEntity>,
+        usesCameraStream: Boolean,
+    ): Result {
         when (val prep = repo.prepareCameraForUpload(shootId)) {
             is PrepareCameraResult.Error -> return failWorker(prep.message, usesCameraStream)
             PrepareCameraResult.Ready -> Unit
@@ -77,7 +112,6 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             )
         }
 
-        var filesDone = repo.countUploadedFiles(shootId)
         val failedKeys = mutableListOf<String>()
 
         suspend fun uploadOne(file: FileEntity): Boolean {
@@ -99,8 +133,12 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 if (file.isCameraStreamUpload()) {
                     usb.refreshCameraSnapshot()
                 }
-                filesDone++
-                UploadMetricsStore.update { it.copy(filesDone = filesDone, network = network.snapshot()) }
+                UploadMetricsStore.update {
+                    it.copy(
+                        filesDone = it.filesDone + 1,
+                        network = network.snapshot(),
+                    )
+                }
                 true
             } catch (e: StreamingCameraUploader.PresignExpiredException) {
                 throw e
@@ -363,6 +401,21 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         else -> "Upload paused"
     }
 
+    private suspend fun syncUploadMetricsFromDb(shootId: String) {
+        val shootFiles = repo.observeFiles(shootId).first()
+        val metrics = UploadMetricsStore.metrics.value
+        val snap = UploadProgressSnapshot.compute(shootFiles, metrics, uploading = true)
+        UploadMetricsStore.update {
+            it.copy(
+                filesDone = shootFiles.count { f -> f.uploadState == "UPLOADED" },
+                filesTotal = shootFiles.size,
+                bytesSent = snap.bytesSent,
+                totalBytes = snap.totalBytes,
+                etaSeconds = snap.etaSeconds,
+            )
+        }
+    }
+
     private suspend fun promoteToForeground(useConnectedDevice: Boolean) {
         try {
             setForeground(buildForeground(useConnectedDevice))
@@ -381,14 +434,26 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         )
     }
 
-    private fun buildForeground(useConnectedDevice: Boolean = enqueueUsesCamera): ForegroundInfo {
-        val m = UploadMetricsStore.metrics.value
+    private suspend fun buildForeground(useConnectedDevice: Boolean = enqueueUsesCamera): ForegroundInfo {
+        val metrics = UploadMetricsStore.metrics.value
+        val shootId = metrics.shootId.ifBlank { inputData.getString("shootId").orEmpty() }
+        val files = if (shootId.isNotEmpty()) repo.observeFiles(shootId).first() else emptyList()
+        val snap = if (files.isNotEmpty()) {
+            UploadProgressSnapshot.compute(files, metrics, uploading = true)
+        } else {
+            UploadProgressSnapshot(
+                bytesSent = metrics.bytesSent,
+                totalBytes = metrics.totalBytes.coerceAtLeast(1),
+                filesDone = metrics.filesDone,
+                filesTotal = metrics.filesTotal,
+                currentBps = metrics.currentBps,
+                averageBps = metrics.averageBps,
+                etaSeconds = metrics.etaSeconds,
+            )
+        }
         return UploadNotifications.foregroundInfo(
             applicationContext,
-            m.currentBps,
-            m.etaSeconds,
-            m.filesDone,
-            m.filesTotal,
+            snap,
             useConnectedDevice = useConnectedDevice,
         )
     }

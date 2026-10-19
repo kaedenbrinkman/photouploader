@@ -87,6 +87,7 @@ import com.photopipeline.app.api.FinalizeErrorMessages
 import com.photopipeline.app.upload.LiveUploadMetrics
 import com.photopipeline.app.upload.UploadEtaEstimator
 import com.photopipeline.app.upload.UploadMetricsStore
+import com.photopipeline.app.upload.UploadProgressSnapshot
 import android.content.Intent
 import android.provider.Settings
 import androidx.activity.ComponentActivity
@@ -809,23 +810,8 @@ private fun OverallUploadProgressCard(
     metrics: LiveUploadMetrics,
     uploading: Boolean,
 ) {
-    val filesDone = if (metrics.filesTotal > 0) metrics.filesDone else files.count { it.uploadState == "UPLOADED" }
-    val filesTotal = if (metrics.filesTotal > 0) metrics.filesTotal else files.size
-    val totalBytes = files.sumOf { it.sizeBytes }.coerceAtLeast(1)
-    val bytesFromFiles = files.sumOf { it.uploadedBytes }
-    val bytesSent = when {
-        uploading && metrics.totalBytes > 0 -> maxOf(metrics.bytesSent, bytesFromFiles)
-        else -> bytesFromFiles
-    }
-    val remaining = (totalBytes - bytesSent).coerceAtLeast(0)
-    val etaSeconds = UploadEtaEstimator.estimateSeconds(
-        remainingBytes = remaining,
-        currentBps = metrics.currentBps,
-        averageBps = metrics.averageBps,
-        sessionBytes = metrics.sessionBytes,
-        sessionElapsedMs = metrics.sessionElapsedMs,
-    )
-    val byteProgress = bytesSent.toFloat() / totalBytes
+    val progress = UploadProgressSnapshot.compute(files, metrics, uploading)
+    val byteProgress = progress.bytesSent.toFloat() / progress.totalBytes
     Card(
         Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
@@ -837,13 +823,14 @@ private fun OverallUploadProgressCard(
                 modifier = Modifier.fillMaxWidth().height(10.dp),
             )
             Text(
-                "${formatBytes(bytesSent)} / ${formatBytes(totalBytes)} · $filesDone / $filesTotal files",
+                "${formatBytes(progress.bytesSent)} / ${formatBytes(progress.totalBytes)} · " +
+                    "${progress.filesDone} / ${progress.filesTotal} files",
                 style = MaterialTheme.typography.bodyMedium,
             )
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("Now ${formatMbps(metrics.currentBps)}", style = MaterialTheme.typography.bodySmall)
+                Text("Now ${formatMbps(progress.currentBps)}", style = MaterialTheme.typography.bodySmall)
                 Text(
-                    UploadEtaEstimator.formatEta(etaSeconds),
+                    UploadEtaEstimator.formatEta(progress.etaSeconds),
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
