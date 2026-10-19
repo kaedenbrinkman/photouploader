@@ -737,6 +737,7 @@ class Repository(
         applyServerUploadStateToLocal(shootId, status.files, status.progress)
         val openUrl = status.albumProductUrl?.takeIf { it.startsWith("http") }
             ?: status.albumId?.let { "https://photos.google.com/lr/album/$it" }
+        val terminal = status.state in setOf("FAILED", "DONE", "PARTIAL")
         db.shootDao().upsert(
             shoot.copy(
                 state = status.state,
@@ -744,8 +745,11 @@ class Repository(
                 backendState = status.state,
                 albumId = status.albumId,
                 albumProductUrl = openUrl ?: shoot.albumProductUrl,
-                maxRuntimeMinutes = status.maxRuntimeMinutes,
-                deadlineAt = status.deadlineAt,
+                maxRuntimeMinutes = if (terminal) status.maxRuntimeMinutes else status.maxRuntimeMinutes ?: shoot.maxRuntimeMinutes,
+                deadlineAt = when {
+                    terminal -> status.deadlineAt
+                    else -> status.deadlineAt ?: shoot.deadlineAt
+                },
                 actualComputeJson = status.actualCompute?.let { ac ->
                     val sec = ac.seconds ?: 0
                     val usd = ac.usd?.takeIf { !it.isNaN() && !it.isInfinite() } ?: 0.0

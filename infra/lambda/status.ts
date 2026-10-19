@@ -4,6 +4,7 @@ import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import type { APIGatewayProxyHandlerV2 } from 'aws-lambda';
 import { actualComputeCost } from './pricing';
 import { json, userIdFromEvent } from './http';
+import { persistedActualCompute } from './shoot-finalize-meta';
 import { albumOpenUrl, mergeProgress, runningActualCompute } from './status-progress';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -48,14 +49,19 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
 
   const started = meta.Item.workerStartedAt as number | undefined;
   const finished = meta.Item.workerFinishedAt as number | undefined;
-  const actualCompute = runningActualCompute(
-    started,
-    finished,
-    meta.Item.instanceType as string | undefined,
-    meta.Item.spot as boolean | undefined,
-    Date.now(),
-    actualComputeCost,
-  );
+  const actualCompute =
+    persistedActualCompute(meta.Item) ??
+    runningActualCompute(
+      started,
+      finished,
+      meta.Item.instanceType as string | undefined,
+      meta.Item.spot as boolean | undefined,
+      Date.now(),
+      actualComputeCost,
+    );
+  const instanceType =
+    (meta.Item.instanceType as string | undefined) ??
+    (meta.Item.finalInstanceType as string | undefined);
 
   const progress = mergeProgress(files, {
     totalFiles: meta.Item.totalFiles as number | undefined,
@@ -81,8 +87,10 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     albumId,
     albumProductUrl: albumOpenUrl(albumId, albumProductUrl),
     instanceId: meta.Item.instanceId,
-    instanceType: meta.Item.instanceType,
+    instanceType,
     spot: meta.Item.spot,
+    finalInstanceType: meta.Item.finalInstanceType,
+    workerFinishedAt: finished,
     missingKeys: meta.Item.missingKeys,
     progress,
     estimateAtSubmit: meta.Item.estimateAtSubmit,

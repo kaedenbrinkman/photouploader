@@ -659,6 +659,12 @@ fun ShootFlowScreen(
                 }
                 ShootFlowStep.Processing -> shoot?.let { s ->
                     item {
+                        LaunchedEffect(Unit) {
+                            vm.setProcessingScreenVisible(true)
+                        }
+                        DisposableEffect(Unit) {
+                            onDispose { vm.setProcessingScreenVisible(false) }
+                        }
                         val processingError = ui.serverProcessingError ?: ui.finalizeError
                         ProcessingStepScreen(
                             shoot = s,
@@ -675,6 +681,8 @@ fun ShootFlowScreen(
                             workerInstanceType = ui.workerInstanceType,
                             workerSpot = ui.workerSpot,
                             ec2Pricing = repository.ec2Pricing,
+                            statusLastUpdatedAtMs = ui.statusLastUpdatedAtMs,
+                            statusPollError = ui.statusPollError,
                             busy = ui.busy,
                             thumbnailForHandle = { vm.readCachedThumbnail(it) },
                             onRetryProcessing = { vm.retryProcessing() },

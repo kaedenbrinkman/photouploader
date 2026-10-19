@@ -8,6 +8,8 @@ data class ProcessingProgress(
     val publishedPhotos: Int,
     val publishedVideos: Int,
     val videoCount: Int,
+    val totalFiles: Int = 0,
+    val uploadCompleteCount: Int = 0,
 )
 
 fun capProcessingProgress(
@@ -28,11 +30,19 @@ fun capProcessingProgress(
     )
 }
 
+private fun jsonIntField(raw: String, key: String): Int {
+    val pattern = Regex("\"$key\"\\s*:\\s*(\\d+)")
+    return pattern.find(raw)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+}
+
 fun parseProcessingProgress(json: String?): ProcessingProgress? {
     if (json.isNullOrBlank()) return null
     return try {
         val o = JSONObject(json)
-        val legacyTotal = o.optInt("totalFiles")
+        var legacyTotal = o.optInt("totalFiles")
+        if (legacyTotal == 0 && json.contains("\"totalFiles\"")) {
+            legacyTotal = jsonIntField(json, "totalFiles")
+        }
         val legacyRendered = o.optInt("renderedCount")
         val legacyPublished = o.optInt("publishedCount")
         val videoCount = o.optInt("videoCount")
@@ -48,6 +58,15 @@ fun parseProcessingProgress(json: String?): ProcessingProgress? {
             publishedPhotos = o.optInt("publishedPhotoCount", legacyPublished),
             publishedVideos = o.optInt("publishedVideoCount"),
             videoCount = videoCount,
+        ).copy(
+            totalFiles = legacyTotal,
+            uploadCompleteCount = run {
+                var uploaded = o.optInt("uploadCompleteCount")
+                if (uploaded == 0 && json.contains("\"uploadCompleteCount\"")) {
+                    uploaded = jsonIntField(json, "uploadCompleteCount")
+                }
+                uploaded
+            },
         )
     } catch (_: Exception) {
         null

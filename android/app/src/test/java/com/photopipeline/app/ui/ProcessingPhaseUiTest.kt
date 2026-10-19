@@ -3,6 +3,8 @@ package com.photopipeline.app.ui
 import com.photopipeline.app.data.FileEntity
 import com.photopipeline.app.data.ShootEntity
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProcessingPhaseUiTest {
@@ -20,6 +22,28 @@ class ProcessingPhaseUiTest {
             ProcessingPipelineStep.Publishing,
             resolveProcessingPipelineStep("PROCESSING", "PUBLISH", false),
         )
+    }
+
+    @Test
+    fun gpEnsureAlbumMapsToPublishing() {
+        assertEquals(
+            ProcessingPipelineStep.Publishing,
+            resolveProcessingPipelineStep("PROCESSING", "GP_ENSURE_ALBUM", false),
+        )
+    }
+
+    @Test
+    fun failedGpPhaseMarksPublishingStep() {
+        val ui = resolveProcessingPipelineUi("FAILED", "GP_FAILED", false)
+        assertEquals(ProcessingPipelineStep.Publishing, ui.activeStep)
+        assertEquals(ProcessingPipelineStep.Publishing, ui.failedStep)
+    }
+
+    @Test
+    fun terminalStateHidesRunTimingFlag() {
+        assertTrue(isTerminalProcessingState("FAILED"))
+        assertTrue(isTerminalProcessingState("PARTIAL"))
+        assertFalse(isTerminalProcessingState("PROCESSING"))
     }
 
     @Test

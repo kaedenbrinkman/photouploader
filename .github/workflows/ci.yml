@@ -22,7 +22,7 @@ jobs:
         run: |
           pip install pytest pytest-timeout
           pip install -r worker/requirements.txt
-          cd worker && PYTHONPATH=. pytest -q -m "not integration"
+          cd worker && PYTHONPATH=../lib:. pytest -q -m "not integration"
       - name: LightCraft importPreview smoke (optional)
         run: |
           chmod +x scripts/lightcraft-import-preview-smoke.sh

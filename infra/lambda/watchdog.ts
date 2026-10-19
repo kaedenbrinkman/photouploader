@@ -4,6 +4,7 @@ import { EC2Client, DescribeInstancesCommand, TerminateInstancesCommand } from '
 import type { ScheduledHandler } from 'aws-lambda';
 import { isWorkerInstanceLive } from './ec2-instance';
 import { bootstrapStuckTimeoutMs, isBootstrapStuck } from './watchdog-bootstrap';
+import { metaTerminalWorkerUpdate } from './shoot-finalize-meta';
 import { isPastDeadline, runtimeTimeoutError } from './watchdog-runtime';
 
 const ec2 = new EC2Client({});
@@ -68,19 +69,17 @@ export const handler: ScheduledHandler = async () => {
       }
       if (instanceId) toTerminate.add(instanceId);
       const err = `Bootstrap timed out after ${bootstrapTimeoutMs / 60_000}m in phase ${phase}`;
+      const terminal = metaTerminalWorkerUpdate(item, now, {
+        state: 'FAILED',
+        phase: 'BOOTSTRAP_TIMEOUT',
+        lastError: err,
+        updatedAt: now,
+      });
       await ddb.send(
         new UpdateCommand({
           TableName: table,
           Key: { pk: item.pk, sk: item.sk },
-          UpdateExpression:
-            'SET #s = :f, phase = :ph, lastError = :e, updatedAt = :t REMOVE instanceId, instanceType, spot, workerStartedAt, launchLockUntil',
-          ExpressionAttributeNames: { '#s': 'state' },
-          ExpressionAttributeValues: {
-            ':f': 'FAILED',
-            ':ph': 'BOOTSTRAP_TIMEOUT',
-            ':e': err,
-            ':t': now,
-          },
+          ...terminal,
         }),
       );
       bootstrapStuckFails.push(shootId);
@@ -117,19 +116,17 @@ export const handler: ScheduledHandler = async () => {
       const hasProgress = rendered > 0 || published > 0;
       const endState = hasProgress ? 'PARTIAL' : 'FAILED';
       const endPhase = hasProgress ? 'READY_TO_PROCESS' : 'RUNTIME_TIMEOUT';
+      const terminal = metaTerminalWorkerUpdate(item, now, {
+        state: endState,
+        phase: endPhase,
+        lastError: runtimeTimeoutError(deadlineAt!),
+        updatedAt: now,
+      });
       await ddb.send(
         new UpdateCommand({
           TableName: table,
           Key: { pk: item.pk, sk: item.sk },
-          UpdateExpression:
-            'SET #s = :f, phase = :ph, lastError = :e, updatedAt = :t REMOVE instanceId, instanceType, spot, workerStartedAt, launchLockUntil',
-          ExpressionAttributeNames: { '#s': 'state' },
-          ExpressionAttributeValues: {
-            ':f': endState,
-            ':ph': endPhase,
-            ':e': runtimeTimeoutError(deadlineAt!),
-            ':t': now,
-          },
+          ...terminal,
         }),
       );
       runtimeTimeouts.push(shootId);

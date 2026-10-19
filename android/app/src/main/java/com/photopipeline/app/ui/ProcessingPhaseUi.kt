@@ -13,6 +13,57 @@ enum class ProcessingPipelineStep(val label: String) {
     Done("Done"),
 }
 
+data class ProcessingPipelineUi(
+    val activeStep: ProcessingPipelineStep,
+    val failedStep: ProcessingPipelineStep? = null,
+)
+
+private val TERMINAL_FAIL_PHASES = setOf(
+    "RUNTIME_TIMEOUT",
+    "STALLED",
+    "GP_FAILED",
+    "RENDER_FAILED",
+    "BOOTSTRAP_TIMEOUT",
+    "FAILED",
+)
+
+fun isTerminalProcessingState(state: String): Boolean {
+    val st = state.uppercase()
+    return st in setOf("FAILED", "DONE", "PARTIAL")
+}
+
+fun resolveProcessingPipelineUi(
+    state: String,
+    phase: String?,
+    finalizeInProgress: Boolean,
+): ProcessingPipelineUi {
+    val st = state.uppercase()
+    val ph = (phase ?: state).uppercase()
+    val failedStep = when {
+        st == "FAILED" || ph in TERMINAL_FAIL_PHASES -> failedPipelineStepForPhase(ph, st)
+        else -> null
+    }
+    if (failedStep != null) {
+        return ProcessingPipelineUi(activeStep = failedStep, failedStep = failedStep)
+    }
+    return ProcessingPipelineUi(
+        activeStep = resolveProcessingPipelineStep(state, phase, finalizeInProgress),
+    )
+}
+
+fun failedPipelineStepForPhase(phase: String, state: String): ProcessingPipelineStep {
+    val p = phase.uppercase()
+    return when {
+        p.contains("BOOTSTRAP") || p == "BOOTSTRAP_TIMEOUT" -> ProcessingPipelineStep.SettingUp
+        p.startsWith("GP_") || p == "GP_FAILED" || p.contains("PUBLISH") -> ProcessingPipelineStep.Publishing
+        p.contains("RENDER") || p == "RENDER_FAILED" || p == "STALLED" -> ProcessingPipelineStep.Rendering
+        p.contains("LAUNCH") -> ProcessingPipelineStep.StartingServer
+        p == "RUNTIME_TIMEOUT" && state == "PARTIAL" -> ProcessingPipelineStep.Publishing
+        p == "RUNTIME_TIMEOUT" -> ProcessingPipelineStep.Rendering
+        else -> ProcessingPipelineStep.Rendering
+    }
+}
+
 fun resolveProcessingPipelineStep(
     state: String,
     phase: String?,
@@ -22,8 +73,10 @@ fun resolveProcessingPipelineStep(
     val st = state.uppercase()
     return when {
         finalizeInProgress || st == "READY_TO_PROCESS" || p.contains("LAUNCH") -> ProcessingPipelineStep.StartingServer
+        p == "GP_LOADING_TOKEN" || p == "GP_REFRESH_TOKEN" || p == "GP_SAVING_TOKEN" || p == "GP_TOKEN_READY" ->
+            ProcessingPipelineStep.SettingUp
+        p.startsWith("GP_") || p.contains("PUBLISH") -> ProcessingPipelineStep.Publishing
         p.contains("BOOTSTRAP") || p.contains("SETUP") || p.contains("INSTALL") -> ProcessingPipelineStep.SettingUp
-        p.contains("PUBLISH") -> ProcessingPipelineStep.Publishing
         st == "DONE" || st == "PARTIAL" || p.contains("DONE") -> ProcessingPipelineStep.Done
         p.contains("RENDER") || st == "PROCESSING" -> ProcessingPipelineStep.Rendering
         else -> ProcessingPipelineStep.StartingServer

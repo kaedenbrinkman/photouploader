@@ -95,6 +95,8 @@ data class ShootUiState(
     val processingStartedAtMs: Long? = null,
     val workerInstanceType: String? = null,
     val workerSpot: Boolean? = null,
+    val statusLastUpdatedAtMs: Long? = null,
+    val statusPollError: String? = null,
 )
 
 class ShootViewModel(
@@ -198,6 +200,8 @@ class ShootViewModel(
         private set
 
     private var pollJob: Job? = null
+    private var processingScreenVisible = false
+    private var transientBackoffMs = 5_000L
     private var workObserveJob: Job? = null
     private var autoResumeAttempted = false
     private var autoFinalizeScheduled = false
@@ -785,13 +789,32 @@ class ShootViewModel(
         }
     }
 
-    fun startPolling() {
+    fun setProcessingScreenVisible(visible: Boolean) {
+        if (processingScreenVisible == visible) return
+        processingScreenVisible = visible
+        if (visible) {
+            transientBackoffMs = 5_000L
+            kickStatusPoll()
+        }
+    }
+
+    private fun kickStatusPoll() {
+        pollJob?.cancel()
+        startPolling(immediate = true)
+    }
+
+    fun startPolling(immediate: Boolean = false) {
         if (!shouldPollBackend()) return
         pollJob?.cancel()
         pollJob = safeScope.launch {
             var pollIntervalMs = 10_000L
+            var skipInitialDelay = immediate
             while (isActive) {
                 if (!shouldPollBackend()) break
+                if (!skipInitialDelay) {
+                    delay(pollIntervalMs)
+                }
+                skipInitialDelay = false
                 var stopPolling = false
                 var transientFailure = false
                 var statusApplied = false
@@ -799,6 +822,7 @@ class ShootViewModel(
                 runCatching { repo.refreshBackendStatus(shootId, acceptStatusAfterMs = retryGate) }
                     .onSuccess { status ->
                         pollIntervalMs = 10_000L
+                        transientBackoffMs = 5_000L
                         status?.let {
                             val updatedAt = it.updatedAt ?: 0L
                             val stale = retryGate != null && updatedAt < retryGate!!
@@ -831,17 +855,30 @@ class ShootViewModel(
                                 },
                                 processingProgress = repo.processingProgressJson(shootId),
                                 serverFileStatusBySha = loadServerFileStatusMap(),
+                                statusLastUpdatedAtMs = System.currentTimeMillis(),
+                                statusPollError = null,
                             )
                         }
                     }
                     .onFailure { e ->
                         if (isTransientPollError(e)) {
                             transientFailure = true
+                            val nextDelay = if (processingScreenVisible) {
+                                val d = transientBackoffMs
+                                transientBackoffMs = (transientBackoffMs * 2).coerceAtMost(30_000L)
+                                d
+                            } else {
+                                pollIntervalMs = (pollIntervalMs * 2).coerceAtMost(120_000L)
+                                pollIntervalMs
+                            }
+                            pollIntervalMs = nextDelay
+                            _ui.value = _ui.value.copy(
+                                statusPollError = "Can't reach server (${e.message ?: "network error"})",
+                            )
                             PipelineLog.d(
                                 "status",
                                 "poll transient network error, retry in ${pollIntervalMs}ms: ${e.message}",
                             )
-                            pollIntervalMs = (pollIntervalMs * 2).coerceAtMost(120_000L)
                         } else {
                             val detail = when (e) {
                                 is ApiRequestException ->
@@ -849,6 +886,7 @@ class ShootViewModel(
                                 else -> "poll failed: ${e.message}"
                             }
                             PipelineLog.w("status", detail, e)
+                            _ui.value = _ui.value.copy(statusPollError = detail)
                             if (e is ApiRequestException && e.httpCode == 404) stopPolling = true
                         }
                     }
@@ -857,14 +895,12 @@ class ShootViewModel(
                     recomputeStep(shoot.value, files.value)
                     tryAutoFinalizeIfReady()
                     val state = shoot.value?.state
-                    if (state in TERMINAL) break
+                    if (state in TERMINAL && !processingScreenVisible) break
                 } else if (!transientFailure && processingRetryStartedAtMs != null) {
-                    // Keep optimistic Processing step until a post-retry status lands.
                     if (_ui.value.step != ShootFlowStep.Processing) {
                         _ui.value = _ui.value.copy(step = ShootFlowStep.Processing)
                     }
                 }
-                delay(pollIntervalMs)
             }
         }
     }
@@ -888,6 +924,7 @@ class ShootViewModel(
 
     private fun shouldPollBackend(): Boolean {
         if (!repo.canUseBackendApi()) return false
+        if (processingScreenVisible) return true
         val s = shoot.value
         if (s != null) {
             if (s.backendState != null || s.albumId != null) return true
@@ -906,9 +943,6 @@ class ShootViewModel(
     }
 
     fun needsProcessingRetry(): Boolean {
-        if (_ui.value.finalizeState == FinalizeState.InProgress) return false
-        val fileList = files.value
-        if (fileList.isEmpty() || fileList.any { it.uploadState != "UPLOADED" }) return false
         val s = shoot.value ?: return false
         val staleFinalizeOnly = repo.getFinalizeError(shootId) != null &&
             _ui.value.serverLastError.isNullOrBlank() &&
@@ -916,28 +950,18 @@ class ShootViewModel(
         if (staleFinalizeOnly) {
             repo.clearFinalizeError(shootId)
         }
-        if (_ui.value.finalizeState == FinalizeState.Failed ||
-            (repo.getFinalizeError(shootId) != null && !staleFinalizeOnly)
-        ) {
-            return true
-        }
-        if (s.state == "PARTIAL") return true
-        if (s.state == "DONE") {
-            parseProgress(repo.processingProgressJson(shootId))?.let { (_, total, published) ->
-                if (published == 0 || (total > 0 && published < total)) return true
-            }
-        }
-        if (s.state == "FAILED" || s.state == "READY_TO_PROCESS") return true
-        if (!s.backendState.isNullOrBlank() && s.backendState in setOf("FAILED", "READY_TO_PROCESS")) {
-            return true
-        }
-        if (s.state == "PROCESSING" && !_ui.value.serverLastError.isNullOrBlank()) return true
-        if (s.state == "PROCESSING" && s.backendState == "READY_TO_PROCESS") return true
-        // All bytes in S3 but server never left LOCAL (e.g. finalize 409 before backend fix).
-        return s.state in LOCAL_ONLY_STATES &&
-            s.phase.contains("MANIFEST", ignoreCase = true) &&
-            _ui.value.uploadStartState != UploadStartState.Uploading &&
-            _ui.value.uploadStartState != UploadStartState.Starting
+        return shouldOfferProcessingRetry(
+            shoot = s,
+            progressJson = repo.processingProgressJson(shootId),
+            serverRegistered = repo.isServerShootRegistered(shootId),
+            finalizeState = _ui.value.finalizeState,
+            finalizeError = repo.getFinalizeError(shootId) ?: _ui.value.finalizeError,
+            serverLastError = _ui.value.serverLastError,
+            localAllUploaded = files.value.isNotEmpty() && files.value.all { it.uploadState == "UPLOADED" },
+            staleFinalizeOnly = staleFinalizeOnly,
+            uploadInProgress = _ui.value.uploadStartState == UploadStartState.Uploading ||
+                _ui.value.uploadStartState == UploadStartState.Starting,
+        )
     }
 
     fun allFilesUploaded(): Boolean =

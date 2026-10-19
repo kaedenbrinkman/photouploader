@@ -54,13 +54,18 @@ fun ProcessingStepScreen(
     workerInstanceType: String?,
     workerSpot: Boolean?,
     ec2Pricing: Ec2Pricing?,
+    statusLastUpdatedAtMs: Long?,
+    statusPollError: String?,
     busy: Boolean,
     thumbnailForHandle: (Long) -> ByteArray?,
     onRetryProcessing: () -> Unit,
 ) {
-    val pipelineStep = resolveProcessingPipelineStep(shoot.state, serverPhase ?: shoot.phase, finalizeInProgress)
+    val phase = serverPhase ?: shoot.phase
+    val pipelineUi = resolveProcessingPipelineUi(shoot.state, phase, finalizeInProgress)
     val steps = ProcessingPipelineStep.entries
-    val activeIndex = steps.indexOf(pipelineStep).coerceAtLeast(0)
+    val activeIndex = steps.indexOf(pipelineUi.activeStep).coerceAtLeast(0)
+    val failedIndex = pipelineUi.failedStep?.let { steps.indexOf(it) }?.takeIf { it >= 0 }
+    val showRunTiming = !finalizeInProgress && !isTerminalProcessingState(shoot.state)
 
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) {
@@ -85,25 +90,48 @@ fun ProcessingStepScreen(
             )
         }
 
-        ProcessingPipelineStepper(activeIndex = activeIndex)
+        ProcessingPipelineStepper(activeIndex = activeIndex, failedIndex = failedIndex)
 
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            elapsedMs?.let {
-                Text(
-                    "Elapsed ${formatDuration(it)}",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
-            shoot.deadlineAt?.let { deadlineMs ->
-                val stopFmt = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
-                Text(
-                    "Auto-stops by ${stopFmt.format(Date(deadlineMs))}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+        statusPollError?.let { err ->
+            Text(
+                err,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        statusLastUpdatedAtMs?.let { updatedAt ->
+            val ageSec = ((nowMs - updatedAt) / 1000).coerceAtLeast(0)
+            val stale = ageSec > 60
+            Text(
+                "Last updated ${ageSec}s ago",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (stale) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+        }
+
+        if (showRunTiming) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                elapsedMs?.let {
+                    Text(
+                        "Elapsed ${formatDuration(it)}",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+                shoot.deadlineAt?.let { deadlineMs ->
+                    val stopFmt = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
+                    Text(
+                        "Auto-stops by ${stopFmt.format(Date(deadlineMs))}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
 
@@ -142,24 +170,34 @@ fun ProcessingStepScreen(
             }
         }
 
-        val runningCost = ec2Pricing?.let { ec2 ->
-            RunningComputeEstimate.runningActualCompute(
-                workerStartedAtMs = processingStartedAtMs,
-                workerFinishedAtMs = null,
-                instanceType = workerInstanceType,
-                spot = workerSpot,
-                nowMs = nowMs,
-                ec2 = ec2,
-            )
-        } ?: shoot.actualComputeJson?.let {
-            val o = JSONObject(it)
-            val sec = o.optInt("seconds", 0)
-            val usd = o.optDouble("usd", 0.0)
-            RunningComputeEstimate.RunningCost(sec, usd)
+        val terminalRun = isTerminalProcessingState(shoot.state)
+        val runningCost = if (terminalRun) {
+            shoot.actualComputeJson?.let {
+                val o = JSONObject(it)
+                RunningComputeEstimate.RunningCost(
+                    o.optInt("seconds", 0),
+                    o.optDouble("usd", 0.0),
+                )
+            }
+        } else {
+            ec2Pricing?.let { ec2 ->
+                RunningComputeEstimate.runningActualCompute(
+                    workerStartedAtMs = processingStartedAtMs,
+                    workerFinishedAtMs = null,
+                    instanceType = workerInstanceType,
+                    spot = workerSpot,
+                    nowMs = nowMs,
+                    ec2 = ec2,
+                )
+            } ?: shoot.actualComputeJson?.let {
+                val o = JSONObject(it)
+                RunningComputeEstimate.RunningCost(o.optInt("seconds", 0), o.optDouble("usd", 0.0))
+            }
         }
-        runningCost?.let { (sec, usd) ->
+        runningCost?.let { cost ->
+            val label = if (terminalRun) "Compute cost" else "Running cost"
             Text(
-                "Running cost · ${sec}s · ~$${"%.4f".format(usd)}",
+                "$label · ${cost.seconds}s · ~$${"%.4f".format(cost.usd)}",
                 style = MaterialTheme.typography.bodyMedium,
             )
         }
@@ -240,20 +278,23 @@ private fun processingFileGrid(
 }
 
 @Composable
-private fun ProcessingPipelineStepper(activeIndex: Int) {
+private fun ProcessingPipelineStepper(activeIndex: Int, failedIndex: Int? = null) {
     val steps = ProcessingPipelineStep.entries
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         steps.forEachIndexed { index, step ->
-            val done = index < activeIndex
-            val active = index == activeIndex
+            val failed = failedIndex != null && index == failedIndex
+            val done = !failed && index < activeIndex
+            val active = !failed && index == activeIndex
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     when {
+                        failed -> "✗"
                         done -> "✓"
                         active -> "●"
                         else -> "○"
                     },
                     color = when {
+                        failed -> MaterialTheme.colorScheme.error
                         done || active -> MaterialTheme.colorScheme.primary
                         else -> MaterialTheme.colorScheme.outline
                     },
