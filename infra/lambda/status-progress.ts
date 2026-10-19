@@ -1,6 +1,10 @@
 /** Progress and compute helpers for GET /shoots/{id}/status (unit-tested). */
 
-export type StatusFileRow = { state?: string; mediaType?: string };
+export type StatusFileRow = {
+  state?: string;
+  mediaType?: string;
+  contentSha256?: string;
+};
 
 const PUBLISHED_STATES = new Set(['GP_CREATED', 'PUBLISHED']);
 
@@ -30,13 +34,24 @@ export function progressCountsFromFiles(files: StatusFileRow[]): {
   let renderedPhotoCount = 0;
   let publishedPhotoCount = 0;
   let publishedVideoCount = 0;
+  const seenPhotoContent = new Set<string>();
+  const seenVideoContent = new Set<string>();
   for (const f of files) {
     if (!fileRowHasState(f)) continue;
     const st = String(f.state ?? '');
     const video = isVideoRow(f);
+    const contentId = String(f.contentSha256 ?? '').toLowerCase();
     if (video) {
+      if (contentId) {
+        if (seenVideoContent.has(contentId)) continue;
+        seenVideoContent.add(contentId);
+      }
       videoCount += 1;
     } else {
+      if (contentId) {
+        if (seenPhotoContent.has(contentId)) continue;
+        seenPhotoContent.add(contentId);
+      }
       photoCount += 1;
     }
     const published = PUBLISHED_STATES.has(st);
@@ -92,12 +107,14 @@ export function mergeProgress(
   const metaTotal = meta.totalFiles ?? 0;
   const metaPhotos = meta.photoCount ?? 0;
   const metaVideos = meta.videoCount ?? 0;
-  const totalFiles =
-    metaTotal > 0
-      ? metaTotal
-      : Math.max(fromFiles.photoCount + fromFiles.videoCount, activeFiles.length);
   const photoCount = metaPhotos > 0 ? metaPhotos : fromFiles.photoCount;
   const videoCount = metaVideos > 0 ? metaVideos : fromFiles.videoCount;
+  const totalFiles =
+    photoCount + videoCount > 0
+      ? photoCount + videoCount
+      : metaTotal > 0
+        ? metaTotal
+        : Math.max(fromFiles.photoCount + fromFiles.videoCount, activeFiles.length);
   const cap = (n: number) => (totalFiles > 0 ? Math.min(totalFiles, n) : n);
   const renderedCount =
     activeFiles.length > 0 ? cap(fromFiles.renderedCount) : cap(meta.renderedCount ?? 0);

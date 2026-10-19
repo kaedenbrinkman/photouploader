@@ -19,6 +19,7 @@ import { launchWorkerForShoot } from './finalize-launch-worker';
 import { json, userIdFromEvent } from './http';
 import { verifyWorkerArtifact } from './worker-artifacts';
 import { computeDeadlineAt, computeMaxRuntimeMinutes } from './pricing';
+import { detectWorkerLaunchProfile } from './worker-launch-profile';
 import { loadWorkerSha256FromSsm } from './worker-sha-ssm';
 import { canReprocessShoot } from './finalize-eligibility';
 
@@ -87,7 +88,7 @@ async function resetStaleProcessing(shootId: string, reason: string): Promise<vo
       TableName: process.env.TABLE_NAME,
       Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
       UpdateExpression:
-        'SET #s = :r, phase = :ph, lastError = :e, updatedAt = :t REMOVE instanceId, instanceType, spot, workerStartedAt',
+        'SET #s = :r, phase = :ph, lastError = :e, updatedAt = :t REMOVE instanceId, instanceType, spot, workerStartedAt, deadlineAt, maxRuntimeMinutes',
       ExpressionAttributeNames: { '#s': 'state' },
       ExpressionAttributeValues: {
         ':r': 'READY_TO_PROCESS',
@@ -127,6 +128,36 @@ async function acquireLaunchLockAndMarkReady(shootId: string): Promise<boolean> 
     if ((e as { name?: string }).name === 'ConditionalCheckFailedException') return false;
     throw e;
   }
+}
+
+async function recordScheduledWorkerLaunch(
+  shootId: string,
+  attrs: {
+    maxRuntimeMinutes: number;
+    deadlineAt: number;
+    photoCount: number;
+    videoCount: number;
+    totalFiles: number;
+    launchProfile: string;
+  },
+): Promise<void> {
+  await ddb.send(
+    new UpdateCommand({
+      TableName: process.env.TABLE_NAME,
+      Key: { pk: `SHOOT#${shootId}`, sk: 'META' },
+      UpdateExpression:
+        'SET maxRuntimeMinutes = :mr, deadlineAt = :dl, photoCount = :pc, videoCount = :vc, totalFiles = :tf, launchProfile = :lp, updatedAt = :t',
+      ExpressionAttributeValues: {
+        ':mr': attrs.maxRuntimeMinutes,
+        ':dl': attrs.deadlineAt,
+        ':pc': attrs.photoCount,
+        ':vc': attrs.videoCount,
+        ':tf': attrs.totalFiles,
+        ':lp': attrs.launchProfile,
+        ':t': Date.now(),
+      },
+    }),
+  );
 }
 
 async function releaseLaunchLock(shootId: string): Promise<void> {
@@ -251,6 +282,7 @@ async function handleLaunchWorker(payload: LaunchWorkerPayload) {
     lightcraftSha256,
     ddb,
     ec2,
+    s3,
     workerAmiId: process.env.WORKER_AMI_ID!,
     workerInstanceProfileName: process.env.WORKER_INSTANCE_PROFILE_NAME!,
     workerSubnetId: process.env.WORKER_SUBNET_ID!,
@@ -275,6 +307,8 @@ async function respondLaunchInProgress(shootId: string) {
     phase,
     instanceId: fresh.Item?.instanceId,
     launchAccepted: true,
+    maxRuntimeMinutes: fresh.Item?.maxRuntimeMinutes,
+    deadlineAt: fresh.Item?.deadlineAt,
   });
 }
 
@@ -473,6 +507,31 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     }
     lockHeld = true;
 
+    const split = splitManifestFiles(manifest.files ?? []);
+    const settingsHash =
+      manifest.settings_hash ?? (meta.Item.settingsHash as string) ?? 'develop.auto-longEdge0-q90';
+    const launchProfile = await detectWorkerLaunchProfile(
+      s3,
+      bucket,
+      shootId,
+      settingsHash,
+      manifestFiles,
+    );
+    const publishOnly = launchProfile === 'publish_only';
+    const maxRuntimeMinutes = computeMaxRuntimeMinutes(split.photoCount, split.videoBytes, {
+      publishOnly,
+    });
+    const launchAt = Date.now();
+    const deadlineAt = computeDeadlineAt(launchAt, maxRuntimeMinutes);
+    await recordScheduledWorkerLaunch(shootId, {
+      maxRuntimeMinutes,
+      deadlineAt,
+      photoCount: split.photoCount,
+      videoCount: split.videoCount,
+      totalFiles: split.photoCount + split.videoCount,
+      launchProfile,
+    });
+
     try {
       await enqueueAsyncLaunch(shootId, userId);
     } catch (e) {
@@ -483,15 +542,16 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     }
 
     lockHeld = false;
-    const split = splitManifestFiles(manifest.files ?? []);
-    const maxRuntimeMinutes = computeMaxRuntimeMinutes(split.photoCount, split.videoBytes);
-    const launchAt = Date.now();
     return json(202, {
       state: 'READY_TO_PROCESS',
       phase: 'LAUNCHING',
       launchAccepted: true,
+      launchProfile,
       maxRuntimeMinutes,
-      deadlineAt: computeDeadlineAt(launchAt, maxRuntimeMinutes),
+      deadlineAt,
+      photoCount: split.photoCount,
+      videoCount: split.videoCount,
+      totalFiles: split.photoCount + split.videoCount,
     });
   } finally {
     if (lockHeld && releaseLockAfter) {

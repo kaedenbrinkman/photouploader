@@ -238,10 +238,30 @@ class ApiClient(
         }
     }
 
-    suspend fun finalizeShoot(shootId: String) = onIo {
+    data class FinalizeAccepted(
+        val deadlineAt: Long? = null,
+        val maxRuntimeMinutes: Int? = null,
+        val photoCount: Int? = null,
+        val videoCount: Int? = null,
+        val totalFiles: Int? = null,
+    )
+
+    suspend fun finalizeShoot(shootId: String): FinalizeAccepted = onIo {
         val req = authorizedRequest("/shoots/$shootId/finalize").post("{}".toRequestBody(JSON)).build()
         finalizeClient.newCall(req).execute().use { resp ->
             if (resp.code !in 200..202) failFinalize(resp)
+            val body = resp.body?.string().orEmpty()
+            if (body.isBlank()) return@use FinalizeAccepted()
+            runCatching {
+                val o = JSONObject(body)
+                FinalizeAccepted(
+                    deadlineAt = o.optLong("deadlineAt").takeIf { it > 0L },
+                    maxRuntimeMinutes = o.optInt("maxRuntimeMinutes").takeIf { it > 0 },
+                    photoCount = o.optInt("photoCount").takeIf { it > 0 },
+                    videoCount = o.optInt("videoCount").takeIf { it >= 0 && o.has("videoCount") },
+                    totalFiles = o.optInt("totalFiles").takeIf { it > 0 },
+                )
+            }.getOrDefault(FinalizeAccepted())
         }
     }
 

@@ -2,10 +2,12 @@ import { UpdateCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamod
 import { RunInstancesCommand, type EC2Client } from '@aws-sdk/client-ec2';
 import { ec2ErrorCode, ec2ErrorMessage, isRetryableEc2LaunchError } from './ec2-launch';
 import type { ManifestFile } from './manifest-validate';
-import { computeDeadlineAt, computeMaxRuntimeMinutes } from './pricing';
+import { computeDeadlineAt, computeMaxRuntimeMinutes, publishOnlyInstanceTypeOrder } from './pricing';
 import { splitManifestFiles } from './media-kind';
 import { computeRootVolumeGiB } from './worker-root-volume';
 import { buildUserData, normalizeLinuxLineEndings } from './user-data-build';
+import { detectWorkerLaunchProfile } from './worker-launch-profile';
+import type { S3Client } from '@aws-sdk/client-s3';
 import EC2_USERDATA_BOOTSTRAP from './ec2-userdata-bootstrap.sh';
 
 export interface LaunchWorkerParams {
@@ -25,6 +27,7 @@ export interface LaunchWorkerParams {
   lightcraftSha256: string;
   ddb: DynamoDBDocumentClient;
   ec2: EC2Client;
+  s3: S3Client;
   workerAmiId: string;
   workerInstanceProfileName: string;
   workerSubnetId: string;
@@ -41,7 +44,15 @@ export async function launchWorkerForShoot(p: LaunchWorkerParams): Promise<Launc
   const albumTitle = p.manifest.album_title ?? (p.meta.albumTitle as string) ?? p.shootId;
   const manifestFiles = p.manifest.files ?? [];
   const split = splitManifestFiles(manifestFiles);
-  const maxRuntimeMinutes = computeMaxRuntimeMinutes(split.photoCount, split.videoBytes);
+  const launchProfile = await detectWorkerLaunchProfile(
+    p.s3,
+    p.bucket,
+    p.shootId,
+    settingsHash,
+    manifestFiles,
+  );
+  const publishOnly = launchProfile === 'publish_only';
+  const maxRuntimeMinutes = computeMaxRuntimeMinutes(split.photoCount, split.videoBytes, { publishOnly });
   const rootVolumeGiB = computeRootVolumeGiB(manifestFiles);
   const launchAt = Date.now();
   const deadlineAt = computeDeadlineAt(launchAt, maxRuntimeMinutes);
@@ -64,12 +75,18 @@ export async function launchWorkerForShoot(p: LaunchWorkerParams): Promise<Launc
     normalizeLinuxLineEndings(EC2_USERDATA_BOOTSTRAP),
   );
 
-  const attempts: Array<{ spot: boolean; type: string }> = [
+  const renderAttempts: Array<{ spot: boolean; type: string }> = [
     { spot: true, type: 'c7i.4xlarge' },
     { spot: true, type: 'c7i.2xlarge' },
     { spot: false, type: 'c7i.4xlarge' },
     { spot: false, type: 'c7i.2xlarge' },
   ];
+  const publishTypes = publishOnlyInstanceTypeOrder();
+  const publishAttempts: Array<{ spot: boolean; type: string }> = publishTypes.flatMap((type) => [
+    { spot: true, type },
+    { spot: false, type },
+  ]);
+  const attempts = publishOnly ? publishAttempts : renderAttempts;
 
   let lastError: unknown;
   let lastCode: string | undefined;
@@ -80,6 +97,7 @@ export async function launchWorkerForShoot(p: LaunchWorkerParams): Promise<Launc
         shootId: p.shootId,
         spot: attempt.spot,
         instanceType: attempt.type,
+        launchProfile,
       }),
     );
     try {
@@ -135,7 +153,7 @@ export async function launchWorkerForShoot(p: LaunchWorkerParams): Promise<Launc
           TableName: p.tableName,
           Key: { pk: `SHOOT#${p.shootId}`, sk: 'META' },
           UpdateExpression:
-            'SET #s = :p, phase = :st, instanceId = :i, instanceType = :it, spot = :sp, workerStartedAt = :t, maxRuntimeMinutes = :mr, deadlineAt = :dl, renderedCount = :rc REMOVE lastError, launchErrorCode, launchLockUntil',
+            'SET #s = :p, phase = :st, instanceId = :i, instanceType = :it, spot = :sp, workerStartedAt = :t, maxRuntimeMinutes = :mr, deadlineAt = :dl, launchProfile = :lp, photoCount = :pc, videoCount = :vc, totalFiles = :tf, renderedCount = :rc REMOVE lastError, launchErrorCode, launchLockUntil',
           ExpressionAttributeNames: { '#s': 'state' },
           ExpressionAttributeValues: {
             ':p': 'PROCESSING',
@@ -146,6 +164,10 @@ export async function launchWorkerForShoot(p: LaunchWorkerParams): Promise<Launc
             ':t': launchAt,
             ':mr': maxRuntimeMinutes,
             ':dl': deadlineAt,
+            ':lp': launchProfile,
+            ':pc': split.photoCount,
+            ':vc': split.videoCount,
+            ':tf': split.photoCount + split.videoCount,
             ':rc': 0,
           },
         }),

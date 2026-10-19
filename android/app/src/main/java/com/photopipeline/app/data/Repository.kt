@@ -644,8 +644,32 @@ class Repository(
         ensureServerShoot(shootId)
         uploadManifestIfReady(shootId)
         try {
-            api.finalizeShoot(shootId)
+            val accepted = api.finalizeShoot(shootId)
             clearFinalizeError(shootId)
+            getShoot(shootId)?.let { shoot ->
+                val progressPatch = buildMap<String, Any> {
+                    accepted.photoCount?.let { put("photoCount", it) }
+                    accepted.videoCount?.let { put("videoCount", it) }
+                    accepted.totalFiles?.let { put("totalFiles", it) }
+                    accepted.photoCount?.let { put("renderedPhotoCount", 0) }
+                    put("renderedCount", 0)
+                    put("publishedCount", 0)
+                }
+                if (progressPatch.isNotEmpty()) {
+                    val existing = processingProgressJson(shootId)?.let { runCatching { JSONObject(it) }.getOrNull() }
+                    val merged = JSONObject(existing?.toString() ?: "{}")
+                    progressPatch.forEach { (k, v) -> merged.put(k, v) }
+                    prefs.edit().putString("shoot_progress_$shootId", merged.toString()).apply()
+                }
+                if (accepted.deadlineAt != null || accepted.maxRuntimeMinutes != null) {
+                    db.shootDao().upsert(
+                        shoot.copy(
+                            deadlineAt = accepted.deadlineAt ?: shoot.deadlineAt,
+                            maxRuntimeMinutes = accepted.maxRuntimeMinutes ?: shoot.maxRuntimeMinutes,
+                        ),
+                    )
+                }
+            }
         } catch (e: ApiRequestException) {
             if (recoverFinalizeMaybeStarted(shootId, e)) return
             val msg = FinalizeStartRecovery.friendlyFailureMessage(e)

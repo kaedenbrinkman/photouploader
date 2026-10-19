@@ -42,9 +42,22 @@ describe('mergeProgress', () => {
     const files = [{ state: 'RENDERED', mediaType: 'photo' }, { state: 'RENDERED', mediaType: 'photo' }];
     const merged = mergeProgress(files, { totalFiles: 13, renderedCount: 0, publishedCount: 0 });
     expect(merged.renderedCount).toBe(2);
-    expect(merged.totalFiles).toBe(13);
+    expect(merged.totalFiles).toBe(2);
     expect(merged.uploadCompleteCount).toBe(0);
     expect(merged.photoCount).toBe(2);
+  });
+
+  it('dedupes duplicate FILE rows by contentSha256', () => {
+    const content = 'd'.repeat(64);
+    const files = [
+      { state: 'RENDERED', mediaType: 'photo', contentSha256: content },
+      { state: 'UPLOADED', mediaType: 'photo', contentSha256: content },
+      { state: 'RENDERED', mediaType: 'photo', contentSha256: content },
+    ];
+    const merged = mergeProgress(files, { totalFiles: 735, photoCount: 362, videoCount: 12 });
+    expect(merged.photoCount).toBe(362);
+    expect(merged.totalFiles).toBe(374);
+    expect(merged.renderedPhotoCount).toBe(1);
   });
 
   it('prefers META photoCount over inflated stateless FILE rows', () => {

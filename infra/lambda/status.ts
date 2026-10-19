@@ -33,6 +33,7 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     originalName: it.originalName,
     sizeBytes: it.sizeBytes,
     mediaType: it.mediaType,
+    contentSha256: it.contentSha256 as string | undefined,
     updatedAt: it.updatedAt,
   }));
 
@@ -60,6 +61,11 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     totalFiles: meta.Item.totalFiles as number | undefined,
     renderedCount: meta.Item.renderedCount as number | undefined,
     publishedCount: meta.Item.publishedCount as number | undefined,
+    photoCount: meta.Item.photoCount as number | undefined,
+    videoCount: meta.Item.videoCount as number | undefined,
+    renderedPhotoCount: meta.Item.renderedPhotoCount as number | undefined,
+    publishedPhotoCount: meta.Item.publishedPhotoCount as number | undefined,
+    publishedVideoCount: meta.Item.publishedVideoCount as number | undefined,
   });
 
   const albumId = meta.Item.albumId as string | undefined;

@@ -24,6 +24,13 @@ describe('computeMaxRuntimeMinutes', () => {
     const withVideo = computeMaxRuntimeMinutes(10, 20 * 1024 ** 3);
     expect(withVideo).toBeGreaterThan(photosOnly);
   });
+
+  it('uses shorter cap for publish-only retries', () => {
+    const full = computeMaxRuntimeMinutes(362, 0);
+    const publishOnly = computeMaxRuntimeMinutes(362, 0, { publishOnly: true });
+    expect(publishOnly).toBeLessThan(full);
+    expect(publishOnly).toBeGreaterThanOrEqual(15);
+  });
 });
 
 describe('computeDeadlineAt', () => {

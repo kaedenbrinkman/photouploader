@@ -962,7 +962,7 @@ private fun ResultsStep(
     val partial = shoot.state == "PARTIAL"
     val processingProgress = parseProcessingProgress(progressJson)
     val total = processingProgress?.photoCount?.takeIf { it > 0 }
-        ?: shoot.imageCount.coerceAtLeast(files.size).coerceAtLeast(1)
+        ?: shoot.imageCount.coerceAtLeast(1)
     val rendered = processingProgress?.renderedPhotos ?: files.size
     val published = processingProgress?.let {
         it.publishedPhotos + it.publishedVideos

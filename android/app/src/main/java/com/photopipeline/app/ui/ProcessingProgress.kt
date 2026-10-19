@@ -30,19 +30,28 @@ fun capProcessingProgress(
 
 fun parseProcessingProgress(json: String?): ProcessingProgress? {
     if (json.isNullOrBlank()) return null
-    return runCatching {
+    return try {
         val o = JSONObject(json)
         val legacyTotal = o.optInt("totalFiles")
         val legacyRendered = o.optInt("renderedCount")
         val legacyPublished = o.optInt("publishedCount")
+        val videoCount = o.optInt("videoCount")
+        val explicitPhotos = o.optInt("photoCount", -1)
+        val photoCount = when {
+            explicitPhotos >= 0 -> explicitPhotos
+            videoCount > 0 && legacyTotal > 0 -> (legacyTotal - videoCount).coerceAtLeast(0)
+            else -> legacyTotal
+        }
         capProcessingProgress(
             renderedPhotos = o.optInt("renderedPhotoCount", legacyRendered),
-            photoCount = o.optInt("photoCount", legacyTotal),
+            photoCount = photoCount,
             publishedPhotos = o.optInt("publishedPhotoCount", legacyPublished),
             publishedVideos = o.optInt("publishedVideoCount"),
-            videoCount = o.optInt("videoCount"),
+            videoCount = videoCount,
         )
-    }.getOrNull()
+    } catch (_: Exception) {
+        null
+    }
 }
 
 fun formatProcessingProgressLine(progress: ProcessingProgress): String {

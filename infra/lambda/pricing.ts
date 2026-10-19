@@ -100,19 +100,37 @@ const MAX_RUNTIME_MIN_CEILING = 120;
 const MAX_RUNTIME_BASE_MINUTES = 10;
 const MAX_RUNTIME_SAFETY_FACTOR = 2;
 
+export function publishOnlyInstanceTypeOrder(): string[] {
+  const p = pricingTable as any;
+  const order = p.ec2?.publishOnlyInstanceTypeOrder;
+  if (Array.isArray(order) && order.length) return order.map(String);
+  return ['t3a.medium', 't3.medium'];
+}
+
 /** Per-shoot EC2 wall clock: photo render estimate + video upload bytes (2× margin, clamped 15–120). */
-export function computeMaxRuntimeMinutes(photoCount: number, videoBytes = 0): number {
+export function computeMaxRuntimeMinutes(
+  photoCount: number,
+  videoBytes = 0,
+  opts?: { publishOnly?: boolean },
+): number {
   const photos = Math.max(0, Math.floor(Number(photoCount) || 0));
   const bytes = Math.max(0, Math.floor(Number(videoBytes) || 0));
   const p = pricingTable as any;
   const ec2 = p.ec2;
+  const publishOnly = Boolean(opts?.publishOnly);
   const totalFiles = Math.max(1, photos + (bytes > 0 ? 1 : 0));
-  const instanceType =
-    totalFiles < 50 ? (ec2.instanceTypeOrder[1] ?? ec2.instanceTypeOrder[0]) : ec2.instanceTypeOrder[0];
-  const par = ec2.parallelism[instanceType] ?? 4;
-  const runtimeSecondsPerPhoto =
-    Number(ec2.maxRuntimeSecondsPerPhotoAtParallelism) ||
-    ec2.secondsPerImageAtReferenceParallelism * 3;
+  const renderOrder = ec2.instanceTypeOrder as string[];
+  const publishOrder = publishOnlyInstanceTypeOrder();
+  const instanceType = publishOnly
+    ? publishOrder[0]!
+    : totalFiles < 50
+      ? (renderOrder[1] ?? renderOrder[0])
+      : renderOrder[0];
+  const par = ec2.parallelism[instanceType] ?? (publishOnly ? 2 : 4);
+  const runtimeSecondsPerPhoto = publishOnly
+    ? Number(ec2.maxRuntimeSecondsPerPublishOnlyPhoto) || 5
+    : Number(ec2.maxRuntimeSecondsPerPhotoAtParallelism) ||
+      ec2.secondsPerImageAtReferenceParallelism * 3;
   const secondsPerFile = runtimeSecondsPerPhoto / par;
   const photoMinutes =
     photos > 0 ? Math.ceil(photos * (secondsPerFile / 60) * MAX_RUNTIME_SAFETY_FACTOR) : 0;
