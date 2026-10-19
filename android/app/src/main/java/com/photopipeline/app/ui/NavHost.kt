@@ -217,7 +217,7 @@ fun HomeScreen(
                 CameraConnectionCard(
                     usbState = usbState,
                     camera = cameraSnapshot,
-                    permissionHint = "Start a shoot — USB access is requested automatically.",
+                    permissionHint = "Allow USB access when Android prompts you.",
                     disconnectedHint = "Canon via USB — use a data-capable cable.",
                 )
             }

@@ -19,6 +19,18 @@ class UsbDeviceInspectorTest {
     }
 
     @Test
+    fun isSupportedCamera_acceptsCanonOrMtpInterface() {
+        val canon = mockDevice(vendorId = 0x04A9, productId = 1, interfaceCount = 0)
+        assertTrue(UsbDeviceInspector.isSupportedCamera(canon))
+        val mtpOnly = mockDevice(vendorId = 0x054C, productId = 1, interfaceCount = 1)
+        every { mtpOnly.getInterface(0) } returns mockInterface(UsbConstants.USB_CLASS_STILL_IMAGE, 1, 0)
+        assertTrue(UsbDeviceInspector.isSupportedCamera(mtpOnly))
+        val other = mockDevice(vendorId = 0x054C, productId = 1, interfaceCount = 1)
+        every { other.getInterface(0) } returns mockInterface(UsbConstants.USB_CLASS_VENDOR_SPEC, 0, 0)
+        assertFalse(UsbDeviceInspector.isSupportedCamera(other))
+    }
+
+    @Test
     fun findMtpInterfaceIndex_detectsStillImageSubclass() {
         val device = mockDevice(vendorId = 0x04A9, productId = 1, interfaceCount = 2)
         every { device.getInterface(0) } returns mockInterface(UsbConstants.USB_CLASS_VENDOR_SPEC, 0, 0)

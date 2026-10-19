@@ -30,6 +30,7 @@ class MainActivity : ComponentActivity() {
         PipelineLog.d("activity", "MainActivity.onCreate action=${intent?.action}")
         val app = application as PhotoPipelineApp
         app.usbCameraManager.onUsbIntent(intent)
+        app.usbCameraManager.onAppForeground()
         GoogleAuthCoordinator.tryCompleteFromIntent(this, intent)
         setContent {
             PhotoPipelineTheme {
@@ -48,6 +49,11 @@ class MainActivity : ComponentActivity() {
             (application as PhotoPipelineApp).usbCameraManager.onUsbIntent(intent)
         }
         GoogleAuthCoordinator.tryCompleteFromIntent(this, intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        (application as PhotoPipelineApp).usbCameraManager.onAppForeground()
     }
 
     private fun requestUploadNotificationPermissionIfNeeded() {

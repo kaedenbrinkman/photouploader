@@ -50,4 +50,8 @@ object UsbDeviceInspector {
     }
 
     fun isCanon(device: UsbDevice): Boolean = device.vendorId == 0x04A9
+
+    /** Canon bodies or any USB still-image (MTP) interface we can open. */
+    fun isSupportedCamera(device: UsbDevice): Boolean =
+        isCanon(device) || findMtpInterfaceIndex(device) != null
 }

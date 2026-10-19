@@ -45,6 +45,9 @@ class UsbCameraManager(private val appContext: Context) {
     private var permissionCallback: ((Boolean) -> Unit)? = null
 
     @Volatile
+    private var permissionRequestInFlight = false
+
+    @Volatile
     private var suppressEmptyDeviceListWarnings = false
 
     private var emptyDeviceListLoggedWhileSuppressed = false
@@ -70,6 +73,7 @@ class UsbCameraManager(private val appContext: Context) {
                 if (!granted) {
                     _accessState.value = UsbAccessState.PERMISSION_DENIED
                 }
+                permissionRequestInFlight = false
                 permissionCallback?.invoke(granted)
                 permissionCallback = null
                 refreshProbe(log = true)
@@ -86,9 +90,8 @@ class UsbCameraManager(private val appContext: Context) {
                             "usb-attach",
                             "ACTION_USB_DEVICE_ATTACHED ${device?.let { UsbDeviceInspector.describe(it) } ?: "no extra"}",
                         )
-                        if (device != null && UsbDeviceInspector.isCanon(device)) {
-                            _selectedDevice.value = device
-                            refreshProbe(log = true)
+                        if (device != null) {
+                            handleCameraAttached(device, log = true)
                         }
                     }
                     UsbManager.ACTION_USB_DEVICE_DETACHED -> {
@@ -129,6 +132,13 @@ class UsbCameraManager(private val appContext: Context) {
         receiversRegistered = true
         logDeviceList("startup")
         refreshProbe(log = true)
+        autoRequestUsbPermissionIfNeeded()
+    }
+
+    /** Call when the app process is visible (create / resume) to probe and prompt for USB access. */
+    fun onAppForeground() {
+        refreshProbe(log = true)
+        autoRequestUsbPermissionIfNeeded()
     }
 
     fun stop() {
@@ -148,10 +158,11 @@ class UsbCameraManager(private val appContext: Context) {
                     "usb-intent",
                     "Activity USB_DEVICE_ATTACHED ${device?.let { UsbDeviceInspector.describe(it) } ?: "?"}",
                 )
-                if (device != null) _selectedDevice.value = device
-                refreshProbe(log = true)
-                if (_accessState.value == UsbAccessState.PERMISSION_REQUIRED) {
-                    requestPermission()
+                if (device != null) {
+                    handleCameraAttached(device, log = true)
+                } else {
+                    refreshProbe(log = true)
+                    autoRequestUsbPermissionIfNeeded()
                 }
             }
             UsbManager.ACTION_USB_DEVICE_DETACHED -> {
@@ -196,7 +207,7 @@ class UsbCameraManager(private val appContext: Context) {
         // Reuse an already-open MTP session even when UsbManager.deviceList is empty (common while MTP is claimed).
         synchronized(sessionLock) {
             val openDev = sessionDevice
-            if (sessionMtp != null && openDev != null && UsbDeviceInspector.isCanon(openDev)) {
+            if (sessionMtp != null && openDev != null && UsbDeviceInspector.isSupportedCamera(openDev)) {
                 _selectedDevice.value = openDev
                 if (usbManager.hasPermission(openDev)) {
                     _accessState.value = UsbAccessState.READY
@@ -252,17 +263,55 @@ class UsbCameraManager(private val appContext: Context) {
         }
         if (usbManager.hasPermission(device)) {
             PipelineLog.d("usb-permission", "Already granted for ${device.deviceName}")
+            permissionRequestInFlight = false
             onResult?.invoke(true)
             refreshProbe(log = true)
             return
         }
-        permissionCallback = onResult
+        if (permissionRequestInFlight && onResult == null) {
+            PipelineLog.d("usb-permission", "Permission dialog already in flight")
+            return
+        }
+        if (onResult != null) {
+            permissionCallback = onResult
+        }
+        permissionRequestInFlight = true
         val intent = Intent(ACTION_USB_PERMISSION).setPackage(appContext.packageName)
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
         val pi = PendingIntent.getBroadcast(appContext, 0, intent, flags)
         PipelineLog.d("usb-permission", "Calling UsbManager.requestPermission for ${device.deviceName}")
         usbManager.requestPermission(device, pi)
+    }
+
+    private fun handleCameraAttached(device: UsbDevice, log: Boolean) {
+        if (!UsbDeviceInspector.isSupportedCamera(device)) {
+            PipelineLog.d("usb-attach", "Ignoring unsupported USB device ${device.deviceName}")
+            return
+        }
+        _selectedDevice.value = device
+        refreshProbe(log = log)
+        autoRequestUsbPermissionIfNeeded()
+    }
+
+    private fun autoRequestUsbPermissionIfNeeded() {
+        val device = findCanonDevice() ?: return
+        if (usbManager.hasPermission(device)) {
+            if (_accessState.value != UsbAccessState.READY) {
+                refreshProbe(log = false)
+            }
+            return
+        }
+        if (_accessState.value != UsbAccessState.PERMISSION_REQUIRED &&
+            _accessState.value != UsbAccessState.PERMISSION_DENIED
+        ) {
+            return
+        }
+        if (permissionCallback != null) {
+            PipelineLog.d("usb-permission", "Skipping auto-request — explicit waiter active")
+            return
+        }
+        requestPermission(onResult = null)
     }
 
     suspend fun requestPermissionSuspend(): Boolean = suspendCancellableCoroutine { cont ->
@@ -375,10 +424,10 @@ class UsbCameraManager(private val appContext: Context) {
 
     fun findCanonDevice(): UsbDevice? {
         synchronized(sessionLock) {
-            sessionDevice?.takeIf { UsbDeviceInspector.isCanon(it) }?.let { return it }
+            sessionDevice?.takeIf { UsbDeviceInspector.isSupportedCamera(it) }?.let { return it }
         }
-        listUsbDevices().firstOrNull { UsbDeviceInspector.isCanon(it) }?.let { return it }
-        _selectedDevice.value?.takeIf { UsbDeviceInspector.isCanon(it) }?.let { cached ->
+        listUsbDevices().firstOrNull { UsbDeviceInspector.isSupportedCamera(it) }?.let { return it }
+        _selectedDevice.value?.takeIf { UsbDeviceInspector.isSupportedCamera(it) }?.let { cached ->
             PipelineLog.w("usb", "Using cached USB_DEVICE_ATTACHED Canon (not in current deviceList)")
             return cached
         }
