@@ -104,6 +104,8 @@ def upload_album(
             json={"album": {"title": album_title[:500]}},
         ).json()
         ledger["album_id"] = led_album["id"]
+        if led_album.get("productUrl"):
+            ledger["album_product_url"] = led_album["productUrl"]
         save_ledger()
 
     pending: list[str] = []
@@ -158,7 +160,12 @@ def upload_album(
         save_ledger()
 
     n = sum(1 for v in ledger.get("items", {}).values() if v["state"] == "CREATED")
-    return {"album_id": ledger["album_id"], "created": n, "total": len(ledger.get("items", {}))}
+    return {
+        "album_id": ledger["album_id"],
+        "album_product_url": ledger.get("album_product_url"),
+        "created": n,
+        "total": len(ledger.get("items", {})),
+    }
 
 
 def main():

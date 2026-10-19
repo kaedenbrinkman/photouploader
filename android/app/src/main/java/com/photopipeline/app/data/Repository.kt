@@ -474,7 +474,18 @@ class Repository(
         val existing = getShoot(shootId)
         db.shootDao().upsert(
             (existing ?: ShootEntity(
-                shootId, shootId, "IMPORTING", "IMPORT", System.currentTimeMillis(), 0, 0, null, null, null, null,
+                shootId,
+                shootId,
+                "IMPORTING",
+                "IMPORT",
+                System.currentTimeMillis(),
+                0,
+                0,
+                null,
+                null,
+                null,
+                null,
+                null,
             )).copy(
                 imageCount = allFiles.size,
                 totalBytes = totalBytes,
@@ -637,30 +648,42 @@ class Repository(
 
     suspend fun submitShoot(shootId: String) = finalizeShootForProcessing(shootId)
 
-    suspend fun refreshBackendStatus(shootId: String): com.photopipeline.app.api.ShootStatusResponse? {
+    suspend fun refreshBackendStatus(
+        shootId: String,
+        acceptStatusAfterMs: Long? = null,
+    ): com.photopipeline.app.api.ShootStatusResponse? {
         if (!canUseBackendApi()) return null
         val status = api.fetchStatus(shootId)
+        val statusUpdatedAt = status.updatedAt ?: 0L
+        if (acceptStatusAfterMs != null && statusUpdatedAt < acceptStatusAfterMs) {
+            return status
+        }
         val shoot = getShoot(shootId) ?: return status
-        status.progress?.let { p ->
+        val progressPayload = buildMap<String, Any> {
+            status.progress?.let { p ->
+                put("totalFiles", p.totalFiles)
+                put("renderedCount", p.renderedCount)
+                put("publishedCount", p.publishedCount)
+                put("uploadCompleteCount", p.uploadCompleteCount)
+            }
+            status.workerStartedAt?.let { put("workerStartedAt", it) }
+        }
+        if (progressPayload.isNotEmpty()) {
             prefs.edit().putString(
                 "shoot_progress_$shootId",
-                JSONObject(
-                    mapOf(
-                        "totalFiles" to p.totalFiles,
-                        "renderedCount" to p.renderedCount,
-                        "publishedCount" to p.publishedCount,
-                        "uploadCompleteCount" to p.uploadCompleteCount,
-                    ),
-                ).toString(),
+                JSONObject(progressPayload).toString(),
             ).apply()
         }
         cacheServerFileStatuses(shootId, status.files)
+        val openUrl = status.albumProductUrl?.takeIf { it.startsWith("http") }
+            ?: status.albumId?.let { "https://photos.google.com/lr/album/$it" }
         db.shootDao().upsert(
             shoot.copy(
                 state = status.state,
                 phase = status.phase ?: status.state,
                 backendState = status.state,
                 albumId = status.albumId,
+                albumProductUrl = openUrl ?: shoot.albumProductUrl,
                 maxRuntimeMinutes = status.maxRuntimeMinutes,
                 deadlineAt = status.deadlineAt,
                 actualComputeJson = status.actualCompute?.let { ac ->
@@ -675,6 +698,14 @@ class Repository(
 
     fun processingProgressJson(shootId: String): String? =
         prefs.getString("shoot_progress_$shootId", null)
+
+    fun processingWorkerStartedAtMs(shootId: String): Long? {
+        val raw = processingProgressJson(shootId) ?: return null
+        return runCatching {
+            val o = JSONObject(raw)
+            o.optLong("workerStartedAt").takeIf { it > 0L }
+        }.getOrNull()
+    }
 
     suspend fun isCameraObjectUploadedElsewhere(shootId: String, obj: MtpObjectInfo): Boolean {
         if (

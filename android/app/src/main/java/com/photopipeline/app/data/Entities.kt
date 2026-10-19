@@ -15,6 +15,8 @@ data class ShootEntity(
     val estimateJson: String?,
     val backendState: String?,
     val albumId: String?,
+    /** Google Photos share/open URL when known (from albums.create productUrl). */
+    val albumProductUrl: String? = null,
     val actualComputeJson: String?,
     val maxRuntimeMinutes: Int? = null,
     val deadlineAt: Long? = null,

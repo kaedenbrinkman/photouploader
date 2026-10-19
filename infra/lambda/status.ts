@@ -4,6 +4,7 @@ import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import type { APIGatewayProxyHandlerV2 } from 'aws-lambda';
 import { actualComputeCost } from './pricing';
 import { json, userIdFromEvent } from './http';
+import { albumOpenUrl, mergeProgress, runningActualCompute } from './status-progress';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const s3 = new S3Client({});
@@ -45,15 +46,23 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
 
   const started = meta.Item.workerStartedAt as number | undefined;
   const finished = meta.Item.workerFinishedAt as number | undefined;
-  let actualCompute: { seconds?: number; usd?: number } = {};
-  if (started && finished && meta.Item.instanceType) {
-    const seconds = Math.max(0, (finished - started) / 1000);
-    const usd = actualComputeCost(seconds, String(meta.Item.instanceType), Boolean(meta.Item.spot));
-    actualCompute = {
-      seconds: Math.round(seconds),
-      usd: Number.isFinite(usd) ? usd : 0,
-    };
-  }
+  const actualCompute = runningActualCompute(
+    started,
+    finished,
+    meta.Item.instanceType as string | undefined,
+    meta.Item.spot as boolean | undefined,
+    Date.now(),
+    actualComputeCost,
+  );
+
+  const progress = mergeProgress(files, {
+    totalFiles: meta.Item.totalFiles as number | undefined,
+    renderedCount: meta.Item.renderedCount as number | undefined,
+    publishedCount: meta.Item.publishedCount as number | undefined,
+  });
+
+  const albumId = meta.Item.albumId as string | undefined;
+  const albumProductUrl = meta.Item.albumProductUrl as string | undefined;
 
   return json(200, {
     shootId,
@@ -61,17 +70,15 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     phase: meta.Item.phase,
     lastError: meta.Item.lastError,
     launchErrorCode: meta.Item.launchErrorCode,
-    albumId: meta.Item.albumId,
+    updatedAt: meta.Item.updatedAt,
+    albumId,
+    albumProductUrl: albumOpenUrl(albumId, albumProductUrl),
     instanceId: meta.Item.instanceId,
     missingKeys: meta.Item.missingKeys,
-    progress: {
-      totalFiles: meta.Item.totalFiles ?? files.length,
-      renderedCount: meta.Item.renderedCount ?? 0,
-      publishedCount: meta.Item.publishedCount ?? 0,
-      uploadCompleteCount: files.filter((f) => f.state === 'UPLOADED' || f.state === 'GP_CREATED').length,
-    },
+    progress,
     estimateAtSubmit: meta.Item.estimateAtSubmit,
     actualCompute,
+    workerStartedAt: started,
     maxRuntimeMinutes: meta.Item.maxRuntimeMinutes,
     deadlineAt: meta.Item.deadlineAt,
     files,

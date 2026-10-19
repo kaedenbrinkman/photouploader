@@ -145,11 +145,12 @@ class ShootViewModel(
                 isResumeShoot = resume,
                 processingProgress = repo.processingProgressJson(shootId),
                 serverFileStatusBySha = loadServerFileStatusMap(),
-                processingStartedAtMs = if (initialStep == ShootFlowStep.Processing) {
-                    System.currentTimeMillis()
-                } else {
-                    null
-                },
+                processingStartedAtMs = repo.processingWorkerStartedAtMs(shootId)
+                    ?: if (initialStep == ShootFlowStep.Processing) {
+                        System.currentTimeMillis()
+                    } else {
+                        null
+                    },
                 statusLine = if (resume) {
                     "Resume upload — connect the camera when ready."
                 } else {
@@ -191,6 +192,8 @@ class ShootViewModel(
     private var autoResumeAttempted = false
     private var autoFinalizeScheduled = false
     private var finalizeInFlight = false
+    /** Ignore status polls whose META.updatedAt is older than this retry (optimistic retry UI). */
+    private var processingRetryStartedAtMs: Long? = null
 
     fun refreshBackendGate() {
         _ui.value = _ui.value.copy(
@@ -546,6 +549,20 @@ class ShootViewModel(
             _ui.value = _ui.value.copy(snackbar = repo.backendGateMessage())
             return
         }
+        val retryAt = System.currentTimeMillis()
+        processingRetryStartedAtMs = retryAt
+        repo.clearFinalizeError(shootId)
+        _ui.value = _ui.value.copy(
+            busy = true,
+            step = ShootFlowStep.Processing,
+            finalizeState = FinalizeState.InProgress,
+            finalizeError = null,
+            serverProcessingError = null,
+            serverLastError = null,
+            serverLaunchErrorCode = null,
+            serverPhase = null,
+            statusLine = "Starting server processing…",
+        )
         safeScope.launch { runFinalizeForProcessing(userInitiated = true) }
     }
 
@@ -733,21 +750,34 @@ class ShootViewModel(
                 if (!shouldPollBackend()) break
                 var stopPolling = false
                 var transientFailure = false
-                runCatching { repo.refreshBackendStatus(shootId) }
+                var statusApplied = false
+                val retryGate = processingRetryStartedAtMs
+                runCatching { repo.refreshBackendStatus(shootId, acceptStatusAfterMs = retryGate) }
                     .onSuccess { status ->
                         pollIntervalMs = 10_000L
                         status?.let {
+                            val updatedAt = it.updatedAt ?: 0L
+                            val stale = retryGate != null && updatedAt < retryGate!!
+                            if (!stale && retryGate != null) {
+                                processingRetryStartedAtMs = null
+                            }
+                            if (stale) return@onSuccess
+                            statusApplied = true
                             val friendly = FinalizeErrorMessages.friendly(it.launchErrorCode, it.lastError)
+                            val workerStarted = it.workerStartedAt ?: repo.processingWorkerStartedAtMs(shootId)
                             _ui.value = _ui.value.copy(
                                 serverPhase = it.phase,
                                 serverLaunchErrorCode = it.launchErrorCode,
                                 serverLastError = it.lastError,
+                                processingStartedAtMs = workerStarted ?: _ui.value.processingStartedAtMs,
                                 serverProcessingError = when {
                                     it.state == "READY_TO_PROCESS" || it.state == "FAILED" -> friendly
                                     it.state == "PROCESSING" && !it.lastError.isNullOrBlank() -> friendly
                                     !it.lastError.isNullOrBlank() -> friendly
-                                    else -> _ui.value.serverProcessingError
+                                    else -> null
                                 },
+                                processingProgress = repo.processingProgressJson(shootId),
+                                serverFileStatusBySha = loadServerFileStatusMap(),
                             )
                         }
                     }
@@ -770,15 +800,15 @@ class ShootViewModel(
                         }
                     }
                 if (stopPolling) break
-                if (!transientFailure) {
-                    val progress = repo.processingProgressJson(shootId)
-                    _ui.value = _ui.value.copy(
-                        processingProgress = progress,
-                        serverFileStatusBySha = loadServerFileStatusMap(),
-                    )
+                if (!transientFailure && statusApplied) {
                     recomputeStep(shoot.value, files.value)
                     val state = shoot.value?.state
                     if (state in TERMINAL) break
+                } else if (!transientFailure && processingRetryStartedAtMs != null) {
+                    // Keep optimistic Processing step until a post-retry status lands.
+                    if (_ui.value.step != ShootFlowStep.Processing) {
+                        _ui.value = _ui.value.copy(step = ShootFlowStep.Processing)
+                    }
                 }
                 delay(pollIntervalMs)
             }

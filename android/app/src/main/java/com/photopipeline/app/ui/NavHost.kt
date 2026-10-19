@@ -1,5 +1,6 @@
 package com.photopipeline.app.ui
 
+import android.net.Uri
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -71,6 +72,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.photopipeline.app.data.FileEntity
 import com.photopipeline.app.data.Repository
 import com.photopipeline.app.data.ShootEntity
 import com.photopipeline.app.mtp.UsbAccessState
@@ -600,9 +602,12 @@ fun ShootFlowScreen(
                 ShootFlowStep.Results -> item {
                     ResultsStep(
                         shoot = shoot,
+                        files = files,
+                        progressJson = ui.processingProgress,
                         showRetry = vm.needsProcessingRetry(),
                         finalizeError = ui.finalizeError,
                         busy = ui.busy,
+                        thumbnailForHandle = { vm.readCachedThumbnail(it) },
                         onRetryProcessing = { vm.retryProcessing() },
                     )
                 }
@@ -907,39 +912,141 @@ private fun SpeedSparkline(samples: List<Long>) {
 @Composable
 private fun ResultsStep(
     shoot: ShootEntity?,
+    files: List<FileEntity>,
+    progressJson: String?,
     showRetry: Boolean,
     finalizeError: String?,
     busy: Boolean,
+    thumbnailForHandle: (Long) -> ByteArray?,
     onRetryProcessing: () -> Unit,
 ) {
     shoot ?: return
+    val context = LocalContext.current
     val failed = shoot.state == "FAILED"
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = if (failed) {
-                MaterialTheme.colorScheme.errorContainer
-            } else {
-                MaterialTheme.colorScheme.primaryContainer
-            },
-        ),
-    ) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (!failed) {
-                Icon(Icons.Default.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-            }
-            Text("Shoot ${humanShootState(shoot).lowercase()}", style = MaterialTheme.typography.titleMedium)
-            if (shoot.albumId != null) {
-                Text("Google Photos album id: ${shoot.albumId}")
-                Text("Open Google Photos and search your library for this album.", style = MaterialTheme.typography.bodySmall)
-            } else if (!failed) {
-                Text("Album link will appear when processing finishes.")
-            }
-            if (showRetry) {
-                ProcessingRetryBlock(error = finalizeError, busy = busy, onRetry = onRetryProcessing)
+    val progress = parseProgress(progressJson)
+    val total = progress?.second ?: shoot.imageCount.coerceAtLeast(files.size).coerceAtLeast(1)
+    val rendered = progress?.first ?: files.size
+    val published = progress?.third ?: rendered
+    val compute = shoot.actualComputeJson?.let {
+        runCatching {
+            val o = JSONObject(it)
+            o.optInt("seconds", 0) to o.optDouble("usd", 0.0)
+        }.getOrNull()
+    }
+    val albumUrl = shootAlbumOpenUrl(shoot)
+
+    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = when {
+                    failed -> MaterialTheme.colorScheme.errorContainer
+                    else -> MaterialTheme.colorScheme.primaryContainer
+                },
+            ),
+        ) {
+            Column(
+                Modifier.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Icon(
+                    Icons.Default.CheckCircle,
+                    contentDescription = null,
+                    modifier = Modifier.size(48.dp),
+                    tint = if (failed) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.primary
+                    },
+                )
+                Text(
+                    if (failed) "Processing failed" else "Album ready in Google Photos",
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = if (failed) {
+                        MaterialTheme.colorScheme.onErrorContainer
+                    } else {
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    },
+                )
+                if (!failed) {
+                    Text(
+                        shoot.albumTitle,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    )
+                }
+                Text(
+                    "Rendered $rendered of $total · Published $published of $total",
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+                compute?.let { (sec, usd) ->
+                    Text(
+                        "Total time ${formatResultsDuration(sec)} · Cost ~$${"%.4f".format(usd)}",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
             }
         }
+
+        if (albumUrl != null && !failed) {
+            Button(
+                onClick = {
+                    context.startActivity(
+                        Intent(Intent.ACTION_VIEW, Uri.parse(albumUrl)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    )
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Open album in Google Photos")
+            }
+        }
+
+        if (files.isNotEmpty()) {
+            Text("Photos", style = MaterialTheme.typography.titleMedium)
+            files.chunked(3).forEach { row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    row.forEach { file ->
+                        Card(
+                            modifier = Modifier.weight(1f),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            ),
+                        ) {
+                            Column(Modifier.padding(6.dp)) {
+                                ShootThumbnailImage(thumbnailForHandle(file.objectHandle))
+                                Text(
+                                    file.originalName,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.labelSmall,
+                                )
+                            }
+                        }
+                    }
+                    repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
+                }
+            }
+        }
+
+        if (showRetry) {
+            ProcessingRetryBlock(error = finalizeError, busy = busy, onRetry = onRetryProcessing)
+        }
     }
+}
+
+private fun shootAlbumOpenUrl(shoot: ShootEntity): String? {
+    val url = shoot.albumProductUrl
+    if (!url.isNullOrBlank() && url.startsWith("http")) return url
+    val id = shoot.albumId ?: return null
+    return "https://photos.google.com/lr/album/$id"
+}
+
+private fun formatResultsDuration(totalSeconds: Int): String {
+    if (totalSeconds < 60) return "${totalSeconds}s"
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return if (seconds == 0) "${minutes}m" else "${minutes}m ${seconds}s"
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

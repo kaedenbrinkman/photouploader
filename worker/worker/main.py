@@ -219,14 +219,16 @@ def run() -> int:
             Body=json.dumps(body).encode(),
             ContentType="application/json",
         )
-        store.update_shoot(
-            cfg.shoot_id,
-            state="DONE",
-            phase="DONE",
-            albumId=result.get("album_id"),
-            resultsS3Key=results_key,
-            workerFinishedAt=t1,
-        )
+        album_updates: dict = {
+            "state": "DONE",
+            "phase": "DONE",
+            "albumId": result.get("album_id"),
+            "resultsS3Key": results_key,
+            "workerFinishedAt": t1,
+        }
+        if result.get("album_product_url"):
+            album_updates["albumProductUrl"] = result.get("album_product_url")
+        store.update_shoot(cfg.shoot_id, **album_updates)
         log.info("done: %s", body)
         return 0
     except Exception as e:
