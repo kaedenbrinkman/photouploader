@@ -4,11 +4,43 @@ package com.photopipeline.app.mtp
 object CameraMtpFormat {
     fun cameraDisplayTitle(manufacturer: String?, model: String?): String {
         val m = model?.trim().orEmpty()
-        val man = manufacturer?.trim().orEmpty()
-        if (m.isBlank()) return man.ifBlank { "Camera" }
-        if (man.isBlank()) return m
-        if (m.contains(man, ignoreCase = true)) return m
-        return "$man $m"
+        val manNorm = normalizeManufacturerName(manufacturer?.trim().orEmpty())
+        if (m.isBlank()) return manNorm.ifBlank { "Camera" }
+        if (manNorm.isBlank()) return m
+
+        val brand = manufacturerBrandWord(manNorm)
+        if (brand.isNotEmpty() && modelStartsWithBrand(m, brand)) {
+            return m
+        }
+        if (m.contains(manNorm, ignoreCase = true)) {
+            return m
+        }
+        return "$manNorm $m"
+    }
+
+    /** e.g. "Canon.Inc" → "Canon", "Sony Corporation" → "Sony" */
+    internal fun normalizeManufacturerName(manufacturer: String): String {
+        if (manufacturer.isBlank()) return ""
+        var s = manufacturer.replace('.', ' ').replace(Regex("\\s+"), " ").trim()
+        val suffix = Regex(
+            "\\s+(Inc\\.?|Incorporated|LLC|Ltd\\.?|Limited|Corp\\.?|Corporation|Co\\.?|Company)$",
+            RegexOption.IGNORE_CASE,
+        )
+        while (true) {
+            val next = s.replace(suffix, "").trim()
+            if (next == s) break
+            s = next
+        }
+        return s.trim()
+    }
+
+    internal fun manufacturerBrandWord(normalizedManufacturer: String): String =
+        normalizedManufacturer.split(Regex("\\s+")).firstOrNull().orEmpty()
+
+    private fun modelStartsWithBrand(model: String, brand: String): Boolean {
+        if (!model.regionMatches(0, brand, 0, brand.length, ignoreCase = true)) return false
+        if (model.length == brand.length) return true
+        return !model[brand.length].isLetterOrDigit()
     }
 
     fun maskSerialNumber(serial: String?): String? {

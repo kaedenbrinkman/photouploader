@@ -18,6 +18,25 @@ class CameraMtpFormatTest {
     }
 
     @Test
+    fun cameraDisplayTitle_stripsIncAndUsesModelWhenBrandPresent() {
+        assertEquals(
+            "Canon EOS R8",
+            CameraMtpFormat.cameraDisplayTitle("Canon.Inc", "Canon EOS R8"),
+        )
+    }
+
+    @Test
+    fun cameraDisplayTitle_normalizesIncWhenJoiningModel() {
+        assertEquals("Canon EOS R8", CameraMtpFormat.cameraDisplayTitle("Canon.Inc", "EOS R8"))
+    }
+
+    @Test
+    fun normalizeManufacturerName_stripsCorporateSuffixes() {
+        assertEquals("Canon", CameraMtpFormat.normalizeManufacturerName("Canon.Inc"))
+        assertEquals("Sony", CameraMtpFormat.normalizeManufacturerName("Sony Corporation"))
+    }
+
+    @Test
     fun maskSerialNumber_showsLastFourOnly() {
         assertEquals("S/N •••1234", CameraMtpFormat.maskSerialNumber("ABC1234567891234"))
     }
