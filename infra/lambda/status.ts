@@ -4,6 +4,8 @@ import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import type { APIGatewayProxyHandlerV2 } from 'aws-lambda';
 import { actualComputeCost } from './pricing';
 import { json, userIdFromEvent } from './http';
+import { persistedActualCompute } from './shoot-finalize-meta';
+import { albumOpenUrl, mergeProgress, runningActualCompute } from './status-progress';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const s3 = new S3Client({});
@@ -31,6 +33,8 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     error: it.error,
     originalName: it.originalName,
     sizeBytes: it.sizeBytes,
+    mediaType: it.mediaType,
+    contentSha256: it.contentSha256 as string | undefined,
     updatedAt: it.updatedAt,
   }));
 
@@ -45,30 +49,56 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
 
   const started = meta.Item.workerStartedAt as number | undefined;
   const finished = meta.Item.workerFinishedAt as number | undefined;
-  let actualCompute: { seconds?: number; usd?: number } = {};
-  if (started && finished && meta.Item.instanceType) {
-    const seconds = (finished - started) / 1000;
-    actualCompute = {
-      seconds: Math.round(seconds),
-      usd: actualComputeCost(seconds, String(meta.Item.instanceType), Boolean(meta.Item.spot)),
-    };
-  }
+  const actualCompute =
+    persistedActualCompute(meta.Item) ??
+    runningActualCompute(
+      started,
+      finished,
+      meta.Item.instanceType as string | undefined,
+      meta.Item.spot as boolean | undefined,
+      Date.now(),
+      actualComputeCost,
+    );
+  const instanceType =
+    (meta.Item.instanceType as string | undefined) ??
+    (meta.Item.finalInstanceType as string | undefined);
+
+  const progress = mergeProgress(files, {
+    totalFiles: meta.Item.totalFiles as number | undefined,
+    renderedCount: meta.Item.renderedCount as number | undefined,
+    publishedCount: meta.Item.publishedCount as number | undefined,
+    photoCount: meta.Item.photoCount as number | undefined,
+    videoCount: meta.Item.videoCount as number | undefined,
+    renderedPhotoCount: meta.Item.renderedPhotoCount as number | undefined,
+    publishedPhotoCount: meta.Item.publishedPhotoCount as number | undefined,
+    publishedVideoCount: meta.Item.publishedVideoCount as number | undefined,
+  });
+
+  const albumId = meta.Item.albumId as string | undefined;
+  const albumProductUrl = meta.Item.albumProductUrl as string | undefined;
 
   return json(200, {
     shootId,
     state: meta.Item.state,
     phase: meta.Item.phase,
-    albumId: meta.Item.albumId,
+    lastError: meta.Item.lastError,
+    launchErrorCode: meta.Item.launchErrorCode,
+    updatedAt: meta.Item.updatedAt,
+    albumId,
+    albumProductUrl: albumOpenUrl(albumId, albumProductUrl),
     instanceId: meta.Item.instanceId,
+    instanceType,
+    spot: meta.Item.spot,
+    finalInstanceType: meta.Item.finalInstanceType,
+    workerFinishedAt: finished,
     missingKeys: meta.Item.missingKeys,
-    progress: {
-      totalFiles: meta.Item.totalFiles ?? files.length,
-      renderedCount: meta.Item.renderedCount ?? 0,
-      publishedCount: meta.Item.publishedCount ?? 0,
-      uploadCompleteCount: files.filter((f) => f.state === 'UPLOADED' || f.state === 'GP_CREATED').length,
-    },
+    progress,
     estimateAtSubmit: meta.Item.estimateAtSubmit,
     actualCompute,
+    workerStartedAt: started,
+    renderStartedAt: meta.Item.renderStartedAt as number | undefined,
+    maxRuntimeMinutes: meta.Item.maxRuntimeMinutes,
+    deadlineAt: meta.Item.deadlineAt,
     files,
     results,
   });

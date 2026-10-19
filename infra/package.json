@@ -21,6 +21,7 @@
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.699.0",
     "@aws-sdk/client-ec2": "^3.699.0",
+    "@aws-sdk/client-lambda": "^3.699.0",
     "@aws-sdk/client-secrets-manager": "^3.699.0",
     "@aws-sdk/lib-dynamodb": "^3.699.0",
     "@aws-sdk/s3-request-presigner": "^3.699.0",
@@ -29,6 +30,7 @@
     "constructs": "^10.4.2",
     "esbuild": "^0.24.0",
     "@aws-sdk/client-ssm": "^3.699.0",
-    "uuid": "^11.0.3"
+    "uuid": "^11.0.3",
+    "jose": "^5.9.6"
   }
 }

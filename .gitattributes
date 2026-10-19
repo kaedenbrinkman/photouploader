@@ -1,0 +1,9 @@
+* text=auto
+
+# Linux / EC2 / container scripts and images
+*.sh text eol=lf
+*.bash text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+**/.dockerignore text eol=lf

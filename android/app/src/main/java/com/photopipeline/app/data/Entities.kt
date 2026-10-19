@@ -15,7 +15,11 @@ data class ShootEntity(
     val estimateJson: String?,
     val backendState: String?,
     val albumId: String?,
+    /** Google Photos share/open URL when known (from albums.create productUrl). */
+    val albumProductUrl: String? = null,
     val actualComputeJson: String?,
+    val maxRuntimeMinutes: Int? = null,
+    val deadlineAt: Long? = null,
 )
 
 @Entity(tableName = "files")
@@ -29,6 +33,8 @@ data class FileEntity(
     val objectHandle: Long,
     val captureTimeEpochMs: Long,
     val localPath: String?,
+    /** CAMERA_STREAM (default) streams MTP→S3; LOCAL uses localPath copy mode. */
+    val uploadSource: String = "CAMERA_STREAM",
     val uploadState: String,
     val uploadedBytes: Long,
     val uploadSpeedBps: Long,

@@ -5,32 +5,56 @@ import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.workDataOf
+import com.photopipeline.app.upload.UploadMetricsStore
 import com.photopipeline.app.api.ApiClient
-import com.photopipeline.app.api.EstimateResponse
-import com.photopipeline.app.core.fileIdentityKey
-import com.photopipeline.app.mtp.CanonMtpRepository
+import com.photopipeline.app.api.NotSignedInException
+import com.photopipeline.app.core.AppDefaults
+import com.photopipeline.app.core.PipelineLog
+import com.photopipeline.app.api.ApiRequestException
+import com.photopipeline.app.api.FinalizeStartRecovery
+import com.photopipeline.app.core.cameraFileIdentityKey
+import com.photopipeline.app.core.cameraFileMatchKey
+import com.photopipeline.app.core.metadataUploadSha256
+import com.photopipeline.app.pricing.Ec2Pricing
+import com.photopipeline.app.pricing.LocalPricingEstimator
 import com.photopipeline.app.mtp.MtpRepository
+import com.photopipeline.app.mtp.MtpObjectInfo
+import com.photopipeline.app.mtp.UsbAccessState
+import com.photopipeline.app.mtp.UsbCameraManager
+import com.photopipeline.app.mtp.UsbDebugLog
+import com.photopipeline.app.media.MediaKinds
+import com.photopipeline.app.upload.MultipartPlanner
+import com.photopipeline.app.upload.StaleMultipartRecovery
+import com.photopipeline.app.upload.UploadServerReconcile
 import com.photopipeline.app.upload.UploadPart
 import com.photopipeline.app.upload.UploadParts
+import com.photopipeline.app.upload.UploadPreferences
 import com.photopipeline.app.upload.UploadWorker
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import org.json.JSONArray
 import org.json.JSONObject
+import okhttp3.OkHttpClient
 import java.io.File
 
 class Repository(
     val db: AppDatabase,
     context: Context,
     mtpOverride: MtpRepository? = null,
+    private val usb: UsbCameraManager? = null,
+    private val localPricing: LocalPricingEstimator,
+    private val uploadPreferences: UploadPreferences,
 ) {
     private val appContext = context.applicationContext
-    val mtp: MtpRepository = mtpOverride ?: CanonMtpRepository(context)
+    val mtp: MtpRepository = mtpOverride ?: error("MtpRepository required")
     private val prefs = appContext.getSharedPreferences("photopipeline", Context.MODE_PRIVATE)
 
+    val ec2Pricing: Ec2Pricing get() = localPricing.ec2
+    private val googleHttp = OkHttpClient.Builder().build()
+
     val api: ApiClient = ApiClient(
-        baseUrl = prefs.getString("api_base", "https://example.execute-api.us-west-2.amazonaws.com")!!,
-        idTokenProvider = { prefs.getString("id_token", null) },
+        baseUrlProvider = { apiBaseUrl() },
+        sessionTokenProvider = { prefs.getString("session_token", null) },
     )
 
     fun observeShoots(): Flow<List<ShootEntity>> = db.shootDao().observeAll()
@@ -48,6 +72,26 @@ class Repository(
     suspend fun markFileFailed(identityKey: String, error: String) = patchFile(identityKey) {
         it.copy(uploadState = "FAILED", lastError = error, retryCount = it.retryCount + 1)
     }
+
+    suspend fun markFilePaused(identityKey: String, reason: String) = patchFile(identityKey) {
+        it.copy(uploadState = "PAUSED", lastError = reason)
+    }
+
+    suspend fun markFileUploading(identityKey: String) = patchFile(identityKey) {
+        it.copy(uploadState = "UPLOADING", lastError = null)
+    }
+
+    suspend fun incrementRetry(identityKey: String, error: String) = patchFile(identityKey) {
+        it.copy(retryCount = it.retryCount + 1, lastError = error)
+    }
+
+    suspend fun updateFileContentSha256(identityKey: String, sha256: String, parts: List<UploadPart>) =
+        patchFile(identityKey) {
+            it.copy(sha256 = sha256, uploadPartsJson = UploadParts.toJson(parts), uploadedBytes = it.sizeBytes)
+        }
+
+    suspend fun countUploadedFiles(shootId: String): Int =
+        db.fileDao().observeForShoot(shootId).first().count { it.uploadState == "UPLOADED" }
 
     suspend fun updateUploadProgress(
         identityKey: String,
@@ -72,37 +116,357 @@ class Repository(
         db.fileDao().upsert(transform(cur))
     }
 
-    suspend fun importFromCamera(shootId: String, destDir: File): Int {
-        destDir.mkdirs()
-        mtp.refreshConnection()
-        val objects = mtp.listCr3Objects()
-        val existingKeys = db.fileDao().observeForShoot(shootId).first().map { it.identityKey }.toSet()
-        val entities = mutableListOf<FileEntity>()
-        for (obj in objects) {
-            val path = File(destDir, obj.filename).absolutePath
-            val partialSha = if (File(path).length() == obj.sizeBytes && File(path).exists()) {
-                sha256File(File(path))
-            } else {
-                mtp.importObject(obj, path) { }
+    fun isGoogleAccountLinked(): Boolean = !prefs.getString("session_token", null).isNullOrBlank()
+
+    fun googleUserId(): String? = prefs.getString("google_sub", null)
+
+    fun googleEmail(): String? = prefs.getString("google_email", null)
+
+    fun googleDisplayName(): String? = prefs.getString("google_name", null)
+
+    fun googlePictureUrl(): String? = prefs.getString("google_picture_url", null)
+
+    /** Cached avatar file preferred for Coil. */
+    fun googlePictureModel(): Any? {
+        val cache = java.io.File(appContext.filesDir, "google_avatar.jpg")
+        if (cache.exists() && cache.length() > 0L) return cache
+        return googlePictureUrl()?.takeIf { it.isNotBlank() }
+    }
+
+    fun googleWebClientId(): String =
+        prefs.getString("google_web_client_id", AppDefaults.GOOGLE_WEB_CLIENT_ID)
+            ?.trim()
+            .orEmpty()
+            .ifBlank { AppDefaults.GOOGLE_WEB_CLIENT_ID }
+
+    fun apiBaseUrl(): String =
+        prefs.getString("api_base", AppDefaults.API_BASE_URL)!!.trim().trimEnd('/')
+
+    fun saveSettings(apiBase: String, googleWebClientId: String?) {
+        prefs.edit()
+            .putString("api_base", apiBase.trim().trimEnd('/'))
+            .putString("google_web_client_id", googleWebClientId?.trim()?.ifBlank { null })
+            .apply()
+    }
+
+    suspend fun completeGoogleSignIn(serverAuthCode: String, googleAccessToken: String? = null) {
+        val resp = api.exchangeGoogleAuth(serverAuthCode)
+        var name: String? = null
+        var picture: String? = null
+        if (!googleAccessToken.isNullOrBlank()) {
+            fetchGoogleUserInfo(googleAccessToken)?.let { info ->
+                name = info.first
+                picture = info.second
             }
-            val key = fileIdentityKey(
+        }
+        prefs.edit()
+            .putString("session_token", resp.sessionToken)
+            .putString("google_sub", resp.sub)
+            .putString("google_email", resp.email)
+            .putString("google_name", name)
+            .putString("google_picture_url", picture)
+            .apply()
+        if (!picture.isNullOrBlank()) {
+            cacheGoogleAvatar(picture!!)
+        }
+        PipelineLog.d("auth", "Signed in as ${resp.sub} gphotos=${resp.gphotosLinked}")
+    }
+
+    private suspend fun fetchGoogleUserInfo(accessToken: String): Pair<String?, String?>? {
+        return runCatching {
+            val req = okhttp3.Request.Builder()
+                .url("https://www.googleapis.com/oauth2/v3/userinfo")
+                .header("Authorization", "Bearer $accessToken")
+                .get()
+                .build()
+            googleHttp.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@runCatching null
+                val json = org.json.JSONObject(resp.body!!.string())
+                json.optString("name").ifBlank { null } to json.optString("picture").ifBlank { null }
+            }
+        }.getOrNull()
+    }
+
+    private suspend fun cacheGoogleAvatar(pictureUrl: String) {
+        runCatching {
+            val req = okhttp3.Request.Builder().url(pictureUrl).get().build()
+            googleHttp.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@runCatching
+                val body = resp.body?.bytes() ?: return@runCatching
+                java.io.File(appContext.filesDir, "google_avatar.jpg").writeBytes(body)
+            }
+        }.onFailure { e ->
+            PipelineLog.d("auth", "avatar cache failed: ${e.message}")
+        }
+    }
+
+    fun signOutGoogle() {
+        prefs.edit()
+            .remove("session_token")
+            .remove("google_sub")
+            .remove("google_email")
+            .remove("google_name")
+            .remove("google_picture_url")
+            .apply()
+        runCatching { java.io.File(appContext.filesDir, "google_avatar.jpg").delete() }
+    }
+
+    fun isBackendConfigured(): Boolean = apiBaseUrl().startsWith("http")
+
+    fun canUseBackendApi(): Boolean = isBackendConfigured() && isGoogleAccountLinked()
+
+    fun backendGateMessage(): String = when {
+        !isBackendConfigured() -> "Backend not configured — set your API base URL in Settings."
+        googleWebClientId().isBlank() ->
+            "Set Google Web OAuth client ID in Settings (see gphotos/GOOGLE_OAUTH_ANDROID.md)."
+        !isGoogleAccountLinked() -> "Tap Connect with Google before upload or submit."
+        else -> ""
+    }
+
+    private fun requireBackendReady() {
+        if (!canUseBackendApi()) throw NotSignedInException()
+    }
+
+    private fun serverShootRegisteredKey(shootId: String) = "server_shoot_$shootId"
+
+    fun isServerShootRegistered(shootId: String): Boolean =
+        prefs.getBoolean(serverShootRegisteredKey(shootId), false)
+
+    suspend fun ensureServerShoot(shootId: String) {
+        requireBackendReady()
+        if (isServerShootRegistered(shootId)) return
+        val shoot = getShoot(shootId) ?: error("shoot missing")
+        runCatching { api.ensureServerShoot(shootId, shoot.albumTitle) }
+            .onSuccess {
+                prefs.edit().putBoolean(serverShootRegisteredKey(shootId), true).apply()
+            }
+            .onFailure { e ->
+                if (e is ApiRequestException && e.httpCode == 409) {
+                    prefs.edit().putBoolean(serverShootRegisteredKey(shootId), true).apply()
+                    return
+                }
+                throw e
+            }
+    }
+
+    /**
+     * USB permission, MTP open, and rematch of camera-stream files when object handles change between sessions.
+     */
+    suspend fun prepareCameraForUpload(shootId: String): PrepareCameraResult {
+        val pending = getPendingFiles(shootId)
+        val needsCamera = pending.any { it.isCameraStreamPending() }
+        if (!needsCamera) return PrepareCameraResult.Ready
+
+        val manager = usb ?: return PrepareCameraResult.Error("USB manager unavailable")
+        // Prefer the singleton's open session (same as listCr3Objects) before a full re-probe.
+        var mtpOpen = manager.openMtpDevice()
+        if (mtpOpen == null) {
+            ensureUsbReady()?.let { err ->
+                return PrepareCameraResult.Error(err.userMessage)
+            }
+            mtpOpen = manager.openMtpDevice()
+        }
+        if (mtpOpen == null) {
+            val state = manager.accessState.value
+            val msg = when (state) {
+                UsbAccessState.PERMISSION_REQUIRED ->
+                    "USB permission required — tap Connect on the camera step or allow access when prompted."
+                UsbAccessState.PERMISSION_DENIED -> "USB permission denied for the camera."
+                UsbAccessState.NO_DEVICE -> "No camera detected — reconnect USB."
+                else -> "Could not open MTP session (state=$state)."
+            }
+            PipelineLog.w("upload", "prepareCameraForUpload: $msg")
+            return PrepareCameraResult.Error(msg)
+        }
+        this.mtp.refreshConnection()
+        val onCamera = runCatching { this.mtp.listCr3Objects() }.getOrElse { e ->
+            PipelineLog.w("upload", "prepareCameraForUpload list failed", e)
+            return PrepareCameraResult.Error("Failed to list camera files: ${e.message ?: "unknown"}")
+        }
+        if (onCamera.isEmpty()) {
+            return PrepareCameraResult.Error("Camera connected but no media files found to match.")
+        }
+        val byMatchKey = onCamera.groupBy { cameraFileMatchKey(it.filename, it.sizeBytes, it.captureTimeEpochMs) }
+        var rematched = 0
+        for (file in pending.filter { it.isCameraStreamPending() }) {
+            val key = cameraFileMatchKey(file.originalName, file.sizeBytes, file.captureTimeEpochMs)
+            val candidates = byMatchKey[key].orEmpty()
+            val obj = when {
+                candidates.size == 1 -> candidates.first()
+                candidates.isEmpty() -> {
+                    val byNameSize = onCamera.filter {
+                        it.filename.equals(file.originalName, ignoreCase = true) && it.sizeBytes == file.sizeBytes
+                    }
+                    byNameSize.singleOrNull()
+                }
+                else -> candidates.firstOrNull {
+                    it.filename.equals(file.originalName, ignoreCase = true)
+                } ?: candidates.first()
+            } ?: return PrepareCameraResult.Error(
+                "Camera file not found: ${file.originalName} (${file.sizeBytes} bytes). Re-import from the camera.",
+            )
+            val handleChanged = obj.handle != file.objectHandle || obj.storageId != file.storageId
+            val newIdentity = cameraFileIdentityKey(
                 obj.storageId,
                 obj.handle,
                 obj.sizeBytes,
                 obj.captureTimeEpochMs,
-                partialSha,
             )
-            if (key in existingKeys) continue
+            val newUploadRef = metadataUploadSha256(
+                obj.storageId,
+                obj.handle,
+                obj.sizeBytes,
+                obj.captureTimeEpochMs,
+            )
+            val updated = file.copy(
+                storageId = obj.storageId,
+                objectHandle = obj.handle,
+                sha256 = if (handleChanged || file.sha256.isBlank()) newUploadRef else file.sha256,
+                s3UploadId = if (handleChanged) null else file.s3UploadId,
+                s3Key = if (handleChanged) null else file.s3Key,
+                uploadPartsJson = if (handleChanged) "[]" else file.uploadPartsJson,
+                uploadState = if (file.uploadState == "PAUSED") "PENDING" else file.uploadState,
+                lastError = null,
+            )
+            if (newIdentity != file.identityKey) {
+                db.fileDao().delete(file.identityKey)
+                db.fileDao().upsert(updated.copy(identityKey = newIdentity))
+            } else {
+                db.fileDao().upsert(updated)
+            }
+            if (handleChanged) rematched++
+        }
+        if (rematched > 0) {
+            PipelineLog.i("upload", "Rematched $rematched camera file(s) after MTP handle change")
+        }
+        return PrepareCameraResult.Ready
+    }
+
+    private fun FileEntity.isCameraStreamPending(): Boolean =
+        uploadSource == "CAMERA_STREAM" || localPath.isNullOrBlank()
+
+    private suspend fun ensureUsbReady(): CameraImportResult.Error? {
+        val manager = usb ?: return null
+        manager.refreshProbe(log = true)
+        when (manager.accessState.value) {
+            UsbAccessState.NO_DEVICE ->
+                return CameraImportResult.Error(
+                    stage = "detect",
+                    userMessage = "No Canon camera found. Plug in the camera via USB and tap Refresh.",
+                )
+            UsbAccessState.PERMISSION_REQUIRED -> {
+                UsbDebugLog.log("Requesting USB permission (user dialog should appear)")
+                val granted = manager.requestPermissionSuspend()
+                if (!granted) {
+                    return CameraImportResult.Error(
+                        stage = "permission",
+                        userMessage = "USB permission denied. Tap Connect again and allow access to the camera.",
+                    )
+                }
+                manager.refreshProbe(log = true)
+                if (manager.accessState.value == UsbAccessState.OPEN_FAILED) {
+                    return CameraImportResult.Error(
+                        stage = "open",
+                        userMessage = "Permission granted but MTP interface is in use. Disconnect USB, reopen Photo Pipeline, and choose this app for USB.",
+                    )
+                }
+            }
+            UsbAccessState.PERMISSION_DENIED ->
+                return CameraImportResult.Error(
+                    stage = "permission",
+                    userMessage = "USB permission denied. In system Settings, clear USB defaults or reconnect the cable.",
+                )
+            UsbAccessState.OPEN_FAILED ->
+                return CameraImportResult.Error(
+                    stage = "open",
+                    userMessage = "Could not open the camera USB interface (another app may be using MTP). Disconnect and choose Photo Pipeline when prompted.",
+                )
+            UsbAccessState.READY -> Unit
+        }
+        if (manager.accessState.value == UsbAccessState.OPEN_FAILED) {
+            return CameraImportResult.Error(
+                stage = "mtp",
+                userMessage = "Camera found but MTP session failed. See debug log for interface details.",
+            )
+        }
+        mtp.refreshConnection()
+        return null
+    }
+
+    suspend fun listCameraMedia(): CameraImportResult {
+        PipelineLog.d("import", "listCameraMedia() begin")
+        ensureUsbReady()?.let { return it }
+        val objects = runCatching { mtp.listCr3Objects() }
+            .getOrElse { e ->
+                UsbDebugLog.log("listCr3Objects exception: ${e.message}")
+                return CameraImportResult.Error(
+                    stage = "list",
+                    userMessage = "Failed to read camera file list: ${e.message ?: "unknown error"}",
+                )
+            }
+        if (objects.isEmpty()) {
+            return CameraImportResult.Error(
+                stage = "list",
+                userMessage = "Camera connected but no CR3/JPEG/RAW files found in MTP storage.",
+            )
+        }
+        return CameraImportResult.Listed(
+            objects = objects,
+            statusMessage = "Found ${objects.size} file(s) on camera.",
+        )
+    }
+
+    suspend fun registerSelectedCameraFiles(
+        shootId: String,
+        only: List<MtpObjectInfo>,
+        localCopy: Boolean = false,
+        destDir: File? = null,
+    ): CameraImportResult {
+        ensureUsbReady()?.let { return it }
+        if (only.isEmpty()) {
+            return CameraImportResult.Error(stage = "import", userMessage = "Nothing selected.")
+        }
+        val existingKeys = db.fileDao().observeForShoot(shootId).first().map { it.identityKey }.toSet()
+        val entities = mutableListOf<FileEntity>()
+        for (obj in only) {
+            val identityKey = cameraFileIdentityKey(
+                obj.storageId,
+                obj.handle,
+                obj.sizeBytes,
+                obj.captureTimeEpochMs,
+            )
+            if (identityKey in existingKeys) continue
+            val uploadRef = metadataUploadSha256(
+                obj.storageId,
+                obj.handle,
+                obj.sizeBytes,
+                obj.captureTimeEpochMs,
+            )
+            var localPath: String? = null
+            var sha256 = ""
+            var uploadSource = "CAMERA_STREAM"
+            if (localCopy && destDir != null) {
+                destDir.mkdirs()
+                val path = File(destDir, obj.filename).absolutePath
+                sha256 = if (File(path).length() == obj.sizeBytes && File(path).exists()) {
+                    sha256File(File(path))
+                } else {
+                    mtp.importObject(obj, path) { }
+                }
+                localPath = path
+                uploadSource = "LOCAL"
+            }
             entities += FileEntity(
-                identityKey = key,
+                identityKey = identityKey,
                 shootId = shootId,
-                sha256 = partialSha,
+                sha256 = sha256.ifBlank { uploadRef },
                 originalName = obj.filename,
                 sizeBytes = obj.sizeBytes,
                 storageId = obj.storageId,
                 objectHandle = obj.handle,
                 captureTimeEpochMs = obj.captureTimeEpochMs,
-                localPath = path,
+                localPath = localPath,
+                uploadSource = uploadSource,
                 uploadState = "PENDING",
                 uploadedBytes = 0,
                 uploadSpeedBps = 0,
@@ -118,7 +482,18 @@ class Repository(
         val existing = getShoot(shootId)
         db.shootDao().upsert(
             (existing ?: ShootEntity(
-                shootId, shootId, "IMPORTING", "IMPORT", System.currentTimeMillis(), 0, 0, null, null, null, null,
+                shootId,
+                shootId,
+                "IMPORTING",
+                "IMPORT",
+                System.currentTimeMillis(),
+                0,
+                0,
+                null,
+                null,
+                null,
+                null,
+                null,
             )).copy(
                 imageCount = allFiles.size,
                 totalBytes = totalBytes,
@@ -126,35 +501,96 @@ class Repository(
                 state = "IMPORTING",
             ),
         )
-        return entities.size
+        val msg = when {
+            entities.isEmpty() -> "No new files to add (${only.size} already in this shoot)."
+            localCopy -> "Copied ${entities.size} file(s) to phone (local mode)."
+            else -> "Queued ${entities.size} file(s) for direct camera→S3 upload (no full copy on phone)."
+        }
+        UsbDebugLog.log(msg)
+        return CameraImportResult.Imported(
+            newCount = entities.size,
+            totalOnShoot = allFiles.size,
+            statusMessage = msg,
+        )
     }
 
-    suspend fun fetchAndStoreEstimate(shootId: String): EstimateResponse {
+    suspend fun fetchAndStoreEstimate(shootId: String): StoredEstimate {
         val files = db.fileDao().observeForShoot(shootId).first()
+        val photoCount = files.count { !MediaKinds.isVideoFileName(it.originalName) }.coerceAtLeast(0)
+        val videoCount = files.count { MediaKinds.isVideoFileName(it.originalName) }
+        val imageCount = (photoCount + videoCount).coerceAtLeast(1)
         val totalBytes = files.sumOf { it.sizeBytes }.coerceAtLeast(1)
-        val estimate = api.fetchEstimate(files.size.coerceAtLeast(1), totalBytes)
-        val shoot = getShoot(shootId) ?: return estimate
-        db.shootDao().upsert(
-            shoot.copy(
-                estimateJson = JSONObject(
-                    mapOf(
-                        "processingMinutes" to estimate.estimate.processingMinutes,
-                        "totalShootUsd" to estimate.estimate.totalShootUsd,
-                        "computeUsd" to estimate.estimate.computeUsd,
-                        "s3StandardMonthUsd" to estimate.estimate.s3StandardMonthUsd,
-                    ),
-                ).toString(),
-                phase = "ESTIMATE",
-            ),
-        )
-        return estimate
+        val measuredBps = uploadPreferences.lastMeasuredUploadBps
+        val uploadMinutes = if (measuredBps > 0) {
+            (totalBytes * 8.0 / measuredBps / 60.0).coerceAtLeast(0.1)
+        } else {
+            null
+        }
+        val useAccel = uploadPreferences.transferAcceleration
+        val stored = if (canUseBackendApi()) {
+            val remote = runCatching {
+                api.fetchEstimate(photoCount, videoCount, totalBytes, useAccel)
+            }
+            if (remote.isSuccess) {
+                StoredEstimate(remote.getOrThrow(), EstimateSource.BACKEND)
+            } else {
+                val err = remote.exceptionOrNull()
+                PipelineLog.w(
+                    "estimate",
+                    "Backend estimate failed (${err?.message}); using local pricing.json",
+                    err,
+                )
+                StoredEstimate(
+                    localPricing.estimateShoot(photoCount, videoCount, totalBytes, useAccel),
+                    EstimateSource.LOCAL,
+                )
+            }
+        } else {
+            PipelineLog.d(
+                "estimate",
+                "Using local pricing (signedIn=${isGoogleAccountLinked()} configured=${isBackendConfigured()})",
+            )
+            StoredEstimate(
+                localPricing.estimateShoot(photoCount, videoCount, totalBytes, useAccel),
+                EstimateSource.LOCAL,
+            )
+        }
+        val shoot = getShoot(shootId)
+        if (shoot != null) {
+            val notes = stored.response.notes.joinToString(" ")
+            db.shootDao().upsert(
+                shoot.copy(
+                    estimateJson = JSONObject(
+                        mapOf(
+                            "imageCount" to stored.response.estimate.imageCount,
+                            "processingMinutes" to stored.response.estimate.processingMinutes,
+                            "totalShootUsd" to stored.response.estimate.totalShootUsd,
+                            "computeUsd" to stored.response.estimate.computeUsd,
+                            "s3StandardMonthUsd" to stored.response.estimate.s3StandardMonthUsd,
+                            "s3DeepArchiveMonthUsd" to stored.response.estimate.s3DeepArchiveMonthUsd,
+                            "requestsUsd" to stored.response.estimate.requestsUsd.let {
+                                if (it.isNaN() || it.isInfinite()) 0.0 else it
+                            },
+                            "transferAccelerationUsd" to stored.response.estimate.transferAccelerationUsd,
+                            "perFileUsd" to stored.response.estimate.totalShootUsd / imageCount,
+                            "source" to stored.source.name,
+                            "notes" to notes,
+                            "uploadMinutesMeasured" to uploadMinutes,
+                            "measuredUploadMbps" to if (measuredBps > 0) measuredBps * 8.0 / 1_000_000.0 else null,
+                        ),
+                    ).toString(),
+                    phase = "ESTIMATE",
+                ),
+            )
+        }
+        return stored
     }
 
     suspend fun uploadManifestIfReady(shootId: String) {
         val files = db.fileDao().observeForShoot(shootId).first()
         if (files.isEmpty() || files.any { it.uploadState != "UPLOADED" }) return
         val shoot = getShoot(shootId) ?: return
-        val userId = prefs.getString("user_id", null) ?: return
+        val userId = prefs.getString("google_sub", null) ?: return
         val manifest = JSONObject()
             .put("shoot_id", shootId)
             .put("user_id", userId)
@@ -164,11 +600,23 @@ class Repository(
                 "files",
                 JSONArray().apply {
                     files.forEach { f ->
+                        val uploadRef = metadataUploadSha256(
+                            f.storageId,
+                            f.objectHandle,
+                            f.sizeBytes,
+                            f.captureTimeEpochMs,
+                        )
+                        val ext = rawManifestExtension(f.originalName)
+                        val s3Key = f.s3Key?.takeIf { it.isNotBlank() }
+                            ?: "shoots/$shootId/raw/${uploadRef.lowercase()}$ext"
+                        val contentType = manifestContentType(f.originalName)
                         put(
                             JSONObject()
                                 .put("sha256", f.sha256)
+                                .put("s3_key", s3Key)
                                 .put("size_bytes", f.sizeBytes)
                                 .put("original_name", f.originalName)
+                                .put("content_type", contentType)
                                 .put("storage_id", f.storageId)
                                 .put("object_handle", f.objectHandle)
                                 .put("capture_time_epoch_ms", f.captureTimeEpochMs),
@@ -176,48 +624,438 @@ class Repository(
                     }
                 },
             )
-        api.uploadManifest(shootId, manifest.toString())
+        api.uploadManifest(shootId, manifest.toString(), uploadPreferences.transferAcceleration)
         db.shootDao().upsert(shoot.copy(phase = "MANIFEST_UPLOADED"))
     }
 
-    suspend fun submitShoot(shootId: String) {
-        uploadManifestIfReady(shootId)
-        api.finalizeShoot(shootId)
+    fun getFinalizeError(shootId: String): String? =
+        prefs.getString(finalizeErrorKey(shootId), null)
+
+    fun clearFinalizeError(shootId: String) {
+        prefs.edit().remove(finalizeErrorKey(shootId)).apply()
     }
 
-    suspend fun refreshBackendStatus(shootId: String) {
+    private fun setFinalizeError(shootId: String, message: String) {
+        prefs.edit().putString(finalizeErrorKey(shootId), message).apply()
+    }
+
+    private fun finalizeErrorKey(shootId: String): String = "shoot_finalize_error_$shootId"
+
+    /** Manifest + finalize only — no camera / MTP (files already in S3). */
+    suspend fun finalizeShootForProcessing(shootId: String) {
+        requireBackendReady()
+        ensureServerShoot(shootId)
+        uploadManifestIfReady(shootId)
+        try {
+            val accepted = api.finalizeShoot(shootId)
+            clearFinalizeError(shootId)
+            getShoot(shootId)?.let { shoot ->
+                val progressPatch = buildMap<String, Any> {
+                    accepted.photoCount?.let { put("photoCount", it) }
+                    accepted.videoCount?.let { put("videoCount", it) }
+                    accepted.totalFiles?.let { put("totalFiles", it) }
+                    accepted.photoCount?.let { put("renderedPhotoCount", 0) }
+                    put("renderedCount", 0)
+                    put("publishedCount", 0)
+                }
+                if (progressPatch.isNotEmpty()) {
+                    val existing = processingProgressJson(shootId)?.let { runCatching { JSONObject(it) }.getOrNull() }
+                    val merged = JSONObject(existing?.toString() ?: "{}")
+                    progressPatch.forEach { (k, v) -> merged.put(k, v) }
+                    prefs.edit().putString("shoot_progress_$shootId", merged.toString()).apply()
+                }
+                if (accepted.deadlineAt != null || accepted.maxRuntimeMinutes != null) {
+                    db.shootDao().upsert(
+                        shoot.copy(
+                            deadlineAt = accepted.deadlineAt ?: shoot.deadlineAt,
+                            maxRuntimeMinutes = accepted.maxRuntimeMinutes ?: shoot.maxRuntimeMinutes,
+                        ),
+                    )
+                }
+            }
+        } catch (e: ApiRequestException) {
+            if (recoverFinalizeMaybeStarted(shootId, e)) return
+            val msg = FinalizeStartRecovery.friendlyFailureMessage(e)
+            setFinalizeError(shootId, msg)
+            throw e
+        } catch (e: Exception) {
+            if (recoverFinalizeMaybeStarted(shootId, e)) return
+            val msg = FinalizeStartRecovery.friendlyFailureMessage(e)
+            setFinalizeError(shootId, msg)
+            throw e
+        }
+    }
+
+    private suspend fun recoverFinalizeMaybeStarted(shootId: String, e: Throwable): Boolean {
+        if (!FinalizeStartRecovery.isMaybeStartedFailure(e)) return false
+        val status = api.pollStatusForProcessingStart(shootId)
+        if (status != null && FinalizeStartRecovery.processingAppearsStarted(status)) {
+            clearFinalizeError(shootId)
+            refreshBackendStatus(shootId)
+            return true
+        }
+        return false
+    }
+
+    suspend fun submitShoot(shootId: String) = finalizeShootForProcessing(shootId)
+
+    suspend fun refreshBackendStatus(
+        shootId: String,
+        acceptStatusAfterMs: Long? = null,
+    ): com.photopipeline.app.api.ShootStatusResponse? {
+        if (!canUseBackendApi()) return null
         val status = api.fetchStatus(shootId)
-        val shoot = getShoot(shootId) ?: return
+        val statusUpdatedAt = status.updatedAt ?: 0L
+        if (acceptStatusAfterMs != null && statusUpdatedAt < acceptStatusAfterMs) {
+            return status
+        }
+        val shoot = getShoot(shootId) ?: return status
+        val progressPayload = buildMap<String, Any> {
+            status.progress?.let { p ->
+                put("totalFiles", p.totalFiles)
+                put("renderedCount", p.renderedCount)
+                put("publishedCount", p.publishedCount)
+                put("uploadCompleteCount", p.uploadCompleteCount)
+                put("photoCount", p.photoCount)
+                put("videoCount", p.videoCount)
+                put("renderedPhotoCount", p.renderedPhotoCount)
+                put("publishedPhotoCount", p.publishedPhotoCount)
+                put("publishedVideoCount", p.publishedVideoCount)
+            }
+            status.workerStartedAt?.let { put("workerStartedAt", it) }
+            status.renderStartedAt?.let { put("renderStartedAt", it) }
+            status.instanceType?.let { put("instanceType", it) }
+            if (status.spot != null) put("spot", status.spot)
+        }
+        if (progressPayload.isNotEmpty()) {
+            prefs.edit().putString(
+                "shoot_progress_$shootId",
+                JSONObject(progressPayload).toString(),
+            ).apply()
+        }
+        cacheServerFileStatuses(shootId, status.files)
+        applyServerUploadStateToLocal(shootId, status.files, status.progress)
+        val openUrl = status.albumProductUrl?.takeIf { it.startsWith("http") }
+            ?: status.albumId?.let { "https://photos.google.com/lr/album/$it" }
+        val terminal = status.state in setOf("FAILED", "DONE", "PARTIAL")
         db.shootDao().upsert(
             shoot.copy(
                 state = status.state,
                 phase = status.phase ?: status.state,
                 backendState = status.state,
                 albumId = status.albumId,
-                actualComputeJson = status.actualCompute?.let {
-                    JSONObject(mapOf("seconds" to it.seconds, "usd" to it.usd)).toString()
+                albumProductUrl = openUrl ?: shoot.albumProductUrl,
+                maxRuntimeMinutes = if (terminal) status.maxRuntimeMinutes else status.maxRuntimeMinutes ?: shoot.maxRuntimeMinutes,
+                deadlineAt = when {
+                    terminal -> status.deadlineAt
+                    else -> status.deadlineAt ?: shoot.deadlineAt
+                },
+                actualComputeJson = status.actualCompute?.let { ac ->
+                    val sec = ac.seconds ?: 0
+                    val usd = ac.usd?.takeIf { !it.isNaN() && !it.isInfinite() } ?: 0.0
+                    JSONObject(mapOf("seconds" to sec, "usd" to usd)).toString()
                 },
             ),
         )
+        return status
     }
 
-    fun enqueueUploads(shootId: String) {
+    fun processingProgressJson(shootId: String): String? =
+        prefs.getString("shoot_progress_$shootId", null)
+
+    fun processingWorkerStartedAtMs(shootId: String): Long? {
+        val raw = processingProgressJson(shootId) ?: return null
+        return runCatching {
+            val o = JSONObject(raw)
+            o.optLong("workerStartedAt").takeIf { it > 0L }
+        }.getOrNull()
+    }
+
+    fun processingWorkerInstanceType(shootId: String): String? {
+        val raw = processingProgressJson(shootId) ?: return null
+        return runCatching {
+            JSONObject(raw).optString("instanceType").takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
+
+    fun processingWorkerSpot(shootId: String): Boolean? {
+        val raw = processingProgressJson(shootId) ?: return null
+        return runCatching {
+            val o = JSONObject(raw)
+            if (!o.has("spot")) null else o.optBoolean("spot")
+        }.getOrNull()
+    }
+
+    suspend fun isCameraObjectUploadedElsewhere(shootId: String, obj: MtpObjectInfo): Boolean {
+        if (
+            db.fileDao().countUploadedElsewhereByMetadata(
+                shootId,
+                obj.filename,
+                obj.sizeBytes,
+                obj.captureTimeEpochMs,
+            ) > 0
+        ) {
+            return true
+        }
+        val metaSha = metadataUploadSha256(
+            obj.storageId,
+            obj.handle,
+            obj.sizeBytes,
+            obj.captureTimeEpochMs,
+        )
+        return db.fileDao().countUploadedElsewhereBySha256(shootId, metaSha) > 0
+    }
+
+    /**
+     * When local Room state lags S3/DynamoDB (e.g. 373/374 shown while server has all UPLOADED),
+     * align local file rows and return how many were fixed.
+     */
+    suspend fun tryMarkIfAlreadyOnServer(shootId: String, file: FileEntity): Boolean {
+        if (file.uploadState == "UPLOADED") return true
+        val accel = uploadPreferences.transferAcceleration
+        val serverFiles = if (canUseBackendApi()) {
+            runCatching { api.fetchStatus(shootId).files }.getOrNull()
+        } else {
+            null
+        }
+        if (!serverFiles.isNullOrEmpty()) {
+            cacheServerFileStatuses(shootId, serverFiles)
+            if (StaleMultipartRecovery.shouldMarkFromServer(file, serverFiles)) {
+                markFileUploadedLocally(file.identityKey)
+                PipelineLog.i("upload", "Marked ${file.originalName} UPLOADED from server status")
+                return true
+            }
+        }
+        val key = StaleMultipartRecovery.s3KeyForFile(shootId, file)
+        val head = runCatching { api.headObject(shootId, key, accel) }.getOrNull()
+        if (head?.exists == true && head.contentLength == file.sizeBytes) {
+            markFileUploadedLocally(file.identityKey)
+            PipelineLog.i("upload", "Marked ${file.originalName} UPLOADED from S3 HEAD")
+            return true
+        }
+        return false
+    }
+
+    suspend fun resolveStaleMultipartUpload(shootId: String, file: FileEntity): Pair<StaleMultipartRecovery.Outcome, FileEntity> {
+        if (tryMarkIfAlreadyOnServer(shootId, file)) {
+            val latest = db.fileDao().getFile(file.identityKey) ?: file
+            return StaleMultipartRecovery.Outcome.AlreadyOnServer to latest
+        }
+        val cleared = resetMultipartUploadState(file.identityKey, shootId)
+        PipelineLog.w("upload", "Reset stale multipart for ${file.originalName}")
+        return StaleMultipartRecovery.Outcome.FreshMultipart to cleared
+    }
+
+    private suspend fun markFileUploadedLocally(identityKey: String) {
+        patchFile(identityKey) {
+            it.copy(
+                uploadState = "UPLOADED",
+                uploadedBytes = it.sizeBytes,
+                lastError = null,
+                uploadSpeedBps = 0L,
+            )
+        }
+    }
+
+    suspend fun reconcileLocalUploadsWithServer(shootId: String): Int {
+        if (!canUseBackendApi()) return 0
+        val status = api.fetchStatus(shootId)
+        cacheServerFileStatuses(shootId, status.files)
+        return applyServerUploadStateToLocal(shootId, status.files, status.progress)
+    }
+
+    private suspend fun applyServerUploadStateToLocal(
+        shootId: String,
+        serverFiles: List<com.photopipeline.app.api.FileStatusDto>?,
+        progress: com.photopipeline.app.api.ProgressDto?,
+    ): Int {
+        val remote = serverFiles.orEmpty()
+        if (remote.isEmpty()) return 0
+        val localFiles = db.fileDao().observeForShoot(shootId).first()
+        if (localFiles.isEmpty()) return 0
+        val uploadedShas = UploadServerReconcile.serverUploadedShaKeys(remote)
+        val markAll = UploadServerReconcile.serverReportsAllUploaded(
+            localFiles.size,
+            remote,
+            progress,
+        )
+        var updated = 0
+        for (file in localFiles) {
+            if (file.uploadState == "UPLOADED") continue
+            if (!markAll && !UploadServerReconcile.shouldMarkLocalUploaded(file, uploadedShas, remote)) {
+                continue
+            }
+            markFileUploadedLocally(file.identityKey)
+            updated++
+        }
+        if (updated > 0) {
+            PipelineLog.i("upload", "Reconciled $updated local file(s) to UPLOADED for shoot $shootId")
+        }
+        return updated
+    }
+
+    fun serverFileStatuses(shootId: String): List<ServerFileStatus> {
+        val raw = prefs.getString(serverFileStatusKey(shootId), null) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    add(
+                        ServerFileStatus(
+                            sha256 = o.optString("sha256", ""),
+                            state = o.optString("state", ""),
+                            originalName = o.optString("originalName", ""),
+                            error = o.optString("error").takeIf { it.isNotBlank() },
+                        ),
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun cacheServerFileStatuses(
+        shootId: String,
+        files: List<com.photopipeline.app.api.FileStatusDto>?,
+    ) {
+        if (files.isNullOrEmpty()) return
+        val arr = JSONArray()
+        files.forEach { f ->
+            arr.put(
+                JSONObject(
+                    mapOf(
+                        "sha256" to (f.sha256 ?: ""),
+                        "state" to (f.state ?: ""),
+                        "originalName" to (f.originalName ?: ""),
+                        "error" to (f.error ?: ""),
+                    ),
+                ),
+            )
+        }
+        prefs.edit().putString(serverFileStatusKey(shootId), arr.toString()).apply()
+    }
+
+    private fun serverFileStatusKey(shootId: String): String = "shoot_server_files_$shootId"
+
+    fun uploadWorkName(shootId: String): String = "upload-$shootId"
+
+    suspend fun cancelUploadForShoot(shootId: String) {
+        WorkManager.getInstance(appContext).cancelUniqueWork(uploadWorkName(shootId))
+        val files = db.fileDao().observeForShoot(shootId).first()
+        val accel = uploadPreferences.transferAcceleration
+        for (f in files) {
+            if (
+                !f.s3UploadId.isNullOrBlank() &&
+                !f.s3Key.isNullOrBlank() &&
+                f.uploadState != "UPLOADED"
+            ) {
+                runCatching { api.abortMultipart(shootId, f.s3UploadId!!, f.s3Key!!, accel) }
+                    .onFailure { e ->
+                        PipelineLog.w("upload", "abort multipart ${f.originalName}: ${e.message}", e)
+                    }
+            }
+            if (f.uploadState != "UPLOADED") {
+                db.fileDao().upsert(
+                    f.copy(
+                        uploadState = "PENDING",
+                        s3UploadId = null,
+                        s3Key = null,
+                        uploadPartsJson = "[]",
+                        uploadedBytes = 0,
+                        uploadSpeedBps = 0,
+                        lastError = null,
+                    ),
+                )
+            }
+        }
+        UploadMetricsStore.clear()
+        PipelineLog.i("upload", "Cancelled upload work for shoot $shootId")
+    }
+
+    suspend fun deleteShootCompletely(shootId: String) {
+        cancelUploadForShoot(shootId)
+        if (canUseBackendApi() && isServerShootRegistered(shootId)) {
+            api.deleteShoot(shootId)
+        }
+        db.fileDao().deleteForShoot(shootId)
+        db.shootDao().delete(shootId)
+        prefs.edit()
+            .remove(serverShootRegisteredKey(shootId))
+            .remove("shoot_progress_$shootId")
+            .apply()
+        PipelineLog.i("upload", "Deleted shoot $shootId locally and on server")
+    }
+
+    suspend fun enqueueUploads(shootId: String) {
+        requireBackendReady()
+        ensureServerShoot(shootId)
+        when (val prep = prepareCameraForUpload(shootId)) {
+            is PrepareCameraResult.Error -> error(prep.message)
+            PrepareCameraResult.Ready -> Unit
+        }
+        val pending = getPendingFiles(shootId)
+        val usesCameraStream = pending.any {
+            it.uploadSource == "CAMERA_STREAM" || it.localPath.isNullOrBlank()
+        }
         val req = OneTimeWorkRequestBuilder<UploadWorker>()
-            .setInputData(workDataOf("shootId" to shootId))
+            .setInputData(
+                workDataOf(
+                    "shootId" to shootId,
+                    UploadWorker.KEY_USES_CAMERA_STREAM to usesCameraStream,
+                ),
+            )
             .addTag("upload-$shootId")
             .build()
         WorkManager.getInstance(appContext).enqueueUniqueWork(
             "upload-$shootId",
-            ExistingWorkPolicy.KEEP,
+            ExistingWorkPolicy.REPLACE,
             req,
         )
     }
 
-    fun photosOAuthUrl(userId: String): String = api.photosOAuthStartUrl(userId)
+    suspend fun resetMultipartUploadState(identityKey: String, shootId: String): FileEntity {
+        val f = db.fileDao().getFile(identityKey) ?: error("missing file $identityKey")
+        if (!f.s3UploadId.isNullOrBlank() && !f.s3Key.isNullOrBlank()) {
+            val accel = uploadPreferences.transferAcceleration
+            runCatching { api.abortMultipart(shootId, f.s3UploadId!!, f.s3Key!!, accel) }
+                .onFailure { e ->
+                    PipelineLog.w("upload", "abort multipart ${f.originalName}: ${e.message}", e)
+                }
+        }
+        val cleared = f.copy(
+            s3UploadId = null,
+            s3Key = null,
+            uploadPartsJson = UploadParts.toJson(emptyList()),
+            uploadedBytes = 0L,
+            uploadSpeedBps = 0L,
+            lastError = null,
+        )
+        db.fileDao().upsert(cleared)
+        return cleared
+    }
+
+    /** Abort stale S3 multipart state when an older planner produced sub-5 MiB non-terminal parts. */
+    suspend fun ensureValidMultipartPlan(shootId: String, file: FileEntity): FileEntity {
+        if (file.s3UploadId.isNullOrBlank()) return file
+        val partSize = uploadPreferences.partSizeBytes
+        if (MultipartPlanner.legacyPlanWasInvalid(file.sizeBytes, partSize)) {
+            PipelineLog.w(
+                "upload",
+                "Reset invalid multipart plan for ${file.originalName} (${file.sizeBytes} bytes)",
+            )
+            return resetMultipartUploadState(file.identityKey, shootId)
+        }
+        return file
+    }
 
     suspend fun retryFile(identityKey: String) {
         val f = db.fileDao().getFile(identityKey) ?: return
-        db.fileDao().upsert(f.copy(uploadState = "PENDING", lastError = null))
+        val partSize = uploadPreferences.partSizeBytes
+        if (!f.s3UploadId.isNullOrBlank() && MultipartPlanner.legacyPlanWasInvalid(f.sizeBytes, partSize)) {
+            resetMultipartUploadState(identityKey, f.shootId)
+        }
+        val latest = db.fileDao().getFile(identityKey) ?: return
+        db.fileDao().upsert(latest.copy(uploadState = "PENDING", lastError = null))
     }
 
     private fun sha256File(file: File): String {
@@ -232,4 +1070,33 @@ class Repository(
         }
         return md.digest().joinToString("") { "%02x".format(it) }
     }
+}
+
+private fun rawManifestExtension(originalName: String): String {
+    val u = originalName.uppercase()
+    return when {
+        u.endsWith(".JPG") || u.endsWith(".JPEG") -> ".JPG"
+        u.endsWith(".CR2") -> ".CR2"
+        u.endsWith(".MP4") -> ".MP4"
+        u.endsWith(".MOV") -> ".MOV"
+        u.endsWith(".M4V") -> ".M4V"
+        u.endsWith(".HEIC") -> ".HEIC"
+        else -> ".CR3"
+    }
+}
+
+private fun manifestContentType(originalName: String): String {
+    val u = originalName.uppercase()
+    return when {
+        u.endsWith(".MP4") || u.endsWith(".M4V") -> "video/mp4"
+        u.endsWith(".MOV") -> "video/quicktime"
+        u.endsWith(".JPG") || u.endsWith(".JPEG") -> "image/jpeg"
+        u.endsWith(".HEIC") -> "image/heic"
+        else -> "image/x-canon-cr3"
+    }
+}
+
+sealed class PrepareCameraResult {
+    data object Ready : PrepareCameraResult()
+    data class Error(val message: String) : PrepareCameraResult()
 }

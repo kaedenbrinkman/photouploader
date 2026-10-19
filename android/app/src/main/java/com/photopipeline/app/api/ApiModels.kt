@@ -7,21 +7,42 @@ data class CostEstimateDto(
     val spot: Boolean,
     val processingMinutes: Double,
     val computeUsd: Double,
+    val ebsRootVolumeGiB: Int = 30,
+    val ebsShootUsd: Double = 0.0,
     val s3StandardMonthUsd: Double,
     val s3DeepArchiveMonthUsd: Double,
     val requestsUsd: Double,
+    val transferAccelerationUsd: Double = 0.0,
     val totalShootUsd: Double,
 )
 
 data class EstimateResponse(val estimate: CostEstimateDto, val notes: List<String>)
 
+data class GoogleAuthResponse(
+    val sessionToken: String,
+    val expiresIn: Long,
+    val sub: String,
+    val email: String?,
+    val gphotosLinked: Boolean,
+)
+
 data class ShootStatusResponse(
     val shootId: String,
     val state: String,
     val phase: String?,
+    val lastError: String? = null,
+    val launchErrorCode: String? = null,
+    val updatedAt: Long? = null,
     val albumId: String?,
+    val albumProductUrl: String? = null,
+    val maxRuntimeMinutes: Int? = null,
+    val deadlineAt: Long? = null,
     val progress: ProgressDto?,
     val actualCompute: ActualComputeDto?,
+    val instanceType: String? = null,
+    val spot: Boolean? = null,
+    val workerStartedAt: Long? = null,
+    val renderStartedAt: Long? = null,
     val files: List<FileStatusDto>?,
     val results: Map<String, Any>?,
 )
@@ -31,6 +52,11 @@ data class ProgressDto(
     val renderedCount: Int,
     val publishedCount: Int,
     val uploadCompleteCount: Int,
+    val photoCount: Int = 0,
+    val videoCount: Int = 0,
+    val renderedPhotoCount: Int = 0,
+    val publishedPhotoCount: Int = 0,
+    val publishedVideoCount: Int = 0,
 )
 
 data class ActualComputeDto(val seconds: Int?, val usd: Double?)
@@ -40,4 +66,5 @@ data class FileStatusDto(
     val state: String?,
     val error: String?,
     val originalName: String?,
+    val sizeBytes: Long? = null,
 )

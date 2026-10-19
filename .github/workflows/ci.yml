@@ -8,6 +8,7 @@ on:
 jobs:
   python:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,8 +20,13 @@ jobs:
           cd lib && pytest -q
       - name: Worker tests
         run: |
-          pip install pytest
-          cd worker && PYTHONPATH=. pytest -q
+          pip install pytest pytest-timeout
+          pip install -r worker/requirements.txt
+          cd worker && PYTHONPATH=../lib:. pytest -q -m "not integration"
+      - name: LightCraft importPreview smoke (optional)
+        run: |
+          chmod +x scripts/lightcraft-import-preview-smoke.sh
+          scripts/lightcraft-import-preview-smoke.sh
       - name: Backend moto tests
         run: |
           pip install -r backend/requirements-dev.txt
@@ -28,6 +34,7 @@ jobs:
 
   infra:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -42,15 +49,32 @@ jobs:
 
   worker-ami:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
       - name: Bootstrap script syntax
         run: bash -n worker/ami/bootstrap.sh
+      - name: EC2 install script syntax
+        run: bash -n worker/ami/ec2-install-from-s3.sh
+      - name: Build worker bundle (artifact only, not uploaded)
+        run: |
+          chmod +x scripts/build-worker-bundle.sh
+          TARGET_PY=3.9 scripts/build-worker-bundle.sh
+      - name: Verify worker bundle offline import (Python 3.9)
+        run: |
+          chmod +x scripts/verify-worker-bundle.sh
+          TARGET_PY=3.9 scripts/verify-worker-bundle.sh
       - name: Bootstrap docker verify (stub LightCraft)
         run: docker build -f worker/ami/Dockerfile.verify .
+      - name: AL2023 user-data venv and vendored pip
+        run: docker build -f worker/ami/Dockerfile.bootstrap-test .
 
   android:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk
     steps:

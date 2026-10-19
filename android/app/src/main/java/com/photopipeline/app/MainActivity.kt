@@ -1,67 +1,68 @@
 package com.photopipeline.app
 
-import android.app.PendingIntent
-import android.content.BroadcastReceiver
-import android.content.Context
+import android.Manifest
 import android.content.Intent
-import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import com.photopipeline.app.mtp.MtpUsbSession
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import com.photopipeline.app.auth.GoogleAuthCoordinator
+import com.photopipeline.app.core.PipelineLog
 import com.photopipeline.app.ui.PhotoPipelineNavHost
 import com.photopipeline.app.ui.theme.PhotoPipelineTheme
 
 class MainActivity : ComponentActivity() {
-    private val usbReceiver =
-        object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                /* permission result — Compose screen can call refreshConnection */
-            }
-        }
+    private val requestPostNotifications = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        PipelineLog.i("activity", "POST_NOTIFICATIONS granted=$granted")
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        requestCanonUsbPermissionIfNeeded()
-        val filter = IntentFilter(ACTION_USB_PERMISSION)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(usbReceiver, filter, RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(usbReceiver, filter)
-        }
+        requestUploadNotificationPermissionIfNeeded()
+        PipelineLog.d("activity", "MainActivity.onCreate action=${intent?.action}")
         val app = application as PhotoPipelineApp
+        app.usbCameraManager.onUsbIntent(intent)
+        app.usbCameraManager.onAppForeground()
+        GoogleAuthCoordinator.tryCompleteFromIntent(this, intent)
         setContent {
             PhotoPipelineTheme {
-                PhotoPipelineNavHost(repository = app.repository)
+                PhotoPipelineNavHost(
+                    repository = app.repository,
+                    usbCameraManager = app.usbCameraManager,
+                )
             }
         }
     }
 
-    override fun onDestroy() {
-        unregisterReceiver(usbReceiver)
-        super.onDestroy()
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+            (application as PhotoPipelineApp).usbCameraManager.onUsbIntent(intent)
+        }
+        GoogleAuthCoordinator.tryCompleteFromIntent(this, intent)
     }
 
-    private fun requestCanonUsbPermissionIfNeeded() {
-        val usb = getSystemService(UsbManager::class.java)
-        val device = usb.deviceList.values.firstOrNull { it.vendorId == MtpUsbSession.CANON_VENDOR_ID }
-            ?: return
-        if (usb.hasPermission(device)) return
-        val pi = PendingIntent.getBroadcast(
-            this,
-            0,
-            Intent(ACTION_USB_PERMISSION),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
-        )
-        usb.requestPermission(device, pi)
+    override fun onResume() {
+        super.onResume()
+        (application as PhotoPipelineApp).usbCameraManager.onAppForeground()
     }
 
-    companion object {
-        const val ACTION_USB_PERMISSION = "com.photopipeline.app.USB_PERMISSION"
+    private fun requestUploadNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        requestPostNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 }

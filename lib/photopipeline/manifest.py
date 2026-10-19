@@ -15,6 +15,7 @@ class ManifestFile:
     object_handle: int = 0
     capture_time_epoch_ms: int = 0
     content_type: str = "image/x-canon-cr3"
+    s3_key: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ManifestFile:
@@ -26,15 +27,25 @@ class ManifestFile:
             object_handle=int(d.get("object_handle", 0)),
             capture_time_epoch_ms=int(d.get("capture_time_epoch_ms", 0)),
             content_type=d.get("content_type", "image/x-canon-cr3"),
+            s3_key=d.get("s3_key"),
         )
 
     def s3_raw_key(self, shoot_id: str) -> str:
+        if self.s3_key:
+            _validate_s3_key(shoot_id, self.s3_key)
+            return self.s3_key
         ext = ".CR3"
         if self.original_name.upper().endswith(".CR2"):
             ext = ".CR2"
         elif self.original_name.upper().endswith(".JPG"):
             ext = ".JPG"
         return f"shoots/{shoot_id}/raw/{self.sha256.lower()}{ext}"
+
+
+def _validate_s3_key(shoot_id: str, key: str) -> None:
+    prefix = f"shoots/{shoot_id}/raw/"
+    if not key.startswith(prefix) or ".." in key:
+        raise ManifestValidationError(f"invalid s3_key: {key}")
 
 
 @dataclass
@@ -67,6 +78,7 @@ def validate_manifest(manifest: ShootManifest) -> None:
     if not manifest.files:
         raise ManifestValidationError("manifest must contain at least one file")
     seen_sha: set[str] = set()
+    seen_keys: set[str] = set()
     for f in manifest.files:
         if len(f.sha256) != 64:
             raise ManifestValidationError(f"invalid sha256: {f.sha256}")
@@ -75,6 +87,11 @@ def validate_manifest(manifest: ShootManifest) -> None:
         seen_sha.add(f.sha256)
         if f.size_bytes <= 0:
             raise ManifestValidationError(f"invalid size for {f.sha256}")
+        if f.s3_key:
+            _validate_s3_key(manifest.shoot_id, f.s3_key)
+            if f.s3_key in seen_keys:
+                raise ManifestValidationError(f"duplicate s3_key in manifest: {f.s3_key}")
+            seen_keys.add(f.s3_key)
 
 
 def manifest_complete_on_s3(

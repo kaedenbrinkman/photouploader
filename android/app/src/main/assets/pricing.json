@@ -1,0 +1,42 @@
+{
+  "region": "us-west-2",
+  "currency": "USD",
+  "ec2": {
+    "instanceTypeOrder": ["c7i.4xlarge", "c7i.2xlarge"],
+    "publishOnlyInstanceTypeOrder": ["t3a.medium", "t3.medium"],
+    "vCpu": { "c7i.4xlarge": 16, "c7i.2xlarge": 8, "t3a.medium": 2, "t3.medium": 2 },
+    "onDemandUsdPerHour": {
+      "c7i.4xlarge": 0.714,
+      "c7i.2xlarge": 0.357,
+      "t3a.medium": 0.0376,
+      "t3.medium": 0.0416
+    },
+    "spotUsdPerHour": {
+      "c7i.4xlarge": 0.253,
+      "c7i.2xlarge": 0.14,
+      "t3a.medium": 0.012,
+      "t3.medium": 0.013
+    },
+    "bootOverheadMinutes": 4,
+    "parallelism": { "c7i.4xlarge": 4, "c7i.2xlarge": 4, "t3a.medium": 2, "t3.medium": 2 },
+    "secondsPerImageAtReferenceParallelism": 3.9,
+    "preferSpot": true
+  },
+  "ebs": {
+    "gp3UsdPerGbMonth": 0.08
+  },
+  "s3": {
+    "standardUsdPerGbMonth": 0.023,
+    "deepArchiveUsdPerGbMonth": 0.00099,
+    "putPer1000": 0.005,
+    "getPer1000": 0.0004,
+    "rawRetentionDaysStandard": 30,
+    "transferAccelerationUsdPerGb": 0.04
+  },
+  "lambdaAndApi": {
+    "estimatePerShootUsd": 0.002
+  },
+  "egress": {
+    "internetUsdPerGb": 0.09
+  }
+}
