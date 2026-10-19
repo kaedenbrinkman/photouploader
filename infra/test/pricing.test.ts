@@ -15,6 +15,13 @@ describe('estimateShoot', () => {
     expect(videosOnly.imageCount).toBe(5);
   });
 
+  it('includes prorated gp3 root volume in estimate', () => {
+    const est = estimateShoot(374, 13e9);
+    expect(est.ebsRootVolumeGiB).toBeGreaterThanOrEqual(30);
+    expect(est.ebsShootUsd).toBeGreaterThan(0);
+    expect(est.totalShootUsd).toBeGreaterThanOrEqual(est.computeUsd + est.ebsShootUsd);
+  });
+
   it('includes transfer acceleration surcharge when requested', () => {
     const bytes = 10e9;
     const base = estimateShoot(100, bytes);

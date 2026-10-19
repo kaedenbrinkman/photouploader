@@ -641,8 +641,16 @@ fun ShootFlowScreen(
                             }
                         }
                         if (vm.needsProcessingRetry()) {
+                            val retryError = ui.serverProcessingError
+                                ?: ui.serverLastError?.let {
+                                    com.photopipeline.app.api.FinalizeErrorMessages.friendly(
+                                        ui.serverLaunchErrorCode,
+                                        it,
+                                    )
+                                }
+                                ?: ui.finalizeError
                             ProcessingRetryBlock(
-                                error = ui.finalizeError,
+                                error = retryError,
                                 busy = ui.busy,
                                 onRetry = { vm.retryProcessing() },
                             )

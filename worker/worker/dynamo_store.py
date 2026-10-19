@@ -51,3 +51,21 @@ class DynamoStore:
     def get_shoot(self, shoot_id: str) -> dict[str, Any] | None:
         r = self._table.get_item(Key={"pk": f"SHOOT#{shoot_id}", "sk": "META"})
         return r.get("Item")
+
+    def finish_run(self, shoot_id: str, **attrs: Any) -> None:
+        """Terminal shoot update: clears ephemeral EC2 fields from META."""
+        names: dict[str, str] = {}
+        values: dict[str, Any] = {":u": int(time.time())}
+        parts = ["updatedAt = :u"]
+        for i, (k, v) in enumerate(attrs.items()):
+            nk, vk = f"#k{i}", f":v{i}"
+            names[nk] = k
+            values[vk] = v
+            parts.append(f"{nk} = {vk}")
+        remove = " REMOVE instanceId, instanceType, spot, workerStartedAt, launchLockUntil"
+        self._table.update_item(
+            Key={"pk": f"SHOOT#{shoot_id}", "sk": "META"},
+            UpdateExpression="SET " + ", ".join(parts) + remove,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )

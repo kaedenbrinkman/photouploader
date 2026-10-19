@@ -802,16 +802,29 @@ class ShootViewModel(
                             statusApplied = true
                             val friendly = FinalizeErrorMessages.friendly(it.launchErrorCode, it.lastError)
                             val workerStarted = it.workerStartedAt ?: repo.processingWorkerStartedAtMs(shootId)
+                            if (
+                                (it.state == "FAILED" || it.state == "PARTIAL") &&
+                                !it.lastError.isNullOrBlank()
+                            ) {
+                                repo.clearFinalizeError(shootId)
+                            }
                             _ui.value = _ui.value.copy(
                                 serverPhase = it.phase,
                                 serverLaunchErrorCode = it.launchErrorCode,
                                 serverLastError = it.lastError,
                                 processingStartedAtMs = workerStarted ?: _ui.value.processingStartedAtMs,
                                 serverProcessingError = when {
-                                    it.state == "READY_TO_PROCESS" || it.state == "FAILED" -> friendly
-                                    it.state == "PROCESSING" && !it.lastError.isNullOrBlank() -> friendly
                                     !it.lastError.isNullOrBlank() -> friendly
+                                    it.state == "READY_TO_PROCESS" || it.state == "FAILED" -> friendly
                                     else -> null
+                                },
+                                finalizeError = if (
+                                    !it.lastError.isNullOrBlank() &&
+                                    (it.state == "FAILED" || it.state == "PARTIAL" || it.state == "PROCESSING")
+                                ) {
+                                    null
+                                } else {
+                                    _ui.value.finalizeError
                                 },
                                 processingProgress = repo.processingProgressJson(shootId),
                                 serverFileStatusBySha = loadServerFileStatusMap(),

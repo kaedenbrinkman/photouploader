@@ -7,6 +7,8 @@ data class CostEstimateDto(
     val spot: Boolean,
     val processingMinutes: Double,
     val computeUsd: Double,
+    val ebsRootVolumeGiB: Int = 30,
+    val ebsShootUsd: Double = 0.0,
     val s3StandardMonthUsd: Double,
     val s3DeepArchiveMonthUsd: Double,
     val requestsUsd: Double,

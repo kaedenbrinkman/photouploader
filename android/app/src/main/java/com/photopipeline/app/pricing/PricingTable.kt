@@ -4,6 +4,11 @@ data class PricingTable(
     val ec2: Ec2Pricing,
     val s3: S3Pricing,
     val lambdaAndApi: LambdaApiPricing,
+    val ebs: EbsPricing? = null,
+)
+
+data class EbsPricing(
+    val gp3UsdPerGbMonth: Double = 0.08,
 )
 
 data class Ec2Pricing(

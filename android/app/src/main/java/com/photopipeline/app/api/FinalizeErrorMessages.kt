@@ -2,6 +2,7 @@ package com.photopipeline.app.api
 
 object FinalizeErrorMessages {
     fun friendly(ec2ErrorCode: String?, detail: String?, httpCode: Int? = null): String {
+        mapServerWorkerMessage(detail)?.let { return it }
         when (ec2ErrorCode) {
             "PendingVerification" ->
                 return "AWS account verification pending — try again later."
@@ -19,6 +20,7 @@ object FinalizeErrorMessages {
                 return "Server is already starting processing — checking status…"
         }
         if (!detail.isNullOrBlank()) {
+            mapServerWorkerMessage(detail)?.let { return it }
             if (detail.equals("timeout", ignoreCase = true)) {
                 return FinalizeStartRecovery.STATUS_LINE_CHECKING
             }
@@ -29,5 +31,20 @@ object FinalizeErrorMessages {
             503 -> "Processing could not start yet — try again later."
             else -> "Processing could not start."
         }
+    }
+
+    /** Map worker [lastError] text from DynamoDB (includes ENOSPC, render failures, etc.). */
+    fun mapServerWorkerMessage(detail: String?): String? {
+        if (detail.isNullOrBlank()) return null
+        val lower = detail.lowercase()
+        when {
+            lower.contains("no space left on device") ||
+                lower.contains("errno 28") ||
+                lower.contains("enospc") ->
+                return "Server ran out of disk space while processing. Retry after deploy — worker disk is sized per shoot."
+            lower.contains("timeout") && lower.contains("worker log") ->
+                return detail.take(280)
+        }
+        return null
     }
 }

@@ -1,4 +1,5 @@
 import pricingTable from '../../config/pricing.json';
+import { computeRootVolumeGiB, ebsGp3ShootUsd } from './worker-root-volume';
 
 export interface CostEstimate {
   imageCount: number;
@@ -7,6 +8,8 @@ export interface CostEstimate {
   spot: boolean;
   processingMinutes: number;
   computeUsd: number;
+  ebsRootVolumeGiB: number;
+  ebsShootUsd: number;
   s3StandardMonthUsd: number;
   s3DeepArchiveMonthUsd: number;
   requestsUsd: number;
@@ -21,7 +24,12 @@ export function getPricingTable() {
 export function estimateShoot(
   photoCount: number,
   totalBytesRaw: number,
-  opts?: { videoCount?: number; transferAcceleration?: boolean },
+  opts?: {
+    videoCount?: number;
+    transferAcceleration?: boolean;
+    /** Largest single video object in bytes (for root EBS sizing). */
+    largestVideoBytes?: number;
+  },
 ): CostEstimate {
   const videos = Math.max(0, Math.floor(Number(opts?.videoCount ?? 0)));
   const photos = Math.max(0, Math.floor(Number(photoCount) || 0));
@@ -40,6 +48,15 @@ export function estimateShoot(
   const rateKey = spot ? 'spotUsdPerHour' : 'onDemandUsdPerHour';
   const hourly = ec2[rateKey][instanceType];
   const computeUsd = hourly * (processingSeconds / 3600);
+  const processingMinutes = Math.round((processingSeconds / 60) * 10) / 10;
+  const largestVideoBytes = Math.max(0, Math.floor(Number(opts?.largestVideoBytes ?? 0)));
+  const volumeFiles =
+    largestVideoBytes > 0
+      ? [{ size_bytes: largestVideoBytes, original_name: 'estimate.MP4' }]
+      : [{ size_bytes: 1, original_name: 'estimate.CR3' }];
+  const ebsRootVolumeGiB = computeRootVolumeGiB(volumeFiles);
+  const gp3Month = (p.ebs?.gp3UsdPerGbMonth as number | undefined) ?? 0.08;
+  const ebsShootUsd = ebsGp3ShootUsd(ebsRootVolumeGiB, processingMinutes, gp3Month);
   const gb = totalBytesRaw / 1024 ** 3;
   const s3StandardMonthUsd = gb * p.s3.standardUsdPerGbMonth;
   const s3DeepArchiveMonthUsd = gb * p.s3.deepArchiveUsdPerGbMonth;
@@ -52,13 +69,15 @@ export function estimateShoot(
     totalBytesRaw,
     instanceType,
     spot,
-    processingMinutes: Math.round((processingSeconds / 60) * 10) / 10,
+    processingMinutes,
     computeUsd: round(computeUsd),
+    ebsRootVolumeGiB,
+    ebsShootUsd: round(ebsShootUsd),
     s3StandardMonthUsd: round(s3StandardMonthUsd),
     s3DeepArchiveMonthUsd: round(s3DeepArchiveMonthUsd),
     requestsUsd: round(requestsUsd),
     transferAccelerationUsd,
-    totalShootUsd: round(computeUsd + s3StandardMonthUsd + requestsUsd + transferAccelerationUsd),
+    totalShootUsd: round(computeUsd + ebsShootUsd + s3StandardMonthUsd + requestsUsd + transferAccelerationUsd),
   };
 }
 

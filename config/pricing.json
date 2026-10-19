@@ -12,6 +12,9 @@
     "videoUploadSecondsPerGb": 90,
     "preferSpot": true
   },
+  "ebs": {
+    "gp3UsdPerGbMonth": 0.08
+  },
   "s3": {
     "standardUsdPerGbMonth": 0.023,
     "deepArchiveUsdPerGbMonth": 0.00099,

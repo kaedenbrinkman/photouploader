@@ -38,6 +38,10 @@ class LocalPricingEstimator private constructor(private val table: PricingTable)
         val hourly = (if (spot) ec2.spotUsdPerHour else ec2.onDemandUsdPerHour)[instanceType]
             ?: error("missing hourly rate for $instanceType")
         val computeUsd = hourly * (processingSeconds / 3600.0)
+        val processingMinutes = round1(processingSeconds / 60.0)
+        val ebsRootVolumeGiB = 30
+        val gp3Month = table.ebs?.gp3UsdPerGbMonth ?: 0.08
+        val ebsShootUsd = round4(ebsRootVolumeGiB * gp3Month * (processingMinutes / 60.0) / 730.0)
         val gb = totalBytesRaw / (1024.0 * 1024.0 * 1024.0)
         val s3StandardMonthUsd = gb * s3.standardUsdPerGbMonth
         val s3DeepArchiveMonthUsd = gb * s3.deepArchiveUsdPerGbMonth
@@ -53,13 +57,17 @@ class LocalPricingEstimator private constructor(private val table: PricingTable)
             totalBytesRaw = totalBytesRaw,
             instanceType = instanceType,
             spot = spot,
-            processingMinutes = round1(processingSeconds / 60.0),
+            processingMinutes = processingMinutes,
             computeUsd = round4(computeUsd),
+            ebsRootVolumeGiB = ebsRootVolumeGiB,
+            ebsShootUsd = ebsShootUsd,
             s3StandardMonthUsd = round4(s3StandardMonthUsd),
             s3DeepArchiveMonthUsd = round4(s3DeepArchiveMonthUsd),
             requestsUsd = round4(requestsUsd),
             transferAccelerationUsd = transferAccelerationUsd,
-            totalShootUsd = round4(computeUsd + s3StandardMonthUsd + requestsUsd + transferAccelerationUsd),
+            totalShootUsd = round4(
+                computeUsd + ebsShootUsd + s3StandardMonthUsd + requestsUsd + transferAccelerationUsd,
+            ),
         )
         val notes = mutableListOf("Computed on device from bundled pricing.json")
         if (transferAcceleration) {

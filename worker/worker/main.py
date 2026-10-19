@@ -16,6 +16,7 @@ import boto3
 
 from gphotos.gphotos_upload import MediaUploadItem
 from worker.config import WorkerConfig
+from worker.disk_space import require_free_bytes
 from worker.dynamo_store import DynamoStore
 from worker.failure_report import format_last_error
 from worker.gphotos_client import upload_shoot_media
@@ -33,6 +34,8 @@ from worker.media_kind import (
 )
 
 log = logging.getLogger("worker")
+
+PIPELINE_WINDOW = max(1, min(8, int(os.environ.get("PIPELINE_WINDOW", "6"))))
 
 
 def worker_log_path() -> Path:
@@ -68,24 +71,31 @@ def raw_s3_key(shoot_id: str, entry: dict) -> str:
     return f"shoots/{shoot_id}/raw/{sha}{ext}"
 
 
-def download_photo_raws(
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        log.warning("failed to delete %s", path)
+
+
+def download_one_raw(
     s3,
     bucket: str,
     shoot_id: str,
-    photo_entries: list[dict],
+    entry: dict,
     raw_dir: Path,
-) -> list[Path]:
-    paths: list[Path] = []
-    for f in photo_entries:
-        sha = f["sha256"].lower()
-        ext = raw_extension_for_name(f.get("original_name"))
-        key = raw_s3_key(shoot_id, f)
-        dest = raw_dir / f"{sha}{ext}"
-        if not dest.exists():
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            s3.download_file(bucket, key, str(dest))
-        paths.append(dest)
-    return paths
+    work_dir: Path,
+) -> Path:
+    sha = entry["sha256"].lower()
+    ext = raw_extension_for_name(entry.get("original_name"))
+    key = raw_s3_key(shoot_id, entry)
+    dest = raw_dir / f"{sha}{ext}"
+    size = int(entry.get("size_bytes") or 0)
+    require_free_bytes(work_dir, size * 2)
+    if not dest.exists():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        s3.download_file(bucket, key, str(dest))
+    return dest
 
 
 def shutdown_instance():
@@ -113,7 +123,7 @@ def _count_rendered_photos(store: DynamoStore, shoot_id: str, photo_shas: set[st
     n = 0
     for sha in photo_shas:
         st = (store.get_image(shoot_id, sha) or {}).get("state")
-        if st in ("RENDERED", "GP_CREATED"):
+        if st in ("RENDERED", "GP_CREATED", "PUBLISHED"):
             n += 1
     return n
 
@@ -138,6 +148,7 @@ def run() -> int:
     raw_dir = work / "raw"
     out_dir = work / "out"
     ledger_path = work / "gphotos_ledger.json"
+    raw_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     shoot_meta = store.get_shoot(cfg.shoot_id) or {}
@@ -165,7 +176,7 @@ def run() -> int:
             totalFiles=total,
             photoCount=photo_count,
             videoCount=video_count,
-            phase="DOWNLOADING",
+            phase="RENDERING",
         )
         for entry in all_files:
             sha = entry["sha256"].lower()
@@ -177,28 +188,32 @@ def run() -> int:
                 originalName=entry.get("original_name"),
             )
 
-        raws = download_photo_raws(s3, cfg.bucket, cfg.shoot_id, photo_entries, raw_dir)
+        ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {"album_id": None, "items": {}}
+        if shoot_meta.get("albumId") and not ledger.get("album_id"):
+            ledger["album_id"] = shoot_meta["albumId"]
+        if shoot_meta.get("albumProductUrl") and not ledger.get("album_product_url"):
+            ledger["album_product_url"] = shoot_meta["albumProductUrl"]
+
+        def save_ledger():
+            tmp = ledger_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(ledger, indent=1))
+            tmp.replace(ledger_path)
+
         render_started_at = int(time.time() * 1000)
         store.update_shoot(cfg.shoot_id, phase="RENDERING", renderStartedAt=render_started_at)
-        rendered: list[Path] = []
-        already_published = sum(
-            1
-            for sha in photo_shas | video_shas
-            if (store.get_image(cfg.shoot_id, sha) or {}).get("state")
-            in ("GP_CREATED", "PUBLISHED")
-        )
         first_error: str | None = None
         fail_count = 0
+        pipeline_workers = max(1, min(PIPELINE_WINDOW, cfg.max_parallel_renders))
 
-        def process_one_photo(raw: Path) -> tuple[str, Path | None, str | None]:
-            sha = raw.stem.lower()
+        def pipeline_one_photo(entry: dict) -> tuple[str, str | None]:
+            sha = entry["sha256"].lower()
             existing = store.get_image(cfg.shoot_id, sha)
-            if existing and existing.get("state") == "GP_CREATED":
-                out = out_dir / f"{sha}.jpg"
-                if out.exists():
-                    return sha, out, None
+            if existing and existing.get("state") in ("GP_CREATED", "PUBLISHED"):
+                return sha, None
+            raw: Path | None = None
+            out = out_dir / f"{sha}.jpg"
             try:
-                out = out_dir / f"{sha}.jpg"
+                raw = download_one_raw(s3, cfg.bucket, cfg.shoot_id, entry, raw_dir, work)
                 if not out.exists():
                     render_jpeg(
                         cfg.lightcraft_bin,
@@ -219,25 +234,46 @@ def run() -> int:
                     cfg.bucket,
                     f"shoots/{cfg.shoot_id}/jpeg/{cfg.settings_hash}/{sha}.jpg",
                 )
-                return sha, out, None
+                upload_shoot_media(
+                    cfg.gphotos_token_param,
+                    cfg.region,
+                    cfg.album_title,
+                    [],
+                    [out],
+                    ledger,
+                    save_ledger,
+                    s3_client=s3,
+                )
+                item = ledger.get("items", {}).get(sha, {})
+                if item.get("state") == "CREATED":
+                    store.update_image(
+                        cfg.shoot_id,
+                        sha,
+                        state="GP_CREATED",
+                        mediaType="photo",
+                        mediaItemId=item.get("media_item_id"),
+                    )
+                return sha, None
             except PreviewOnlyError as e:
                 _file_error(store, cfg.shoot_id, sha, str(e), "PREVIEW_ONLY")
-                return sha, None, str(e)
+                return sha, str(e)
             except LightcraftRenderError as e:
                 _file_error(store, cfg.shoot_id, sha, str(e), "FAILED_RENDER")
-                return sha, None, str(e)
+                return sha, str(e)
+            finally:
+                if raw is not None:
+                    _safe_unlink(raw)
+                _safe_unlink(out)
 
-        if raws:
-            with ThreadPoolExecutor(max_workers=cfg.max_parallel_renders) as pool:
-                futures = [pool.submit(process_one_photo, r) for r in raws]
+        if photo_entries:
+            with ThreadPoolExecutor(max_workers=pipeline_workers) as pool:
+                futures = [pool.submit(pipeline_one_photo, entry) for entry in photo_entries]
                 for fut in as_completed(futures):
-                    sha, out, err = fut.result()
+                    sha, err = fut.result()
                     if err:
                         fail_count += 1
                         if first_error is None:
                             first_error = err
-                    if out:
-                        rendered.append(out)
                     rendered_count = _count_rendered_photos(store, cfg.shoot_id, photo_shas)
                     store.update_shoot(
                         cfg.shoot_id,
@@ -245,12 +281,12 @@ def run() -> int:
                         renderedPhotoCount=rendered_count,
                         phase="RENDERING",
                     )
-                    log.info("processed photo %s err=%s (%s/%s)", sha, err, rendered_count, photo_count)
+                    log.info("pipeline photo %s err=%s (%s/%s)", sha, err, rendered_count, photo_count)
 
         rendered_photo_count = _count_rendered_photos(store, cfg.shoot_id, photo_shas)
         if photo_count > 0 and rendered_photo_count == 0:
             summary = f"{first_error or 'render failed'}; {fail_count}/{photo_count} photo(s) failed"
-            store.update_shoot(
+            store.finish_run(
                 cfg.shoot_id,
                 state="FAILED",
                 phase="RENDER_FAILED",
@@ -265,16 +301,6 @@ def run() -> int:
                 return 1
 
         store.update_shoot(cfg.shoot_id, state="PUBLISHING", phase="PUBLISHING_GP")
-        ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {"album_id": None, "items": {}}
-        if shoot_meta.get("albumId") and not ledger.get("album_id"):
-            ledger["album_id"] = shoot_meta["albumId"]
-        if shoot_meta.get("albumProductUrl") and not ledger.get("album_product_url"):
-            ledger["album_product_url"] = shoot_meta["albumProductUrl"]
-
-        def save_ledger():
-            tmp = ledger_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(ledger, indent=1))
-            tmp.replace(ledger_path)
 
         media_items: list[MediaUploadItem] = []
         for entry in video_entries:
@@ -284,12 +310,14 @@ def run() -> int:
                 continue
             key = raw_s3_key(cfg.shoot_id, entry)
             name = entry.get("original_name") or f"{sha}.mp4"
+            size = int(entry.get("size_bytes") or 0)
+            require_free_bytes(work, min(size, 512 * 1024 * 1024))
             media_items.append(
                 MediaUploadItem(
                     ledger_key=sha,
                     filename=os.path.basename(name),
                     content_type=content_type_for_name(name),
-                    size_bytes=int(entry.get("size_bytes") or 0),
+                    size_bytes=size,
                     s3_bucket=cfg.bucket,
                     s3_key=key,
                 )
@@ -300,16 +328,14 @@ def run() -> int:
             cfg.region,
             cfg.album_title,
             media_items,
-            rendered,
+            [],
             ledger,
             save_ledger,
             s3_client=s3,
         )
-        newly_published = 0
         for sha, item in ledger.get("items", {}).items():
             if item.get("state") != "CREATED":
                 continue
-            newly_published += 1
             if sha in video_shas:
                 store.update_image(
                     cfg.shoot_id,
@@ -318,15 +344,12 @@ def run() -> int:
                     mediaType="video",
                     mediaItemId=item.get("media_item_id"),
                 )
-            else:
-                store.update_image(
-                    cfg.shoot_id,
-                    sha,
-                    state="GP_CREATED",
-                    mediaType="photo",
-                    mediaItemId=item.get("media_item_id"),
-                )
-        published_count = already_published + newly_published
+
+        published_count = sum(
+            1
+            for sha in photo_shas | video_shas
+            if (store.get_image(cfg.shoot_id, sha) or {}).get("state") in ("GP_CREATED", "PUBLISHED")
+        )
 
         results_key = f"shoots/{cfg.shoot_id}/results.json"
         t1 = int(time.time() * 1000)
@@ -365,12 +388,12 @@ def run() -> int:
                 if fail_count
                 else f"Published {published_count}/{total}"
             )
-        store.update_shoot(cfg.shoot_id, **album_updates)
+        store.finish_run(cfg.shoot_id, **album_updates)
         log.info("done: %s state=%s published=%s", body, final_state, published_count)
         return 0
     except Exception as e:
         log.exception("worker failed")
-        store.update_shoot(
+        store.finish_run(
             cfg.shoot_id,
             state="FAILED",
             phase="FAILED",

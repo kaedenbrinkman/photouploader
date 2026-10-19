@@ -4,6 +4,7 @@ import { ec2ErrorCode, ec2ErrorMessage, isRetryableEc2LaunchError } from './ec2-
 import type { ManifestFile } from './manifest-validate';
 import { computeDeadlineAt, computeMaxRuntimeMinutes } from './pricing';
 import { splitManifestFiles } from './media-kind';
+import { computeRootVolumeGiB } from './worker-root-volume';
 import { buildUserData, normalizeLinuxLineEndings } from './user-data-build';
 import EC2_USERDATA_BOOTSTRAP from './ec2-userdata-bootstrap.sh';
 
@@ -38,8 +39,10 @@ export type LaunchWorkerResult =
 export async function launchWorkerForShoot(p: LaunchWorkerParams): Promise<LaunchWorkerResult> {
   const settingsHash = p.manifest.settings_hash ?? (p.meta.settingsHash as string) ?? 'develop.auto-longEdge0-q90';
   const albumTitle = p.manifest.album_title ?? (p.meta.albumTitle as string) ?? p.shootId;
-  const split = splitManifestFiles(p.manifest.files ?? []);
+  const manifestFiles = p.manifest.files ?? [];
+  const split = splitManifestFiles(manifestFiles);
   const maxRuntimeMinutes = computeMaxRuntimeMinutes(split.photoCount, split.videoBytes);
+  const rootVolumeGiB = computeRootVolumeGiB(manifestFiles);
   const launchAt = Date.now();
   const deadlineAt = computeDeadlineAt(launchAt, maxRuntimeMinutes);
 
@@ -100,6 +103,16 @@ export async function launchWorkerForShoot(p: LaunchWorkerParams): Promise<Launc
               SubnetId: p.workerSubnetId,
               Groups: [p.workerSecurityGroupId],
               AssociatePublicIpAddress: true,
+            },
+          ],
+          BlockDeviceMappings: [
+            {
+              DeviceName: '/dev/xvda',
+              Ebs: {
+                VolumeSize: rootVolumeGiB,
+                VolumeType: 'gp3',
+                DeleteOnTermination: true,
+              },
             },
           ],
           UserData: Buffer.from(userData).toString('base64'),
