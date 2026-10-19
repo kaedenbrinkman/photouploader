@@ -1,5 +1,5 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { EC2Client, RunInstancesCommand } from '@aws-sdk/client-ec2';
 import { GetObjectCommand, HeadObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import type { APIGatewayProxyHandlerV2 } from 'aws-lambda';
@@ -16,6 +16,7 @@ import { computeDeadlineAt, computeMaxRuntimeMinutes } from './pricing';
 import { loadWorkerSha256FromSsm } from './worker-sha-ssm';
 import EC2_USERDATA_BOOTSTRAP from './ec2-userdata-bootstrap.sh';
 import { buildUserData, normalizeLinuxLineEndings } from './user-data-build';
+import { canReprocessShoot } from './finalize-eligibility';
 
 const s3 = new S3Client({});
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -91,7 +92,7 @@ async function acquireLaunchLockAndMarkReady(shootId: string): Promise<boolean> 
         UpdateExpression:
           'SET launchLockUntil = :u, #s = :v, phase = :q, verifiedAt = :t REMOVE missingKeys, lastError, launchErrorCode',
         ConditionExpression:
-          '(attribute_not_exists(launchLockUntil) OR launchLockUntil < :now) AND #s <> :done',
+          '(attribute_not_exists(launchLockUntil) OR launchLockUntil < :now) AND #s <> :processing',
         ExpressionAttributeNames: { '#s': 'state' },
         ExpressionAttributeValues: {
           ':u': now + LAUNCH_LOCK_MS,
@@ -99,7 +100,7 @@ async function acquireLaunchLockAndMarkReady(shootId: string): Promise<boolean> 
           ':v': 'READY_TO_PROCESS',
           ':q': 'READY_TO_PROCESS',
           ':t': now,
-          ':done': 'DONE',
+          ':processing': 'PROCESSING',
         },
       }),
     );
@@ -144,7 +145,24 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
   );
   if (!meta.Item || meta.Item.userId !== userId) return json(404, { error: 'shoot not found' });
 
-  if (meta.Item.state === 'DONE') {
+  let forceReprocess = false;
+  try {
+    const body = event.body ? JSON.parse(event.body) : {};
+    forceReprocess = Boolean(body.force);
+  } catch {
+    forceReprocess = false;
+  }
+
+  const fileRowsRes = await ddb.send(
+    new QueryCommand({
+      TableName: process.env.TABLE_NAME,
+      KeyConditionExpression: 'pk = :pk AND begins_with(sk, :f)',
+      ExpressionAttributeValues: { ':pk': `SHOOT#${shootId}`, ':f': 'FILE#' },
+    }),
+  );
+  const fileRows = (fileRowsRes.Items ?? []).map((it) => ({ state: it.state as string | undefined }));
+
+  if (meta.Item.state === 'DONE' && !canReprocessShoot(meta.Item, fileRows, { force: forceReprocess })) {
     return json(202, { state: 'DONE', instanceId: meta.Item.instanceId });
   }
 

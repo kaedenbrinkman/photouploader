@@ -853,6 +853,12 @@ class ShootViewModel(
             return true
         }
         val s = shoot.value ?: return false
+        if (s.state == "PARTIAL") return true
+        if (s.state == "DONE") {
+            parseProgress(repo.processingProgressJson(shootId))?.let { (_, total, published) ->
+                if (published == 0 || (total > 0 && published < total)) return true
+            }
+        }
         if (s.state == "FAILED" || s.state == "READY_TO_PROCESS") return true
         if (!s.backendState.isNullOrBlank() && s.backendState in setOf("FAILED", "READY_TO_PROCESS")) {
             return true

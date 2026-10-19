@@ -923,6 +923,7 @@ private fun ResultsStep(
     shoot ?: return
     val context = LocalContext.current
     val failed = shoot.state == "FAILED"
+    val partial = shoot.state == "PARTIAL"
     val progress = parseProgress(progressJson)
     val total = progress?.second ?: shoot.imageCount.coerceAtLeast(files.size).coerceAtLeast(1)
     val rendered = progress?.first ?: files.size
@@ -961,7 +962,11 @@ private fun ResultsStep(
                     },
                 )
                 Text(
-                    if (failed) "Processing failed" else "Album ready in Google Photos",
+                    when {
+                        failed -> "Processing failed"
+                        partial -> "Album partially uploaded"
+                        else -> "Album ready in Google Photos"
+                    },
                     style = MaterialTheme.typography.headlineSmall,
                     color = if (failed) {
                         MaterialTheme.colorScheme.onErrorContainer
@@ -989,7 +994,7 @@ private fun ResultsStep(
             }
         }
 
-        if (albumUrl != null && !failed) {
+        if (albumUrl != null && !failed && published > 0) {
             Button(
                 onClick = {
                     context.startActivity(

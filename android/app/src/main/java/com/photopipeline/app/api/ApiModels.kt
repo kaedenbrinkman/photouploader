@@ -38,6 +38,7 @@ data class ShootStatusResponse(
     val progress: ProgressDto?,
     val actualCompute: ActualComputeDto?,
     val workerStartedAt: Long? = null,
+    val renderStartedAt: Long? = null,
     val files: List<FileStatusDto>?,
     val results: Map<String, Any>?,
 )

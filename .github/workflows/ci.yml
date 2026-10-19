@@ -20,7 +20,11 @@ jobs:
       - name: Worker tests
         run: |
           pip install pytest
-          cd worker && PYTHONPATH=. pytest -q
+          cd worker && PYTHONPATH=. pytest -q -m "not integration"
+      - name: LightCraft importPreview smoke (optional)
+        run: |
+          chmod +x scripts/lightcraft-import-preview-smoke.sh
+          scripts/lightcraft-import-preview-smoke.sh
       - name: Backend moto tests
         run: |
           pip install -r backend/requirements-dev.txt

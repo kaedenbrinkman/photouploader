@@ -47,3 +47,7 @@ class DynamoStore:
     def get_image(self, shoot_id: str, sha256: str) -> dict[str, Any] | None:
         r = self._table.get_item(Key={"pk": f"SHOOT#{shoot_id}", "sk": f"FILE#{sha256.lower()}"})
         return r.get("Item")
+
+    def get_shoot(self, shoot_id: str) -> dict[str, Any] | None:
+        r = self._table.get_item(Key={"pk": f"SHOOT#{shoot_id}", "sk": "META"})
+        return r.get("Item")

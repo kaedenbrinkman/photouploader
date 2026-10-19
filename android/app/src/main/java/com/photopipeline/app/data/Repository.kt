@@ -667,6 +667,7 @@ class Repository(
                 put("uploadCompleteCount", p.uploadCompleteCount)
             }
             status.workerStartedAt?.let { put("workerStartedAt", it) }
+            status.renderStartedAt?.let { put("renderStartedAt", it) }
         }
         if (progressPayload.isNotEmpty()) {
             prefs.edit().putString(

@@ -92,6 +92,16 @@ def manage_shutdown_backstop(*, cancel: bool, arm_idle_minutes: int | None = Non
         log.exception("shutdown backstop update failed")
 
 
+def _file_error(store: DynamoStore, shoot_id: str, sha: str, message: str, state: str) -> None:
+    store.update_image(
+        shoot_id,
+        sha,
+        state=state,
+        error=message,
+        lastError=message,
+    )
+
+
 def run() -> int:
     log_path = worker_log_path()
     setup_logging(log_path)
@@ -103,16 +113,15 @@ def run() -> int:
     out_dir = work / "out"
     ledger_path = work / "gphotos_ledger.json"
     out_dir.mkdir(parents=True, exist_ok=True)
-    t0 = int(time.time() * 1000)
 
+    shoot_meta = store.get_shoot(cfg.shoot_id) or {}
     store.update_shoot(
         cfg.shoot_id,
         state="PROCESSING",
         phase="RENDERING",
-        workerStartedAt=t0,
         totalFiles=0,
         renderedCount=0,
-        publishedCount=0,
+        publishedCount=shoot_meta.get("publishedCount") or 0,
     )
     manage_shutdown_backstop(cancel=True, arm_idle_minutes=None)
 
@@ -121,9 +130,17 @@ def run() -> int:
         total = len(manifest.get("files", []))
         store.update_shoot(cfg.shoot_id, totalFiles=total, phase="DOWNLOADING")
         raws = download_raws(s3, cfg.bucket, cfg.shoot_id, manifest, raw_dir)
-        store.update_shoot(cfg.shoot_id, phase="RENDERING")
+        render_started_at = int(time.time() * 1000)
+        store.update_shoot(cfg.shoot_id, phase="RENDERING", renderStartedAt=render_started_at)
         rendered: list[Path] = []
         rendered_count = 0
+        already_published = sum(
+            1
+            for raw in raws
+            if (store.get_image(cfg.shoot_id, raw.stem.lower()) or {}).get("state") == "GP_CREATED"
+        )
+        first_error: str | None = None
+        fail_count = 0
 
         def process_one(raw: Path) -> tuple[str, Path | None, str | None]:
             sha = raw.stem.lower()
@@ -155,36 +172,51 @@ def run() -> int:
                 )
                 return sha, out, None
             except PreviewOnlyError as e:
-                store.update_image(cfg.shoot_id, sha, state="PREVIEW_ONLY", error=str(e))
-                return sha, None, "PREVIEW_ONLY"
+                _file_error(store, cfg.shoot_id, sha, str(e), "PREVIEW_ONLY")
+                return sha, None, str(e)
             except LightcraftRenderError as e:
-                store.update_image(cfg.shoot_id, sha, state="FAILED_RENDER", error=str(e))
-                return sha, None, "FAILED_RENDER"
+                _file_error(store, cfg.shoot_id, sha, str(e), "FAILED_RENDER")
+                return sha, None, str(e)
 
         with ThreadPoolExecutor(max_workers=cfg.max_parallel_renders) as pool:
             futures = [pool.submit(process_one, r) for r in raws]
             for fut in as_completed(futures):
                 sha, out, err = fut.result()
+                if err:
+                    fail_count += 1
+                    if first_error is None:
+                        first_error = err
                 if out:
                     rendered.append(out)
                     rendered_count += 1
                     store.update_shoot(cfg.shoot_id, renderedCount=rendered_count, phase="RENDERING")
                 log.info("processed %s err=%s (%s/%s)", sha, err, rendered_count, total)
 
+        if rendered_count == 0:
+            summary = f"{first_error or 'render failed'}; {fail_count}/{total} failed"
+            store.update_shoot(
+                cfg.shoot_id,
+                state="FAILED",
+                phase="RENDER_FAILED",
+                renderedCount=0,
+                publishedCount=0,
+                lastError=summary,
+                workerFinishedAt=int(time.time() * 1000),
+            )
+            log.error("no renders succeeded: %s", summary)
+            return 1
+
         store.update_shoot(cfg.shoot_id, state="PUBLISHING", phase="PUBLISHING_GP")
         ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {"album_id": None, "items": {}}
+        if shoot_meta.get("albumId") and not ledger.get("album_id"):
+            ledger["album_id"] = shoot_meta["albumId"]
+        if shoot_meta.get("albumProductUrl") and not ledger.get("album_product_url"):
+            ledger["album_product_url"] = shoot_meta["albumProductUrl"]
 
         def save_ledger():
             tmp = ledger_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(ledger, indent=1))
             tmp.replace(ledger_path)
-
-        published = 0
-
-        def on_batch_done(n: int):
-            nonlocal published
-            published += n
-            store.update_shoot(cfg.shoot_id, publishedCount=published, phase="PUBLISHING_GP")
 
         result = upload_shoot_jpegs(
             cfg.gphotos_token_param,
@@ -194,24 +226,28 @@ def run() -> int:
             ledger,
             save_ledger,
         )
+        newly_published = 0
         for sha, item in ledger.get("items", {}).items():
             if item.get("state") == "CREATED":
+                newly_published += 1
                 store.update_image(
                     cfg.shoot_id,
                     sha,
                     state="GP_CREATED",
                     mediaItemId=item.get("media_item_id"),
                 )
-        store.update_shoot(cfg.shoot_id, publishedCount=len(rendered))
+        published_count = already_published + newly_published
 
         results_key = f"shoots/{cfg.shoot_id}/results.json"
         t1 = int(time.time() * 1000)
+        worker_started = shoot_meta.get("workerStartedAt")
+        compute_ms = t1 - worker_started if isinstance(worker_started, int) else t1 - render_started_at
         body = {
             "shoot_id": cfg.shoot_id,
             "album_id": result.get("album_id"),
-            "created": result.get("created"),
+            "created": published_count,
             "settings_hash": cfg.settings_hash,
-            "computeMs": t1 - t0,
+            "computeMs": compute_ms,
         }
         s3.put_object(
             Bucket=cfg.bucket,
@@ -219,17 +255,27 @@ def run() -> int:
             Body=json.dumps(body).encode(),
             ContentType="application/json",
         )
+
+        final_state = "DONE" if published_count >= 1 else "PARTIAL"
         album_updates: dict = {
-            "state": "DONE",
-            "phase": "DONE",
+            "state": final_state,
+            "phase": final_state,
             "albumId": result.get("album_id"),
             "resultsS3Key": results_key,
+            "renderedCount": rendered_count,
+            "publishedCount": published_count,
             "workerFinishedAt": t1,
         }
         if result.get("album_product_url"):
             album_updates["albumProductUrl"] = result.get("album_product_url")
+        if final_state == "PARTIAL":
+            album_updates["lastError"] = (
+                f"Published {published_count}/{total}; {fail_count} render failure(s)"
+                if fail_count
+                else f"Published {published_count}/{total}"
+            )
         store.update_shoot(cfg.shoot_id, **album_updates)
-        log.info("done: %s", body)
+        log.info("done: %s state=%s published=%s", body, final_state, published_count)
         return 0
     except Exception as e:
         log.exception("worker failed")

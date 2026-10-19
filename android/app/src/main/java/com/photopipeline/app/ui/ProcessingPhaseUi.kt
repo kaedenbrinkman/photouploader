@@ -40,10 +40,10 @@ enum class FileProcessingBadge(val label: String) {
 
 fun fileProcessingBadge(serverState: String?): FileProcessingBadge {
     when (serverState?.uppercase()?.replace('-', '_')) {
-        "PUBLISHED", "DONE" -> return FileProcessingBadge.Published
+        "GP_CREATED", "PUBLISHED", "DONE" -> return FileProcessingBadge.Published
         "RENDERED" -> return FileProcessingBadge.Rendered
         "RENDERING", "IN_PROGRESS", "PROCESSING" -> return FileProcessingBadge.Rendering
-        "FAILED", "ERROR" -> return FileProcessingBadge.Failed
+        "FAILED", "FAILED_RENDER", "PREVIEW_ONLY", "ERROR" -> return FileProcessingBadge.Failed
         null, "", "QUEUED", "PENDING", "UPLOADED" -> return FileProcessingBadge.Queued
         else -> return FileProcessingBadge.Queued
     }
