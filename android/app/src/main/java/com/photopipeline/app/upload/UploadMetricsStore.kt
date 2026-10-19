@@ -22,6 +22,8 @@ data class LiveUploadMetrics(
     val network: NetworkSnapshot? = null,
     val speedHistoryBps: List<Long> = emptyList(),
     val transferAccelerationActive: Boolean = false,
+    val sessionBytes: Long = 0,
+    val sessionElapsedMs: Long = 0,
 )
 
 object UploadMetricsStore {

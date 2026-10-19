@@ -68,7 +68,7 @@ class StreamingCameraUploader(
         }
         onProgress(
             0,
-            TransferSpeedTracker.Snapshot(0, 0, 0, 0, file.sizeBytes, null),
+            TransferSpeedTracker.Snapshot(0, 0, 0, 0, file.sizeBytes, 0, 0, null),
             parts.size,
             plans.size,
             parts,
@@ -163,7 +163,16 @@ class StreamingCameraUploader(
             }
         }
         val completeStart = System.currentTimeMillis()
-        api.completeMultipart(shootId, uploadRef, key!!, uploadId!!, parts, prefs.transferAcceleration)
+        MultipartComplete.completeWithRetry(
+            api,
+            shootId,
+            uploadRef,
+            key!!,
+            uploadId!!,
+            parts,
+            prefs.transferAcceleration,
+            file.sizeBytes,
+        )
         PipelineLog.i(
             "upload",
             "file complete name=${file.originalName} key=$key ms=${System.currentTimeMillis() - completeStart} " +

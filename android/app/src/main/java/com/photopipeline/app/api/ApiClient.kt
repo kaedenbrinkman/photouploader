@@ -158,6 +158,29 @@ class ApiClient(
         }
     }
 
+    data class HeadObjectResult(val exists: Boolean, val contentLength: Long)
+
+    suspend fun headObject(
+        shootId: String,
+        key: String,
+        transferAcceleration: Boolean = false,
+    ): HeadObjectResult = onIo {
+        val body = JSONObject()
+            .put("action", "head_object")
+            .put("key", key)
+            .putTransferAcceleration(transferAcceleration)
+            .toString()
+        val req = authorizedRequest("/shoots/$shootId/presign").post(body.toRequestBody(JSON)).build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) failHttp("head_object", resp)
+            val json = JSONObject(resp.body!!.string())
+            HeadObjectResult(
+                exists = json.optBoolean("exists", false),
+                contentLength = json.optLong("contentLength", 0L),
+            )
+        }
+    }
+
     suspend fun completeMultipart(
         shootId: String,
         sha256: String,

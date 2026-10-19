@@ -144,16 +144,33 @@ fun SelectFilesStep(
                 }
             }
         }
-        Button(
-            onClick = onImport,
-            enabled = !busy && selectedCount > 0,
-            modifier = Modifier.fillMaxWidth(),
+    }
+}
+
+@Composable
+fun ImportFlowBottomBar(
+    summary: String,
+    buttonText: String,
+    enabled: Boolean,
+    busy: Boolean,
+    onClick: () -> Unit,
+) {
+    Surface(tonalElevation = 3.dp, shadowElevation = 8.dp) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            if (busy) {
-                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                Spacer(Modifier.size(8.dp))
+            Text(summary, modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+            Button(onClick = onClick, enabled = enabled && !busy) {
+                if (busy) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.size(8.dp))
+                }
+                Text(buttonText)
             }
-            Text("Upload $selectedCount selected files")
         }
     }
 }

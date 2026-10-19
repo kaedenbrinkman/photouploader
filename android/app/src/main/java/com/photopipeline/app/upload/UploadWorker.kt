@@ -211,6 +211,9 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                     totalBytes = file.sizeBytes,
                     partsDone = partsDone,
                     partsTotal = partsTotal,
+                    etaSeconds = sessionSnap.etaSeconds,
+                    sessionBytes = sessionSnap.sessionBytes,
+                    sessionElapsedMs = sessionSnap.sessionElapsedMs,
                     network = network.snapshot(),
                 )
             }
@@ -311,6 +314,9 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         totalBytes = file.sizeBytes,
                         partsDone = parts.size,
                         partsTotal = plans.size,
+                        etaSeconds = sessionSnap.etaSeconds,
+                        sessionBytes = sessionSnap.sessionBytes,
+                        sessionElapsedMs = sessionSnap.sessionElapsedMs,
                         network = network.snapshot(),
                     )
                 }
@@ -318,7 +324,16 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             }
         }
         val completeStart = System.currentTimeMillis()
-        repo.api.completeMultipart(shootId, uploadRef, key!!, uploadId!!, parts, accel)
+        MultipartComplete.completeWithRetry(
+            repo.api,
+            shootId,
+            uploadRef,
+            key!!,
+            uploadId!!,
+            parts,
+            accel,
+            file.sizeBytes,
+        )
         PipelineLog.i(
             "upload",
             "file complete (local) name=${file.originalName} key=$key ms=${System.currentTimeMillis() - completeStart}",

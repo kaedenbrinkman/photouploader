@@ -4,6 +4,7 @@ import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
+  HeadObjectCommand,
   ListPartsCommand,
   PutObjectCommand,
   S3Client,
@@ -136,6 +137,23 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
       }),
     );
     return json(200, { url, key, transferAcceleration: accelerated });
+  }
+
+  if (action === 'head_object') {
+    const { key } = body;
+    if (!key) return json(400, { error: 'missing fields' });
+    try {
+      const head = await s3For(body).send(
+        new HeadObjectCommand({ Bucket: process.env.BUCKET_NAME!, Key: key }),
+      );
+      return json(200, {
+        exists: true,
+        contentLength: head.ContentLength ?? 0,
+        transferAcceleration: accelerated,
+      });
+    } catch {
+      return json(200, { exists: false, transferAcceleration: accelerated });
+    }
   }
 
   if (action === 'complete_multipart') {

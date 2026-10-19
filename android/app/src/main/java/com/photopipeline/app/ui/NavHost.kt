@@ -463,10 +463,70 @@ fun ShootFlowScreen(
             )
         },
         snackbarHost = { SnackbarHost(snackbarHost) },
+        bottomBar = {
+            if (!ui.flowReady) return@Scaffold
+            when (ui.step) {
+                ShootFlowStep.PickFiles -> {
+                    val (selCount, selBytes) = vm.selectedCountAndBytes()
+                    ImportFlowBottomBar(
+                        summary = "$selCount selected · ${formatBytesShort(selBytes)}",
+                        buttonText = if (selCount > 0) "Next" else "Next",
+                        enabled = selCount > 0,
+                        busy = ui.busy,
+                        onClick = { vm.importSelected() },
+                    )
+                }
+                ShootFlowStep.Upload -> {
+                    val uploading = ui.uploadStartState == UploadStartState.Uploading ||
+                        ui.uploadStartState == UploadStartState.Starting
+                    val failed = files.count { it.uploadState == "FAILED" }
+                    val pending = files.count { it.uploadState != "UPLOADED" }
+                    val uploaded = files.size - pending
+                    val needsManualStart = !uploading && (
+                        ui.isResumeShoot ||
+                            ui.uploadStartState == UploadStartState.Failed ||
+                            failed > 0 ||
+                            files.any { it.uploadState == "PENDING" }
+                        )
+                    if (files.isEmpty()) return@Scaffold
+                    val label = when {
+                        uploading -> "Uploading…"
+                        failed > 0 -> "Retry failed"
+                        ui.isResumeShoot && usbState != UsbAccessState.READY -> "Connect & upload"
+                        ui.isResumeShoot -> "Resume upload"
+                        ui.uploadStartState == UploadStartState.Failed -> "Retry upload"
+                        else -> "Start upload"
+                    }
+                    val action = when {
+                        failed > 0 && !uploading -> ({ vm.retryFailedUploads() })
+                        ui.isResumeShoot && !uploading -> ({ vm.connectAndResumeUpload() })
+                        ui.uploadStartState == UploadStartState.Failed && !uploading -> ({ vm.retryFailedUploads() })
+                        !uploading && needsManualStart -> ({ vm.startUpload() })
+                        else -> null
+                    }
+                    ImportFlowBottomBar(
+                        summary = "$uploaded / ${files.size} uploaded · ${formatBytesShort(files.sumOf { it.sizeBytes })}",
+                        buttonText = label,
+                        enabled = action != null,
+                        busy = ui.busy || uploading,
+                        onClick = { action?.invoke() },
+                    )
+                }
+                else -> Unit
+            }
+        },
     ) { pad ->
+        val bottomInset = if (
+            ui.flowReady &&
+            (ui.step == ShootFlowStep.PickFiles || ui.step == ShootFlowStep.Upload)
+        ) {
+            88.dp
+        } else {
+            0.dp
+        }
         LazyColumn(
             modifier = Modifier.padding(pad).fillMaxSize(),
-            contentPadding = PaddingValues(16.dp),
+            contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 16.dp + bottomInset),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             if (
@@ -739,28 +799,10 @@ private fun UploadStep(
             val needsManualStart = ui.isResumeShoot ||
                 ui.uploadStartState == UploadStartState.Failed ||
                 files.any { it.uploadState == "FAILED" }
-            if (needsManualStart && !uploading) {
-                val primaryLabel = when {
-                    ui.isResumeShoot && usbState != UsbAccessState.READY -> "Connect & resume upload"
-                    ui.isResumeShoot -> "Resume upload"
-                    else -> "Retry upload"
-                }
-                val primaryAction = when {
-                    ui.isResumeShoot -> onResume
-                    else -> onRetry
-                }
-                Button(
-                    onClick = primaryAction,
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = !ui.busy,
-                ) {
-                    Text(primaryLabel)
-                }
-            }
             UploadProgressSection(
                 files = files,
                 onRetry = onRetry,
-                showRetryButton = needsManualStart && !uploading,
+                showRetryButton = false,
             )
         }
     }
@@ -781,7 +823,13 @@ private fun OverallUploadProgressCard(
         else -> bytesFromFiles
     }
     val remaining = (totalBytes - bytesSent).coerceAtLeast(0)
-    val etaSeconds = UploadEtaEstimator.estimateSeconds(remaining, metrics.currentBps, metrics.averageBps)
+    val etaSeconds = UploadEtaEstimator.estimateSeconds(
+        remainingBytes = remaining,
+        currentBps = metrics.currentBps,
+        averageBps = metrics.averageBps,
+        sessionBytes = metrics.sessionBytes,
+        sessionElapsedMs = metrics.sessionElapsedMs,
+    )
     val byteProgress = bytesSent.toFloat() / totalBytes
     Card(
         Modifier.fillMaxWidth(),
@@ -799,12 +847,10 @@ private fun OverallUploadProgressCard(
             )
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("Now ${formatMbps(metrics.currentBps)}", style = MaterialTheme.typography.bodySmall)
-                etaSeconds?.let {
-                    Text(
-                        if (it <= 0L) "Finishing…" else "ETA ~${it / 60}m ${it % 60}s",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
+                Text(
+                    UploadEtaEstimator.formatEta(etaSeconds),
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
         }
     }

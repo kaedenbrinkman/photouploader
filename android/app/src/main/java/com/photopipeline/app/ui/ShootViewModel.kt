@@ -9,6 +9,8 @@ import androidx.work.WorkManager
 import com.photopipeline.app.api.ApiRequestException
 import com.photopipeline.app.api.FinalizeErrorMessages
 import com.photopipeline.app.api.NotSignedInException
+import com.photopipeline.app.core.CaptureTimeNormalizer
+import com.photopipeline.app.core.ExifCaptureTime
 import com.photopipeline.app.core.PipelineLog
 import com.photopipeline.app.data.CameraImportResult
 import com.photopipeline.app.data.EstimateSource
@@ -320,15 +322,24 @@ class ShootViewModel(
     private fun loadThumbnails(objects: List<MtpObjectInfo>) {
         safeScope.launch {
             val map = mutableMapOf<Long, ByteArray>()
-            for (obj in objects.take(40)) {
+            var updatedObjects = objects
+            for (obj in objects.take(80)) {
                 runCatching {
                     repo.mtp.getThumbnail(obj)?.let { bytes ->
                         map[obj.handle] = bytes
                         persistThumbnail(obj.handle, bytes)
+                        ExifCaptureTime.epochMsFromThumbnailJpeg(bytes)?.let { exifMs ->
+                            val merged = CaptureTimeNormalizer.bestCaptureEpochMs(exifMs, obj.captureTimeEpochMs)
+                            if (merged > 0L && merged != obj.captureTimeEpochMs) {
+                                updatedObjects = updatedObjects.map {
+                                    if (it.handle == obj.handle) it.copy(captureTimeEpochMs = merged) else it
+                                }
+                            }
+                        }
                     }
                 }.onFailure { PipelineLog.w("mtp", "thumbnail ${obj.filename} failed", it) }
             }
-            _ui.value = _ui.value.copy(thumbnails = map)
+            _ui.value = _ui.value.copy(thumbnails = map, cameraObjects = updatedObjects)
         }
     }
 
@@ -582,6 +593,7 @@ class ShootViewModel(
         if (!repo.canUseBackendApi()) return
         val fileList = files.value
         if (fileList.isEmpty() || fileList.any { it.uploadState != "UPLOADED" }) return
+        if (fileList.any { it.uploadState == "FAILED" }) return
         val s = shoot.value ?: return
         if (s.state in TERMINAL && s.state != "FAILED") return
         if (s.albumId != null) return

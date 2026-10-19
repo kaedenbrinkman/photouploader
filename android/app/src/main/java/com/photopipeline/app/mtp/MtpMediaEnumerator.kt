@@ -2,6 +2,7 @@ package com.photopipeline.app.mtp
 
 import android.mtp.MtpDevice
 import android.mtp.MtpObjectInfo as AndroidMtpObjectInfo
+import com.photopipeline.app.core.CaptureTimeNormalizer
 import com.photopipeline.app.core.PipelineLog
 
 /**
@@ -37,7 +38,10 @@ object MtpMediaEnumerator {
                 if (MtpObjectFormat.isFolder(info.format, name)) continue
                 if (!MtpObjectFormat.isMediaFileName(name)) continue
                 mediaCount++
-                val captureMs = info.dateCreated.toLong() * 1000L
+                val captureMs = CaptureTimeNormalizer.resolveMtpCaptureEpochMs(
+                    info.dateCreated.toLong(),
+                    info.dateModified.toLong(),
+                )
                 out += MtpObjectInfo(
                     storageId = storageId.toLong(),
                     handle = handle.toLong(),
