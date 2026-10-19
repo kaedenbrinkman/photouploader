@@ -20,6 +20,7 @@ jobs:
       - name: Worker tests
         run: |
           pip install pytest
+          pip install -r worker/requirements.txt
           cd worker && PYTHONPATH=. pytest -q -m "not integration"
       - name: LightCraft importPreview smoke (optional)
         run: |
