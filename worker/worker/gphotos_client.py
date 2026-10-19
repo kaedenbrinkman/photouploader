@@ -10,6 +10,7 @@ import boto3
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
+
 def _gphotos_sys_path_root() -> Path:
     here = Path(__file__).resolve()
     for parent in (here.parents[1], here.parents[2]):
@@ -22,7 +23,7 @@ _GPHOTOS_ROOT = _gphotos_sys_path_root()
 if str(_GPHOTOS_ROOT) not in sys.path:
     sys.path.insert(0, str(_GPHOTOS_ROOT))
 
-from gphotos.gphotos_upload import SCOPES, upload_album  # noqa: E402
+from gphotos.gphotos_upload import MediaUploadItem, SCOPES, upload_album  # noqa: E402
 
 
 def load_credentials_from_ssm(param_name: str, region: str) -> Credentials:
@@ -51,4 +52,27 @@ def upload_shoot_jpegs(
         [str(p) for p in jpeg_paths],
         ledger,
         save_ledger=save_ledger,
+    )
+
+
+def upload_shoot_media(
+    token_param: str,
+    region: str,
+    album_title: str,
+    media_items: list[MediaUploadItem],
+    jpeg_paths: list[Path],
+    ledger: dict,
+    save_ledger,
+    *,
+    s3_client=None,
+) -> dict:
+    creds = load_credentials_from_ssm(token_param, region)
+    return upload_album(
+        creds,
+        album_title,
+        [str(p) for p in jpeg_paths],
+        ledger,
+        save_ledger=save_ledger,
+        s3_client=s3_client,
+        media_items=media_items,
     )

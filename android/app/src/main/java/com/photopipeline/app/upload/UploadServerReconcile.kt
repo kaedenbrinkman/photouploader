@@ -6,7 +6,7 @@ import com.photopipeline.app.core.metadataUploadSha256
 import com.photopipeline.app.data.FileEntity
 
 object UploadServerReconcile {
-    private val serverUploadedStates = setOf("UPLOADED", "GP_CREATED", "RENDERED")
+    private val serverUploadedStates = setOf("UPLOADED", "GP_CREATED", "RENDERED", "PUBLISHED")
 
     fun serverUploadedShaKeys(files: List<FileStatusDto>): Set<String> =
         files.filter { f ->

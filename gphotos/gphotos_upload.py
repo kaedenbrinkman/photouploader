@@ -1,18 +1,7 @@
 #!/usr/bin/env python3
-"""Minimal Google Photos Library API uploader (NOT run against a real account in this investigation).
+"""Google Photos Library API uploader with resumable uploads for large video files."""
+from __future__ import annotations
 
-Flow (per https://developers.google.com/photos/library/guides/upload-media, checked 2026-10-18):
-  1. OAuth 2.0 installed-app flow, scope photoslibrary.appendonly (+ readonly.appcreateddata for idempotent resume).
-  2. albums.create  (app-created album; API cannot add to user-created albums)
-  3. POST /v1/uploads (raw bytes) -> uploadToken (valid 1 day). Parallel OK.
-  4. mediaItems.batchCreate with albumId, <=50 items/call, serial per user.
-  5. 429 -> wait >=30 s, exponential backoff; 5xx -> backoff. 207 -> per-item status.
-State is kept in a JSON ledger so a rerun skips files already created (idempotent resume).
-
-Usage:
-  python gphotos_upload.py --client-secret client_secret.json --token token.json \
-      --album "Shoot 2026-10-18" --ledger ledger.json out/*.jpg
-"""
 import argparse
 import hashlib
 import json
@@ -20,6 +9,8 @@ import os
 import random
 import sys
 import time
+from dataclasses import dataclass
+from typing import Callable, Iterator
 
 import requests
 from google.auth.transport.requests import Request
@@ -31,6 +22,18 @@ SCOPES = [
     "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata",
 ]
 API = "https://photoslibrary.googleapis.com/v1"
+CHUNK_SIZE = 8 * 1024 * 1024
+
+
+@dataclass
+class MediaUploadItem:
+    ledger_key: str
+    filename: str
+    content_type: str
+    size_bytes: int
+    local_path: str | None = None
+    s3_bucket: str | None = None
+    s3_key: str | None = None
 
 
 def creds(client_secret, token_path):
@@ -42,7 +45,7 @@ def creds(client_secret, token_path):
     if c and c.expired and c.refresh_token:
         try:
             c.refresh(Request())
-        except Exception as e:  # invalid_grant: revoked, or 7-day expiry in Testing mode
+        except Exception as e:
             sys.exit(
                 f"REAUTH_REQUIRED: refresh failed ({type(e).__name__}); rerun interactively"
             )
@@ -87,6 +90,121 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def _byte_source(item: MediaUploadItem, s3_client) -> tuple[Callable[[], Iterator[bytes]], int]:
+    if item.local_path:
+        size = item.size_bytes or os.path.getsize(item.local_path)
+
+        def open_iter() -> Iterator[bytes]:
+            with open(item.local_path, "rb") as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    yield chunk
+
+        return open_iter, size
+    if item.s3_bucket and item.s3_key and s3_client is not None:
+        head = s3_client.head_object(Bucket=item.s3_bucket, Key=item.s3_key)
+        size = int(head["ContentLength"])
+
+        def open_iter() -> Iterator[bytes]:
+            obj = s3_client.get_object(Bucket=item.s3_bucket, Key=item.s3_key)
+            body = obj["Body"]
+            while True:
+                chunk = body.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                yield chunk
+
+        return open_iter, size
+    raise ValueError(f"MediaUploadItem {item.ledger_key} has no local_path or s3 location")
+
+
+def _upload_bytes_resumable(
+    credentials: Credentials,
+    content_type: str,
+    size: int,
+    chunks: Iterator[bytes],
+) -> str:
+    start = call(
+        credentials,
+        "POST",
+        f"{API}/uploads",
+        headers={
+            "Content-Type": "application/octet-stream",
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Content-Type": content_type,
+            "X-Goog-Upload-Content-Length": str(size),
+        },
+    )
+    upload_url = start.headers.get("X-Goog-Upload-URL")
+    if not upload_url:
+        raise RuntimeError("missing X-Goog-Upload-URL from Google Photos upload start")
+    offset = 0
+    for chunk in chunks:
+        end = offset + len(chunk) - 1
+        call(
+            credentials,
+            "PUT",
+            upload_url,
+            data=chunk,
+            headers={
+                "Content-Length": str(len(chunk)),
+                "Content-Range": f"bytes {offset}-{end}/{size}",
+            },
+        )
+        offset += len(chunk)
+    if offset != size:
+        raise RuntimeError(f"upload size mismatch: sent {offset} expected {size}")
+    finalize = call(
+        credentials,
+        "PUT",
+        upload_url,
+        headers={
+            "Content-Length": "0",
+            "X-Goog-Upload-Command": "upload, finalize",
+        },
+    )
+    return finalize.text
+
+
+def _upload_item(
+    credentials: Credentials,
+    item: MediaUploadItem,
+    ledger_item: dict,
+    save_ledger: Callable[[], None],
+    s3_client,
+) -> None:
+    if ledger_item.get("state") == "CREATED":
+        return
+    if ledger_item.get("state") != "UPLOADED" or time.time() - ledger_item.get("token_at", 0) > 20 * 3600:
+        chunk_iter_fn, size = _byte_source(item, s3_client)
+        if size > 32 * 1024 * 1024 or (item.content_type or "").startswith("video/"):
+            token = _upload_bytes_resumable(
+                credentials,
+                item.content_type,
+                size,
+                chunk_iter_fn(),
+            )
+        else:
+            with open(item.local_path, "rb") as f:
+                r = call(
+                    credentials,
+                    "POST",
+                    f"{API}/uploads",
+                    data=f,
+                    headers={
+                        "Content-type": "application/octet-stream",
+                        "X-Goog-Upload-Content-Type": item.content_type,
+                        "X-Goog-Upload-Protocol": "raw",
+                    },
+                )
+            token = r.text
+        ledger_item.update(state="UPLOADED", upload_token=token, token_at=time.time())
+        save_ledger()
+
+
 def upload_album(
     credentials: Credentials,
     album_title: str,
@@ -94,8 +212,10 @@ def upload_album(
     ledger: dict,
     *,
     save_ledger,
+    s3_client=None,
+    media_items: list[MediaUploadItem] | None = None,
 ) -> dict:
-    """Upload JPEGs to a Google Photos app-created album; mutates ledger in place."""
+    """Upload media to a Google Photos app-created album; mutates ledger in place."""
     if not ledger.get("album_id"):
         led_album = call(
             credentials,
@@ -108,28 +228,34 @@ def upload_album(
             ledger["album_product_url"] = led_album["productUrl"]
         save_ledger()
 
-    pending: list[str] = []
-    for p in file_paths:
-        k = sha256_file(p)
-        it = ledger.setdefault("items", {}).setdefault(k, {"path": p, "state": "PENDING"})
-        if it["state"] == "CREATED":
-            continue
-        if it["state"] != "UPLOADED" or time.time() - it.get("token_at", 0) > 20 * 3600:
-            with open(p, "rb") as f:
-                r = call(
-                    credentials,
-                    "POST",
-                    f"{API}/uploads",
-                    data=f,
-                    headers={
-                        "Content-type": "application/octet-stream",
-                        "X-Goog-Upload-Content-Type": "image/jpeg",
-                        "X-Goog-Upload-Protocol": "raw",
-                    },
+    specs: list[MediaUploadItem] = list(media_items or [])
+    if not specs:
+        for p in file_paths:
+            specs.append(
+                MediaUploadItem(
+                    ledger_key=sha256_file(p),
+                    filename=os.path.basename(p),
+                    content_type="image/jpeg",
+                    size_bytes=os.path.getsize(p),
+                    local_path=p,
                 )
-            it.update(state="UPLOADED", upload_token=r.text, token_at=time.time())
-            save_ledger()
-        pending.append(k)
+            )
+
+    pending: list[str] = []
+    for spec in specs:
+        k = spec.ledger_key.lower()
+        it = ledger.setdefault("items", {}).setdefault(
+            k,
+            {
+                "path": spec.local_path or spec.s3_key or spec.filename,
+                "filename": spec.filename,
+                "state": "PENDING",
+            },
+        )
+        it.setdefault("filename", spec.filename)
+        _upload_item(credentials, spec, it, save_ledger, s3_client)
+        if it.get("state") == "UPLOADED":
+            pending.append(k)
 
     for i in range(0, len(pending), 50):
         batch = pending[i : i + 50]
@@ -138,7 +264,8 @@ def upload_album(
             "newMediaItems": [
                 {
                     "simpleMediaItem": {
-                        "fileName": os.path.basename(ledger["items"][k]["path"]),
+                        "fileName": ledger["items"][k].get("filename")
+                        or os.path.basename(ledger["items"][k].get("path", f"media-{k[:8]}")),
                         "uploadToken": ledger["items"][k]["upload_token"],
                     }
                 }

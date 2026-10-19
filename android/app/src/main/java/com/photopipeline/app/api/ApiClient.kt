@@ -27,12 +27,15 @@ class ApiClient(
     private val statusAdapter: JsonAdapter<ShootStatusResponse> = moshi.adapter(ShootStatusResponse::class.java)
 
     suspend fun fetchEstimate(
-        imageCount: Int,
+        photoCount: Int,
+        videoCount: Int,
         totalBytesRaw: Long,
         transferAcceleration: Boolean = false,
     ): EstimateResponse = onIo {
         val body = JSONObject()
-            .put("imageCount", imageCount)
+            .put("photoCount", photoCount)
+            .put("videoCount", videoCount)
+            .put("imageCount", photoCount + videoCount)
             .put("totalBytesRaw", totalBytesRaw)
             .putTransferAcceleration(transferAcceleration)
             .toString()

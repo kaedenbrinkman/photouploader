@@ -12,6 +12,7 @@ import {
 import { ManifestValidationError, rawKeyForFile, validateManifest } from './manifest-validate';
 import { json, userIdFromEvent } from './http';
 import { verifyWorkerArtifact } from './worker-artifacts';
+import { splitManifestFiles } from './media-kind';
 import { computeDeadlineAt, computeMaxRuntimeMinutes } from './pricing';
 import { loadWorkerSha256FromSsm } from './worker-sha-ssm';
 import EC2_USERDATA_BOOTSTRAP from './ec2-userdata-bootstrap.sh';
@@ -280,8 +281,8 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     const albumTitle = manifest.album_title ?? meta.Item.albumTitle ?? shootId;
     const tokenParam = `/photopipeline/users/${userId}/gphotos-token`;
 
-    const fileCount = manifest.files?.length ?? Number(meta.Item.imageCount) ?? 1;
-    const maxRuntimeMinutes = computeMaxRuntimeMinutes(fileCount);
+    const split = splitManifestFiles(manifest.files ?? []);
+    const maxRuntimeMinutes = computeMaxRuntimeMinutes(split.photoCount, split.videoBytes);
     const launchAt = Date.now();
     const deadlineAt = computeDeadlineAt(launchAt, maxRuntimeMinutes);
 

@@ -20,6 +20,7 @@ import com.photopipeline.app.mtp.MtpObjectInfo
 import com.photopipeline.app.mtp.UsbAccessState
 import com.photopipeline.app.mtp.UsbCameraManager
 import com.photopipeline.app.mtp.UsbDebugLog
+import com.photopipeline.app.media.MediaKinds
 import com.photopipeline.app.upload.MultipartPlanner
 import com.photopipeline.app.upload.UploadServerReconcile
 import com.photopipeline.app.upload.UploadPart
@@ -510,7 +511,9 @@ class Repository(
 
     suspend fun fetchAndStoreEstimate(shootId: String): StoredEstimate {
         val files = db.fileDao().observeForShoot(shootId).first()
-        val imageCount = files.size.coerceAtLeast(1)
+        val photoCount = files.count { !MediaKinds.isVideoFileName(it.originalName) }.coerceAtLeast(0)
+        val videoCount = files.count { MediaKinds.isVideoFileName(it.originalName) }
+        val imageCount = (photoCount + videoCount).coerceAtLeast(1)
         val totalBytes = files.sumOf { it.sizeBytes }.coerceAtLeast(1)
         val measuredBps = uploadPreferences.lastMeasuredUploadBps
         val uploadMinutes = if (measuredBps > 0) {
@@ -520,7 +523,9 @@ class Repository(
         }
         val useAccel = uploadPreferences.transferAcceleration
         val stored = if (canUseBackendApi()) {
-            val remote = runCatching { api.fetchEstimate(imageCount, totalBytes, useAccel) }
+            val remote = runCatching {
+                api.fetchEstimate(photoCount, videoCount, totalBytes, useAccel)
+            }
             if (remote.isSuccess) {
                 StoredEstimate(remote.getOrThrow(), EstimateSource.BACKEND)
             } else {
@@ -531,7 +536,7 @@ class Repository(
                     err,
                 )
                 StoredEstimate(
-                    localPricing.estimateShoot(imageCount, totalBytes, useAccel),
+                    localPricing.estimateShoot(photoCount, videoCount, totalBytes, useAccel),
                     EstimateSource.LOCAL,
                 )
             }
@@ -541,7 +546,7 @@ class Repository(
                 "Using local pricing (signedIn=${isGoogleAccountLinked()} configured=${isBackendConfigured()})",
             )
             StoredEstimate(
-                localPricing.estimateShoot(imageCount, totalBytes, useAccel),
+                localPricing.estimateShoot(photoCount, videoCount, totalBytes, useAccel),
                 EstimateSource.LOCAL,
             )
         }
@@ -596,15 +601,17 @@ class Repository(
                             f.sizeBytes,
                             f.captureTimeEpochMs,
                         )
-                        val ext = if (f.originalName.uppercase().endsWith(".JPG")) ".JPG" else ".CR3"
+                        val ext = rawManifestExtension(f.originalName)
                         val s3Key = f.s3Key?.takeIf { it.isNotBlank() }
                             ?: "shoots/$shootId/raw/${uploadRef.lowercase()}$ext"
+                        val contentType = manifestContentType(f.originalName)
                         put(
                             JSONObject()
                                 .put("sha256", f.sha256)
                                 .put("s3_key", s3Key)
                                 .put("size_bytes", f.sizeBytes)
                                 .put("original_name", f.originalName)
+                                .put("content_type", contentType)
                                 .put("storage_id", f.storageId)
                                 .put("object_handle", f.objectHandle)
                                 .put("capture_time_epoch_ms", f.captureTimeEpochMs),
@@ -667,6 +674,11 @@ class Repository(
                 put("renderedCount", p.renderedCount)
                 put("publishedCount", p.publishedCount)
                 put("uploadCompleteCount", p.uploadCompleteCount)
+                put("photoCount", p.photoCount)
+                put("videoCount", p.videoCount)
+                put("renderedPhotoCount", p.renderedPhotoCount)
+                put("publishedPhotoCount", p.publishedPhotoCount)
+                put("publishedVideoCount", p.publishedVideoCount)
             }
             status.workerStartedAt?.let { put("workerStartedAt", it) }
             status.renderStartedAt?.let { put("renderStartedAt", it) }
@@ -954,6 +966,30 @@ class Repository(
             }
         }
         return md.digest().joinToString("") { "%02x".format(it) }
+    }
+}
+
+private fun rawManifestExtension(originalName: String): String {
+    val u = originalName.uppercase()
+    return when {
+        u.endsWith(".JPG") || u.endsWith(".JPEG") -> ".JPG"
+        u.endsWith(".CR2") -> ".CR2"
+        u.endsWith(".MP4") -> ".MP4"
+        u.endsWith(".MOV") -> ".MOV"
+        u.endsWith(".M4V") -> ".M4V"
+        u.endsWith(".HEIC") -> ".HEIC"
+        else -> ".CR3"
+    }
+}
+
+private fun manifestContentType(originalName: String): String {
+    val u = originalName.uppercase()
+    return when {
+        u.endsWith(".MP4") || u.endsWith(".M4V") -> "video/mp4"
+        u.endsWith(".MOV") -> "video/quicktime"
+        u.endsWith(".JPG") || u.endsWith(".JPEG") -> "image/jpeg"
+        u.endsWith(".HEIC") -> "image/heic"
+        else -> "image/x-canon-cr3"
     }
 }
 

@@ -25,7 +25,9 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.photopipeline.app.data.FileEntity
+import com.photopipeline.app.media.MediaKinds
 import com.photopipeline.app.mtp.MtpObjectInfo
+import androidx.compose.foundation.layout.Box
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -111,15 +113,16 @@ fun SelectFilesStep(
                                     },
                                 ),
                             ) {
-                                Column(Modifier.padding(6.dp)) {
-                                    ShootThumbnailImage(ui.thumbnails[obj.handle])
-                                    Text(
-                                        obj.filename,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        style = MaterialTheme.typography.labelSmall,
-                                    )
-                                    when {
+                                Box {
+                                    Column(Modifier.padding(6.dp)) {
+                                        ShootThumbnailImage(ui.thumbnails[obj.handle])
+                                        Text(
+                                            obj.filename,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            style = MaterialTheme.typography.labelSmall,
+                                        )
+                                        when {
                                         uploadedElsewhere || inThisShoot -> {
                                             StatusBadge(
                                                 label = "Uploaded",
@@ -133,6 +136,16 @@ fun SelectFilesStep(
                                                 color = MaterialTheme.colorScheme.primary,
                                             )
                                         }
+                                    }
+                                    }
+                                    if (MediaKinds.isVideoFileName(obj.filename)) {
+                                        StatusBadge(
+                                            label = "Video",
+                                            tint = MaterialTheme.colorScheme.tertiary,
+                                            modifier = Modifier
+                                                .align(Alignment.TopStart)
+                                                .padding(4.dp),
+                                        )
                                     }
                                 }
                             }

@@ -952,10 +952,15 @@ private fun ResultsStep(
     val context = LocalContext.current
     val failed = shoot.state == "FAILED"
     val partial = shoot.state == "PARTIAL"
-    val progress = parseProgress(progressJson)
-    val total = progress?.second ?: shoot.imageCount.coerceAtLeast(files.size).coerceAtLeast(1)
-    val rendered = progress?.first ?: files.size
-    val published = progress?.third ?: rendered
+    val processingProgress = parseProcessingProgress(progressJson)
+    val total = processingProgress?.photoCount?.takeIf { it > 0 }
+        ?: shoot.imageCount.coerceAtLeast(files.size).coerceAtLeast(1)
+    val rendered = processingProgress?.renderedPhotos ?: files.size
+    val published = processingProgress?.let {
+        it.publishedPhotos + it.publishedVideos
+    } ?: rendered
+    val progressSummary = processingProgress?.let { formatProcessingProgressLine(it) }
+        ?: "Rendered $rendered of $total · Published $published of $total"
     val compute = shoot.actualComputeJson?.let {
         runCatching {
             val o = JSONObject(it)
@@ -1010,7 +1015,7 @@ private fun ResultsStep(
                     )
                 }
                 Text(
-                    "Rendered $rendered of $total · Published $published of $total",
+                    progressSummary,
                     style = MaterialTheme.typography.bodyLarge,
                 )
                 compute?.let { (sec, usd) ->

@@ -32,6 +32,7 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     error: it.error,
     originalName: it.originalName,
     sizeBytes: it.sizeBytes,
+    mediaType: it.mediaType,
     updatedAt: it.updatedAt,
   }));
 

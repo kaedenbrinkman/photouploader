@@ -6,27 +6,37 @@ import {
 } from '../lambda/status-progress';
 
 describe('progressCountsFromFiles', () => {
-  it('counts rendered and published from file states', () => {
+  it('counts rendered photos separately from published videos', () => {
     const files = [
-      { state: 'GP_CREATED' },
-      { state: 'RENDERED' },
-      { state: 'UPLOADED' },
+      { state: 'GP_CREATED', mediaType: 'photo' },
+      { state: 'RENDERED', mediaType: 'photo' },
+      { state: 'PUBLISHED', mediaType: 'video' },
+      { state: 'UPLOADED', mediaType: 'video' },
     ];
-    expect(progressCountsFromFiles(files)).toEqual({ renderedCount: 2, publishedCount: 1 });
+    expect(progressCountsFromFiles(files)).toEqual({
+      renderedCount: 2,
+      publishedCount: 2,
+      photoCount: 2,
+      videoCount: 2,
+      renderedPhotoCount: 2,
+      publishedPhotoCount: 1,
+      publishedVideoCount: 1,
+    });
   });
 });
 
 describe('mergeProgress', () => {
-  it('derives counts from per-file states capped at total', () => {
-    const files = [{ state: 'RENDERED' }, { state: 'RENDERED' }];
+  it('derives counts from per-file states capped at totals', () => {
+    const files = [{ state: 'RENDERED', mediaType: 'photo' }, { state: 'RENDERED', mediaType: 'photo' }];
     const merged = mergeProgress(files, { totalFiles: 13, renderedCount: 0, publishedCount: 0 });
     expect(merged.renderedCount).toBe(2);
     expect(merged.totalFiles).toBe(13);
     expect(merged.uploadCompleteCount).toBe(0);
+    expect(merged.photoCount).toBe(2);
   });
 
   it('ignores inflated meta renderedCount when file rows exist', () => {
-    const files = Array.from({ length: 13 }, () => ({ state: 'RENDERED' }));
+    const files = Array.from({ length: 13 }, () => ({ state: 'RENDERED', mediaType: 'photo' }));
     const merged = mergeProgress(files, { totalFiles: 13, renderedCount: 26, publishedCount: 99 });
     expect(merged.renderedCount).toBe(13);
     expect(merged.publishedCount).toBe(0);

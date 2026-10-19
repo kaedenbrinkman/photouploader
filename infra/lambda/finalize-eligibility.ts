@@ -3,7 +3,7 @@
 export type ShootFileRow = { state?: string };
 
 export function countPublishedFiles(files: ShootFileRow[]): number {
-  return files.filter((f) => f.state === 'GP_CREATED').length;
+  return files.filter((f) => f.state === 'GP_CREATED' || f.state === 'PUBLISHED').length;
 }
 
 export function canReprocessShoot(

@@ -48,6 +48,11 @@ data class ProgressDto(
     val renderedCount: Int,
     val publishedCount: Int,
     val uploadCompleteCount: Int,
+    val photoCount: Int = 0,
+    val videoCount: Int = 0,
+    val renderedPhotoCount: Int = 0,
+    val publishedPhotoCount: Int = 0,
+    val publishedVideoCount: Int = 0,
 )
 
 data class ActualComputeDto(val seconds: Int?, val usd: Double?)

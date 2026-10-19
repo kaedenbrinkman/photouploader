@@ -13,7 +13,8 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { APIGatewayProxyHandlerV2 } from 'aws-lambda';
 import { randomUUID } from 'crypto';
 import { json, userIdFromEvent } from './http';
-import { completeShootMultipart } from './presign-complete';
+import { rawExtensionForName } from './media-kind';
+import { completeShootMultipart, invalidPartErrorCode } from './presign-complete';
 
 const s3Standard = new S3Client({});
 const s3Accelerated = new S3Client({ useAccelerateEndpoint: true });
@@ -73,7 +74,7 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
   if (action === 'presign_part') {
     const { sha256, partNumber, uploadId, originalName, sizeBytes } = body;
     if (!sha256 || !partNumber || !uploadId) return json(400, { error: 'missing fields' });
-    const ext = (originalName as string | undefined)?.toUpperCase().endsWith('.JPG') ? '.JPG' : '.CR3';
+    const ext = rawExtensionForName(originalName as string | undefined);
     const key = `shoots/${shootId}/raw/${String(sha256).toLowerCase()}${ext}`;
     const url = await getSignedUrl(
       s3For(body),
@@ -189,14 +190,18 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
         transferAcceleration: accelerated,
       });
     } catch (err) {
+      const invalid = invalidPartErrorCode(err);
       console.error(
         JSON.stringify({
           msg: 'complete_multipart unhandled',
-          errorName: (err as { name?: string })?.name ?? 'unknown',
+          errorName: invalid ?? (err as { name?: string })?.name ?? 'unknown',
           uploadId,
           partCount: 0,
         }),
       );
+      if (invalid) {
+        return json(409, { error: invalid, uploadId, transferAcceleration: accelerated });
+      }
       return json(500, { error: 'complete_failed', retryable: true, transferAcceleration: accelerated });
     }
   }
@@ -216,7 +221,7 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
 
   if (action === 'create_multipart') {
     const { sha256, originalName } = body;
-    const ext = (originalName as string | undefined)?.toUpperCase().endsWith('.JPG') ? '.JPG' : '.CR3';
+    const ext = rawExtensionForName(originalName as string | undefined);
     const key = `shoots/${shootId}/raw/${String(sha256).toLowerCase()}${ext}`;
     const created = await s3For(body).send(
       new CreateMultipartUploadCommand({

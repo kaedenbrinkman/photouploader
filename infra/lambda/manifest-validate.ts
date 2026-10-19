@@ -1,8 +1,11 @@
+import { rawExtensionForName } from './media-kind';
+
 export interface ManifestFile {
   sha256: string;
   size_bytes: number;
   s3_key?: string;
   original_name?: string;
+  content_type?: string;
   storage_id?: number;
   object_handle?: number;
   capture_time_epoch_ms?: number;
@@ -67,7 +70,7 @@ export function rawKeyForFile(shootId: string, f: ManifestFile): string {
     validateManifestS3Key(shootId, f.s3_key);
     return f.s3_key;
   }
-  const ext = (f.original_name ?? '').toUpperCase().endsWith('.JPG') ? '.JPG' : '.CR3';
+  const ext = rawExtensionForName(f.original_name);
   return `${RAW_PREFIX(shootId)}${String(f.sha256).toLowerCase()}${ext}`;
 }
 

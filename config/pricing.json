@@ -9,6 +9,7 @@
     "bootOverheadMinutes": 4,
     "parallelism": { "c7i.4xlarge": 4, "c7i.2xlarge": 4 },
     "secondsPerImageAtReferenceParallelism": 3.9,
+    "videoUploadSecondsPerGb": 90,
     "preferSpot": true
   },
   "s3": {

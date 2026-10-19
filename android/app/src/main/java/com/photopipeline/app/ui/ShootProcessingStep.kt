@@ -114,19 +114,26 @@ fun ProcessingStepScreen(
             }
         }
 
-        parseProgress(progressJson)?.let { (rendered, total, published) ->
-            val safeTotal = total.coerceAtLeast(1)
+        parseProcessingProgress(progressJson)?.let { progress ->
+            val photoTotal = progress.photoCount.coerceAtLeast(1)
+            val videoTotal = progress.videoCount.coerceAtLeast(1)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("Rendered $rendered of $total", style = MaterialTheme.typography.labelLarge)
+                Text(formatProcessingProgressLine(progress), style = MaterialTheme.typography.labelLarge)
                 LinearProgressIndicator(
-                    progress = { rendered.toFloat() / safeTotal },
+                    progress = { progress.renderedPhotos.toFloat() / photoTotal },
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Text("Published $published of $total", style = MaterialTheme.typography.labelLarge)
-                LinearProgressIndicator(
-                    progress = { published.toFloat() / safeTotal },
-                    modifier = Modifier.fillMaxWidth(),
-                )
+                if (progress.videoCount > 0) {
+                    LinearProgressIndicator(
+                        progress = { progress.publishedVideos.toFloat() / videoTotal },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                } else {
+                    LinearProgressIndicator(
+                        progress = { progress.publishedPhotos.toFloat() / photoTotal },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
             }
         }
 
@@ -140,7 +147,32 @@ fun ProcessingStepScreen(
             )
         }
 
-        Text("Photos", style = MaterialTheme.typography.titleMedium)
+        val photoFiles = files.filter { !com.photopipeline.app.media.MediaKinds.isVideoFileName(it.originalName) }
+        val videoFiles = files.filter { com.photopipeline.app.media.MediaKinds.isVideoFileName(it.originalName) }
+        if (photoFiles.isNotEmpty()) {
+            Text("Photos", style = MaterialTheme.typography.titleMedium)
+            processingFileGrid(photoFiles, serverFileStatusBySha, thumbnailForHandle)
+        }
+        if (videoFiles.isNotEmpty()) {
+            Text("Videos", style = MaterialTheme.typography.titleMedium)
+            processingFileGrid(videoFiles, serverFileStatusBySha, thumbnailForHandle, showVideoBadge = true)
+        }
+
+        if (showRetry && displayError.isNullOrBlank()) {
+            Button(onClick = onRetryProcessing, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+                Text("Retry processing")
+            }
+        }
+    }
+}
+
+@Composable
+private fun processingFileGrid(
+    files: List<FileEntity>,
+    serverFileStatusBySha: Map<String, String>,
+    thumbnailForHandle: (Long) -> ByteArray?,
+    showVideoBadge: Boolean = false,
+) {
         files.chunked(3).forEach { row ->
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 row.forEach { file ->
@@ -173,19 +205,21 @@ fun ProcessingStepScreen(
                                     .align(Alignment.TopEnd)
                                     .padding(4.dp),
                             )
+                            if (showVideoBadge) {
+                                StatusBadge(
+                                    label = "Video",
+                                    tint = MaterialTheme.colorScheme.tertiary,
+                                    modifier = Modifier
+                                        .align(Alignment.TopStart)
+                                        .padding(4.dp),
+                                )
+                            }
                         }
                     }
                 }
                 repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
             }
         }
-
-        if (showRetry && displayError.isNullOrBlank()) {
-            Button(onClick = onRetryProcessing, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
-                Text("Retry processing")
-            }
-        }
-    }
 }
 
 @Composable

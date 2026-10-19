@@ -12,6 +12,12 @@ describe('computeMaxRuntimeMinutes', () => {
     expect(large).toBeGreaterThan(small);
     expect(large).toBeLessThanOrEqual(120);
   });
+
+  it('adds runtime for large video byte volume', () => {
+    const photosOnly = computeMaxRuntimeMinutes(10, 0);
+    const withVideo = computeMaxRuntimeMinutes(10, 20 * 1024 ** 3);
+    expect(withVideo).toBeGreaterThan(photosOnly);
+  });
 });
 
 describe('computeDeadlineAt', () => {

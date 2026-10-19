@@ -14,15 +14,22 @@ from pathlib import Path
 
 import boto3
 
+from gphotos.gphotos_upload import MediaUploadItem
 from worker.config import WorkerConfig
 from worker.dynamo_store import DynamoStore
-from worker.gphotos_client import upload_shoot_jpegs
 from worker.failure_report import format_last_error
+from worker.gphotos_client import upload_shoot_media
 from worker.lightcraft_runner import (
     LightcraftRenderError,
     PreviewOnlyError,
     render_jpeg,
     validate_jpeg,
+)
+from worker.media_kind import (
+    content_type_for_name,
+    is_video_manifest_entry,
+    raw_extension_for_name,
+    split_manifest_files,
 )
 
 log = logging.getLogger("worker")
@@ -53,15 +60,26 @@ def load_manifest(s3, bucket: str, shoot_id: str) -> dict:
     return json.loads(obj["Body"].read())
 
 
-def download_raws(s3, bucket: str, shoot_id: str, manifest: dict, raw_dir: Path) -> list[Path]:
+def raw_s3_key(shoot_id: str, entry: dict) -> str:
+    if entry.get("s3_key"):
+        return str(entry["s3_key"])
+    sha = str(entry["sha256"]).lower()
+    ext = raw_extension_for_name(entry.get("original_name"))
+    return f"shoots/{shoot_id}/raw/{sha}{ext}"
+
+
+def download_photo_raws(
+    s3,
+    bucket: str,
+    shoot_id: str,
+    photo_entries: list[dict],
+    raw_dir: Path,
+) -> list[Path]:
     paths: list[Path] = []
-    for f in manifest["files"]:
+    for f in photo_entries:
         sha = f["sha256"].lower()
-        ext = ".CR3"
-        name = (f.get("original_name") or "").upper()
-        if name.endswith(".JPG"):
-            ext = ".JPG"
-        key = f.get("s3_key") or f"shoots/{shoot_id}/raw/{sha}{ext}"
+        ext = raw_extension_for_name(f.get("original_name"))
+        key = raw_s3_key(shoot_id, f)
         dest = raw_dir / f"{sha}{ext}"
         if not dest.exists():
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -78,7 +96,6 @@ def shutdown_instance():
 
 
 def manage_shutdown_backstop(*, cancel: bool, arm_idle_minutes: int | None = None) -> None:
-    """Cancel bootstrap backstop; optionally arm idle shutdown (matches user-data lifetime)."""
     try:
         if cancel:
             subprocess.run(["sudo", "shutdown", "-c"], check=False, timeout=5)
@@ -92,10 +109,10 @@ def manage_shutdown_backstop(*, cancel: bool, arm_idle_minutes: int | None = Non
         log.exception("shutdown backstop update failed")
 
 
-def _count_rendered_files(store: DynamoStore, shoot_id: str, raws: list[Path]) -> int:
+def _count_rendered_photos(store: DynamoStore, shoot_id: str, photo_shas: set[str]) -> int:
     n = 0
-    for raw in raws:
-        st = (store.get_image(shoot_id, raw.stem.lower()) or {}).get("state")
+    for sha in photo_shas:
+        st = (store.get_image(shoot_id, sha) or {}).get("state")
         if st in ("RENDERED", "GP_CREATED"):
             n += 1
     return n
@@ -136,21 +153,44 @@ def run() -> int:
 
     try:
         manifest = load_manifest(s3, cfg.bucket, cfg.shoot_id)
-        total = len(manifest.get("files", []))
-        store.update_shoot(cfg.shoot_id, totalFiles=total, phase="DOWNLOADING")
-        raws = download_raws(s3, cfg.bucket, cfg.shoot_id, manifest, raw_dir)
+        all_files = manifest.get("files", [])
+        photo_entries, video_entries, _video_bytes = split_manifest_files(all_files)
+        photo_shas = {f["sha256"].lower() for f in photo_entries}
+        video_shas = {f["sha256"].lower() for f in video_entries}
+        total = len(all_files)
+        photo_count = len(photo_entries)
+        video_count = len(video_entries)
+        store.update_shoot(
+            cfg.shoot_id,
+            totalFiles=total,
+            photoCount=photo_count,
+            videoCount=video_count,
+            phase="DOWNLOADING",
+        )
+        for entry in all_files:
+            sha = entry["sha256"].lower()
+            media_type = "video" if is_video_manifest_entry(entry) else "photo"
+            store.update_image(
+                cfg.shoot_id,
+                sha,
+                mediaType=media_type,
+                originalName=entry.get("original_name"),
+            )
+
+        raws = download_photo_raws(s3, cfg.bucket, cfg.shoot_id, photo_entries, raw_dir)
         render_started_at = int(time.time() * 1000)
         store.update_shoot(cfg.shoot_id, phase="RENDERING", renderStartedAt=render_started_at)
         rendered: list[Path] = []
         already_published = sum(
             1
-            for raw in raws
-            if (store.get_image(cfg.shoot_id, raw.stem.lower()) or {}).get("state") == "GP_CREATED"
+            for sha in photo_shas | video_shas
+            if (store.get_image(cfg.shoot_id, sha) or {}).get("state")
+            in ("GP_CREATED", "PUBLISHED")
         )
         first_error: str | None = None
         fail_count = 0
 
-        def process_one(raw: Path) -> tuple[str, Path | None, str | None]:
+        def process_one_photo(raw: Path) -> tuple[str, Path | None, str | None]:
             sha = raw.stem.lower()
             existing = store.get_image(cfg.shoot_id, sha)
             if existing and existing.get("state") == "GP_CREATED":
@@ -172,6 +212,7 @@ def run() -> int:
                     sha,
                     state="RENDERED",
                     settingsHash=cfg.settings_hash,
+                    mediaType="photo",
                 )
                 s3.upload_file(
                     str(out),
@@ -186,38 +227,42 @@ def run() -> int:
                 _file_error(store, cfg.shoot_id, sha, str(e), "FAILED_RENDER")
                 return sha, None, str(e)
 
-        with ThreadPoolExecutor(max_workers=cfg.max_parallel_renders) as pool:
-            futures = [pool.submit(process_one, r) for r in raws]
-            for fut in as_completed(futures):
-                sha, out, err = fut.result()
-                if err:
-                    fail_count += 1
-                    if first_error is None:
-                        first_error = err
-                if out:
-                    rendered.append(out)
-                rendered_count = _count_rendered_files(store, cfg.shoot_id, raws)
-                store.update_shoot(
-                    cfg.shoot_id,
-                    renderedCount=min(rendered_count, total),
-                    phase="RENDERING",
-                )
-                log.info("processed %s err=%s (%s/%s)", sha, err, rendered_count, total)
+        if raws:
+            with ThreadPoolExecutor(max_workers=cfg.max_parallel_renders) as pool:
+                futures = [pool.submit(process_one_photo, r) for r in raws]
+                for fut in as_completed(futures):
+                    sha, out, err = fut.result()
+                    if err:
+                        fail_count += 1
+                        if first_error is None:
+                            first_error = err
+                    if out:
+                        rendered.append(out)
+                    rendered_count = _count_rendered_photos(store, cfg.shoot_id, photo_shas)
+                    store.update_shoot(
+                        cfg.shoot_id,
+                        renderedCount=rendered_count,
+                        renderedPhotoCount=rendered_count,
+                        phase="RENDERING",
+                    )
+                    log.info("processed photo %s err=%s (%s/%s)", sha, err, rendered_count, photo_count)
 
-        rendered_count = _count_rendered_files(store, cfg.shoot_id, raws)
-        if rendered_count == 0:
-            summary = f"{first_error or 'render failed'}; {fail_count}/{total} failed"
+        rendered_photo_count = _count_rendered_photos(store, cfg.shoot_id, photo_shas)
+        if photo_count > 0 and rendered_photo_count == 0:
+            summary = f"{first_error or 'render failed'}; {fail_count}/{photo_count} photo(s) failed"
             store.update_shoot(
                 cfg.shoot_id,
                 state="FAILED",
                 phase="RENDER_FAILED",
                 renderedCount=0,
+                renderedPhotoCount=0,
                 publishedCount=0,
                 lastError=summary,
                 workerFinishedAt=int(time.time() * 1000),
             )
-            log.error("no renders succeeded: %s", summary)
-            return 1
+            log.error("no photo renders succeeded: %s", summary)
+            if video_count == 0:
+                return 1
 
         store.update_shoot(cfg.shoot_id, state="PUBLISHING", phase="PUBLISHING_GP")
         ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {"album_id": None, "items": {}}
@@ -231,22 +276,54 @@ def run() -> int:
             tmp.write_text(json.dumps(ledger, indent=1))
             tmp.replace(ledger_path)
 
-        result = upload_shoot_jpegs(
+        media_items: list[MediaUploadItem] = []
+        for entry in video_entries:
+            sha = entry["sha256"].lower()
+            existing = store.get_image(cfg.shoot_id, sha)
+            if existing and existing.get("state") == "PUBLISHED":
+                continue
+            key = raw_s3_key(cfg.shoot_id, entry)
+            name = entry.get("original_name") or f"{sha}.mp4"
+            media_items.append(
+                MediaUploadItem(
+                    ledger_key=sha,
+                    filename=os.path.basename(name),
+                    content_type=content_type_for_name(name),
+                    size_bytes=int(entry.get("size_bytes") or 0),
+                    s3_bucket=cfg.bucket,
+                    s3_key=key,
+                )
+            )
+
+        result = upload_shoot_media(
             cfg.gphotos_token_param,
             cfg.region,
             cfg.album_title,
+            media_items,
             rendered,
             ledger,
             save_ledger,
+            s3_client=s3,
         )
         newly_published = 0
         for sha, item in ledger.get("items", {}).items():
-            if item.get("state") == "CREATED":
-                newly_published += 1
+            if item.get("state") != "CREATED":
+                continue
+            newly_published += 1
+            if sha in video_shas:
+                store.update_image(
+                    cfg.shoot_id,
+                    sha,
+                    state="PUBLISHED",
+                    mediaType="video",
+                    mediaItemId=item.get("media_item_id"),
+                )
+            else:
                 store.update_image(
                     cfg.shoot_id,
                     sha,
                     state="GP_CREATED",
+                    mediaType="photo",
                     mediaItemId=item.get("media_item_id"),
                 )
         published_count = already_published + newly_published
@@ -275,7 +352,8 @@ def run() -> int:
             "phase": final_state,
             "albumId": result.get("album_id"),
             "resultsS3Key": results_key,
-            "renderedCount": min(rendered_count, total),
+            "renderedCount": min(rendered_photo_count, photo_count),
+            "renderedPhotoCount": min(rendered_photo_count, photo_count),
             "publishedCount": published_count,
             "workerFinishedAt": t1,
         }
@@ -283,7 +361,7 @@ def run() -> int:
             album_updates["albumProductUrl"] = result.get("album_product_url")
         if final_state == "PARTIAL":
             album_updates["lastError"] = (
-                f"Published {published_count}/{total}; {fail_count} render failure(s)"
+                f"Published {published_count}/{total}; {fail_count} photo render failure(s)"
                 if fail_count
                 else f"Published {published_count}/{total}"
             )

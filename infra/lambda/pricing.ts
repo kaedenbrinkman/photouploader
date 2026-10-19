@@ -19,18 +19,24 @@ export function getPricingTable() {
 }
 
 export function estimateShoot(
-  imageCount: number,
+  photoCount: number,
   totalBytesRaw: number,
-  opts?: { transferAcceleration?: boolean },
+  opts?: { videoCount?: number; transferAcceleration?: boolean },
 ): CostEstimate {
-  if (imageCount <= 0) throw new Error('imageCount must be positive');
+  const videos = Math.max(0, Math.floor(Number(opts?.videoCount ?? 0)));
+  const photos = Math.max(0, Math.floor(Number(photoCount) || 0));
+  if (photos <= 0 && videos <= 0) throw new Error('photoCount or videoCount must be positive');
+  const imageCount = photos + videos;
   const p = pricingTable as any;
   const ec2 = p.ec2;
   let instanceType = ec2.instanceTypeOrder[0];
   let spot = Boolean(ec2.preferSpot);
   if (imageCount < 50) instanceType = ec2.instanceTypeOrder[1] ?? instanceType;
   const par = ec2.parallelism[instanceType];
-  const processingSeconds = ec2.bootOverheadMinutes * 60 + (imageCount * ec2.secondsPerImageAtReferenceParallelism) / par;
+  const processingSeconds =
+    photos > 0
+      ? ec2.bootOverheadMinutes * 60 + (photos * ec2.secondsPerImageAtReferenceParallelism) / par
+      : ec2.bootOverheadMinutes * 60 * 0.25;
   const rateKey = spot ? 'spotUsdPerHour' : 'onDemandUsdPerHour';
   const hourly = ec2[rateKey][instanceType];
   const computeUsd = hourly * (processingSeconds / 3600);
@@ -75,18 +81,25 @@ const MAX_RUNTIME_MIN_CEILING = 120;
 const MAX_RUNTIME_BASE_MINUTES = 10;
 const MAX_RUNTIME_SAFETY_FACTOR = 2;
 
-/** Per-shoot EC2 wall clock from config/pricing.json render estimate (2× margin, clamped 15–120). */
-export function computeMaxRuntimeMinutes(fileCount: number): number {
-  const count = Math.max(1, Math.floor(Number(fileCount) || 0));
+/** Per-shoot EC2 wall clock: photo render estimate + video upload bytes (2× margin, clamped 15–120). */
+export function computeMaxRuntimeMinutes(photoCount: number, videoBytes = 0): number {
+  const photos = Math.max(0, Math.floor(Number(photoCount) || 0));
+  const bytes = Math.max(0, Math.floor(Number(videoBytes) || 0));
   const p = pricingTable as any;
   const ec2 = p.ec2;
+  const totalFiles = Math.max(1, photos + (bytes > 0 ? 1 : 0));
   const instanceType =
-    count < 50 ? (ec2.instanceTypeOrder[1] ?? ec2.instanceTypeOrder[0]) : ec2.instanceTypeOrder[0];
+    totalFiles < 50 ? (ec2.instanceTypeOrder[1] ?? ec2.instanceTypeOrder[0]) : ec2.instanceTypeOrder[0];
   const par = ec2.parallelism[instanceType] ?? 4;
   const secondsPerFile = ec2.secondsPerImageAtReferenceParallelism / par;
-  const perFileMinutes = secondsPerFile / 60;
-  const estimate =
-    MAX_RUNTIME_BASE_MINUTES + Math.ceil(count * perFileMinutes * MAX_RUNTIME_SAFETY_FACTOR);
+  const photoMinutes =
+    photos > 0 ? Math.ceil(photos * (secondsPerFile / 60) * MAX_RUNTIME_SAFETY_FACTOR) : 0;
+  const secondsPerGb = Number(ec2.videoUploadSecondsPerGb ?? 90);
+  const videoMinutes =
+    bytes > 0
+      ? Math.ceil((bytes / 1024 ** 3) * (secondsPerGb / 60) * MAX_RUNTIME_SAFETY_FACTOR)
+      : 0;
+  const estimate = MAX_RUNTIME_BASE_MINUTES + photoMinutes + videoMinutes;
   return Math.min(MAX_RUNTIME_MIN_CEILING, Math.max(MAX_RUNTIME_MIN_FLOOR, estimate));
 }
 

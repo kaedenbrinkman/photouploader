@@ -14,11 +14,13 @@ class LocalPricingEstimator private constructor(private val table: PricingTable)
     constructor(pricingJsonString: String) : this(parse(pricingJsonString))
 
     fun estimateShoot(
-        imageCount: Int,
+        photoCount: Int,
+        videoCount: Int,
         totalBytesRaw: Long,
         transferAcceleration: Boolean = false,
     ): EstimateResponse {
-        require(imageCount > 0) { "imageCount must be positive" }
+        require(photoCount > 0 || videoCount > 0) { "photoCount or videoCount must be positive" }
+        val imageCount = photoCount + videoCount
         val ec2 = table.ec2
         val s3 = table.s3
         var instanceType = ec2.instanceTypeOrder.first()
@@ -27,9 +29,12 @@ class LocalPricingEstimator private constructor(private val table: PricingTable)
             instanceType = ec2.instanceTypeOrder[1]
         }
         val par = ec2.parallelism[instanceType] ?: 4
-        val processingSeconds =
+        val processingSeconds = if (photoCount > 0) {
             ec2.bootOverheadMinutes * 60.0 +
-                (imageCount * ec2.secondsPerImageAtReferenceParallelism) / par
+                (photoCount * ec2.secondsPerImageAtReferenceParallelism) / par
+        } else {
+            ec2.bootOverheadMinutes * 60.0 * 0.25
+        }
         val hourly = (if (spot) ec2.spotUsdPerHour else ec2.onDemandUsdPerHour)[instanceType]
             ?: error("missing hourly rate for $instanceType")
         val computeUsd = hourly * (processingSeconds / 3600.0)
