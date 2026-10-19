@@ -8,6 +8,7 @@ describe('presign-complete errors', () => {
   it('detects invalid part codes', () => {
     expect(invalidPartErrorCode({ name: 'InvalidPart' })).toBe('InvalidPart');
     expect(invalidPartErrorCode({ Code: 'InvalidPartOrder' })).toBe('InvalidPartOrder');
+    expect(invalidPartErrorCode({ Code: 'EntityTooSmall' })).toBe('EntityTooSmall');
   });
 
   it('detects NoSuchUpload', () => {

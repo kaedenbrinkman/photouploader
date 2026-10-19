@@ -20,6 +20,7 @@ import com.photopipeline.app.mtp.MtpObjectInfo
 import com.photopipeline.app.mtp.UsbAccessState
 import com.photopipeline.app.mtp.UsbCameraManager
 import com.photopipeline.app.mtp.UsbDebugLog
+import com.photopipeline.app.upload.MultipartPlanner
 import com.photopipeline.app.upload.UploadPart
 import com.photopipeline.app.upload.UploadParts
 import com.photopipeline.app.upload.UploadPreferences
@@ -847,9 +848,49 @@ class Repository(
         )
     }
 
+    suspend fun resetMultipartUploadState(identityKey: String, shootId: String): FileEntity {
+        val f = db.fileDao().getFile(identityKey) ?: error("missing file $identityKey")
+        if (!f.s3UploadId.isNullOrBlank() && !f.s3Key.isNullOrBlank()) {
+            val accel = uploadPreferences.transferAcceleration
+            runCatching { api.abortMultipart(shootId, f.s3UploadId!!, f.s3Key!!, accel) }
+                .onFailure { e ->
+                    PipelineLog.w("upload", "abort multipart ${f.originalName}: ${e.message}", e)
+                }
+        }
+        val cleared = f.copy(
+            s3UploadId = null,
+            s3Key = null,
+            uploadPartsJson = UploadParts.toJson(emptyList()),
+            uploadedBytes = 0L,
+            uploadSpeedBps = 0L,
+            lastError = null,
+        )
+        db.fileDao().upsert(cleared)
+        return cleared
+    }
+
+    /** Abort stale S3 multipart state when an older planner produced sub-5 MiB non-terminal parts. */
+    suspend fun ensureValidMultipartPlan(shootId: String, file: FileEntity): FileEntity {
+        if (file.s3UploadId.isNullOrBlank()) return file
+        val partSize = uploadPreferences.partSizeBytes
+        if (MultipartPlanner.legacyPlanWasInvalid(file.sizeBytes, partSize)) {
+            PipelineLog.w(
+                "upload",
+                "Reset invalid multipart plan for ${file.originalName} (${file.sizeBytes} bytes)",
+            )
+            return resetMultipartUploadState(file.identityKey, shootId)
+        }
+        return file
+    }
+
     suspend fun retryFile(identityKey: String) {
         val f = db.fileDao().getFile(identityKey) ?: return
-        db.fileDao().upsert(f.copy(uploadState = "PENDING", lastError = null))
+        val partSize = uploadPreferences.partSizeBytes
+        if (!f.s3UploadId.isNullOrBlank() && MultipartPlanner.legacyPlanWasInvalid(f.sizeBytes, partSize)) {
+            resetMultipartUploadState(identityKey, f.shootId)
+        }
+        val latest = db.fileDao().getFile(identityKey) ?: return
+        db.fileDao().upsert(latest.copy(uploadState = "PENDING", lastError = null))
     }
 
     private fun sha256File(file: File): String {

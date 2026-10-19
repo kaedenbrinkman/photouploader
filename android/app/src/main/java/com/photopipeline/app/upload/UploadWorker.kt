@@ -124,10 +124,29 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 }
             }
             return try {
-                if (!file.localPath.isNullOrBlank() && File(file.localPath).exists()) {
-                    uploadLocalFile(shootId, file)
-                } else {
-                    uploadStreaming(shootId, file)
+                var entity = repo.ensureValidMultipartPlan(shootId, file)
+                var remultipartRecovery = false
+                while (true) {
+                    try {
+                        if (!entity.localPath.isNullOrBlank() && File(entity.localPath).exists()) {
+                            uploadLocalFile(shootId, entity)
+                        } else {
+                            uploadStreaming(shootId, entity)
+                        }
+                        break
+                    } catch (e: ApiRequestException) {
+                        if (!remultipartRecovery && MultipartUploadRecovery.isRecoverableCompleteError(e)) {
+                            remultipartRecovery = true
+                            PipelineLog.w(
+                                "upload",
+                                "Re-upload after multipart complete error ${e.ec2ErrorCode} " +
+                                    "for ${entity.originalName}",
+                            )
+                            entity = repo.resetMultipartUploadState(entity.identityKey, shootId)
+                            continue
+                        }
+                        throw e
+                    }
                 }
                 repo.markFileUploaded(file.identityKey)
                 if (file.isCameraStreamUpload()) {
@@ -250,8 +269,9 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
 
     private suspend fun uploadStreaming(shootId: String, file: FileEntity) {
         repo.markFileUploading(file.identityKey)
+        val prepared = repo.ensureValidMultipartPlan(shootId, file)
         var lastUploaded = 0L
-        val result = streamUploader.uploadFile(shootId, file) { uploaded, snap, partsDone, partsTotal, parts, uploadId, s3Key ->
+        val result = streamUploader.uploadFile(shootId, prepared) { uploaded, snap, partsDone, partsTotal, parts, uploadId, s3Key ->
             val delta = (uploaded - lastUploaded).toInt()
             if (delta > 0) sessionSpeed.recordBytes(delta)
             lastUploaded = uploaded
@@ -262,7 +282,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                     averageBps = sessionSnap.averageBps,
                     peakBps = maxOf(it.peakBps, snap.peakBps, sessionSnap.peakBps),
                     bytesSent = uploaded,
-                    totalBytes = file.sizeBytes,
+                    totalBytes = prepared.sizeBytes,
                     partsDone = partsDone,
                     partsTotal = partsTotal,
                     etaSeconds = sessionSnap.etaSeconds,
@@ -273,7 +293,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             }
             UploadMetricsStore.pushSpeedSample(snap.currentBps)
             repo.updateUploadProgress(
-                file.identityKey,
+                prepared.identityKey,
                 uploaded,
                 snap.currentBps,
                 uploadId,
@@ -281,33 +301,34 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 parts,
             )
         }
-        repo.updateFileContentSha256(file.identityKey, result.contentSha256, result.parts)
+        repo.updateFileContentSha256(prepared.identityKey, result.contentSha256, result.parts)
     }
 
     private suspend fun uploadLocalFile(shootId: String, file: FileEntity) {
-        val local = File(file.localPath!!)
-        var parts = UploadParts.parse(file.uploadPartsJson)
-        var uploadId = file.s3UploadId
-        var key = file.s3Key
-        val uploadRef = file.sha256.ifBlank {
+        val prepared = repo.ensureValidMultipartPlan(shootId, file)
+        val local = File(prepared.localPath!!)
+        var parts = UploadParts.parse(prepared.uploadPartsJson)
+        var uploadId = prepared.s3UploadId
+        var key = prepared.s3Key
+        val uploadRef = prepared.sha256.ifBlank {
             com.photopipeline.app.core.metadataUploadSha256(
-                file.storageId,
-                file.objectHandle,
-                file.sizeBytes,
-                file.captureTimeEpochMs,
+                prepared.storageId,
+                prepared.objectHandle,
+                prepared.sizeBytes,
+                prepared.captureTimeEpochMs,
             )
         }
         val accel = prefs.transferAcceleration
         if (uploadId.isNullOrBlank() || key.isNullOrBlank()) {
-            val created = repo.api.createMultipart(shootId, uploadRef, file.originalName, accel)
+            val created = repo.api.createMultipart(shootId, uploadRef, prepared.originalName, accel)
             uploadId = created.first
             key = created.second
         }
-        PipelineLog.i("upload", "file start (local) name=${file.originalName} key=$key size=${file.sizeBytes}")
+        PipelineLog.i("upload", "file start (local) name=${prepared.originalName} key=$key size=${prepared.sizeBytes}")
         val fileSpeed = TransferSpeedTracker()
-        fileSpeed.reset(file.sizeBytes)
+        fileSpeed.reset(prepared.sizeBytes)
         val partSize = prefs.partSizeBytes
-        val plans = MultipartPlanner.planParts(file.sizeBytes, partSize)
+        val plans = MultipartPlanner.planParts(prepared.sizeBytes, partSize)
         val client = StreamingCameraUploader.defaultHttp()
         RandomAccessFile(local, "r").use { raf ->
             for (plan in plans) {
@@ -321,8 +342,8 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                     uploadRef,
                     plan.partNumber,
                     uploadId!!,
-                    file.originalName,
-                    file.sizeBytes,
+                    prepared.originalName,
+                    prepared.sizeBytes,
                     accel,
                 )
                 UploadMetricsStore.update {
@@ -352,8 +373,8 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         "totalMs=${System.currentTimeMillis() - partStartMs}",
                 )
                 repo.updateUploadProgress(
-                    file.identityKey,
-                    min(file.sizeBytes, plan.offset + plan.length),
+                    prepared.identityKey,
+                    min(prepared.sizeBytes, plan.offset + plan.length),
                     snap.currentBps,
                     uploadId,
                     key!!,
@@ -364,8 +385,8 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         currentBps = snap.currentBps,
                         averageBps = sessionSnap.averageBps,
                         peakBps = maxOf(it.peakBps, snap.peakBps, sessionSnap.peakBps),
-                        bytesSent = min(file.sizeBytes, plan.offset + plan.length),
-                        totalBytes = file.sizeBytes,
+                        bytesSent = min(prepared.sizeBytes, plan.offset + plan.length),
+                        totalBytes = prepared.sizeBytes,
                         partsDone = parts.size,
                         partsTotal = plans.size,
                         etaSeconds = sessionSnap.etaSeconds,
@@ -386,11 +407,11 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             uploadId!!,
             parts,
             accel,
-            file.sizeBytes,
+            prepared.sizeBytes,
         )
         PipelineLog.i(
             "upload",
-            "file complete (local) name=${file.originalName} key=$key ms=${System.currentTimeMillis() - completeStart}",
+            "file complete (local) name=${prepared.originalName} key=$key ms=${System.currentTimeMillis() - completeStart}",
         )
     }
 

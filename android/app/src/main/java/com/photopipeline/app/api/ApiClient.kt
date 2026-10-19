@@ -297,10 +297,15 @@ class ApiClient(
     }
 
     private fun failHttp(route: String, resp: Response): Nothing {
-        val snippet = resp.body?.string()?.take(240)?.replace('\n', ' ') ?: ""
+        val body = resp.body?.string().orEmpty()
+        val snippet = body.take(240).replace('\n', ' ')
+        var errorCode: String? = null
+        runCatching {
+            errorCode = JSONObject(body).optString("error").takeIf { it.isNotBlank() }
+        }
         val msg = "$route HTTP ${resp.code}${if (snippet.isNotBlank()) ": $snippet" else ""}"
         PipelineLog.w("api", msg)
-        throw ApiRequestException(msg, resp.code)
+        throw ApiRequestException(msg, resp.code, errorCode)
     }
 
     companion object {

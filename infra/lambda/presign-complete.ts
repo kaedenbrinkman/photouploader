@@ -12,9 +12,9 @@ export type CompleteMultipartResult =
 
 export function invalidPartErrorCode(err: unknown): string | null {
   const code = errorCode(err);
-  if (code === 'InvalidPart' || code === 'InvalidPartOrder') return code;
+  if (code === 'InvalidPart' || code === 'InvalidPartOrder' || code === 'EntityTooSmall') return code;
   const name = errorName(err);
-  if (name === 'InvalidPart' || name === 'InvalidPartOrder') return name;
+  if (name === 'InvalidPart' || name === 'InvalidPartOrder' || name === 'EntityTooSmall') return name;
   return null;
 }
 
