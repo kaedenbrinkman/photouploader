@@ -13,7 +13,12 @@ import com.photopipeline.app.core.PipelineLog
 import com.photopipeline.app.data.FileEntity
 import com.photopipeline.app.data.PrepareCameraResult
 import com.photopipeline.app.mtp.UsbAccessState
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
@@ -115,14 +120,25 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             }
         }
 
-        for (file in files) {
-            try {
-                uploadOne(file)
-            } catch (e: StreamingCameraUploader.PresignExpiredException) {
-                val reason = e.message ?: "presign expired"
-                repo.incrementRetry(file.identityKey, reason)
-                return retryWorker(reason, usesCameraStream, retryable = true)
-            }
+        var presignExpired: StreamingCameraUploader.PresignExpiredException? = null
+        coroutineScope {
+            val fileSemaphore = Semaphore(MAX_CONCURRENT_FILE_UPLOADS)
+            files.map { file ->
+                async {
+                    fileSemaphore.withPermit {
+                        try {
+                            uploadOne(file)
+                        } catch (e: StreamingCameraUploader.PresignExpiredException) {
+                            presignExpired = e
+                        }
+                    }
+                }
+            }.awaitAll()
+        }
+        presignExpired?.let { e ->
+            val reason = e.message ?: "presign expired"
+            repo.incrementRetry(files.first().identityKey, reason)
+            return retryWorker(reason, usesCameraStream, retryable = true)
         }
 
         if (failedKeys.isNotEmpty()) {
@@ -383,6 +399,8 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         uploadSource == "CAMERA_STREAM" || localPath.isNullOrBlank()
 
     companion object {
+        /** Limits parallel files hitting presign Lambda (account concurrency ~10). */
+        const val MAX_CONCURRENT_FILE_UPLOADS = 2
         private val OCTET = "application/octet-stream".toMediaType()
         const val KEY_USES_CAMERA_STREAM = "usesCameraStream"
         const val KEY_ERROR = "error"

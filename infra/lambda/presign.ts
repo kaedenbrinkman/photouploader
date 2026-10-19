@@ -2,7 +2,6 @@ import { ConditionalCheckFailedException, DynamoDBClient } from '@aws-sdk/client
 import { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import {
   AbortMultipartUploadCommand,
-  CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
   HeadObjectCommand,
   ListPartsCommand,
@@ -14,6 +13,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { APIGatewayProxyHandlerV2 } from 'aws-lambda';
 import { randomUUID } from 'crypto';
 import { json, userIdFromEvent } from './http';
+import { completeShootMultipart } from './presign-complete';
 
 const s3Standard = new S3Client({});
 const s3Accelerated = new S3Client({ useAccelerateEndpoint: true });
@@ -157,26 +157,48 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
   }
 
   if (action === 'complete_multipart') {
-    const { key, uploadId, parts } = body;
-    if (!key || !uploadId || !parts) return json(400, { error: 'missing fields' });
-    await s3For(body).send(
-      new CompleteMultipartUploadCommand({
-        Bucket: process.env.BUCKET_NAME!,
-        Key: key,
-        UploadId: uploadId,
-        MultipartUpload: { Parts: parts },
-      }),
-    );
-    await ddb.send(
-      new UpdateCommand({
-        TableName: process.env.TABLE_NAME,
-        Key: { pk: `SHOOT#${shootId}`, sk: `FILE#${String(body.sha256).toLowerCase()}` },
-        UpdateExpression: 'SET #s = :u, updatedAt = :t',
-        ExpressionAttributeNames: { '#s': 'state' },
-        ExpressionAttributeValues: { ':u': 'UPLOADED', ':t': Date.now() },
-      }),
-    );
-    return json(200, { key, completed: true, transferAcceleration: accelerated });
+    const { key, uploadId } = body;
+    if (!key || !uploadId) return json(400, { error: 'missing fields' });
+    const bucket = process.env.BUCKET_NAME!;
+    const s3 = s3For(body);
+    try {
+      const result = await completeShootMultipart({
+        s3,
+        bucket,
+        key,
+        uploadId,
+        log: (msg, extra) => console.error(JSON.stringify({ msg, ...extra })),
+      });
+      if (!result.ok) {
+        return json(result.status, { ...result.body, transferAcceleration: accelerated });
+      }
+      await ddb.send(
+        new UpdateCommand({
+          TableName: process.env.TABLE_NAME,
+          Key: { pk: `SHOOT#${shootId}`, sk: `FILE#${String(body.sha256).toLowerCase()}` },
+          UpdateExpression: 'SET #s = :u, updatedAt = :t',
+          ExpressionAttributeNames: { '#s': 'state' },
+          ExpressionAttributeValues: { ':u': 'UPLOADED', ':t': Date.now() },
+        }),
+      );
+      return json(200, {
+        key,
+        completed: true,
+        idempotent: result.idempotent ?? false,
+        partCount: result.partCount,
+        transferAcceleration: accelerated,
+      });
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          msg: 'complete_multipart unhandled',
+          errorName: (err as { name?: string })?.name ?? 'unknown',
+          uploadId,
+          partCount: 0,
+        }),
+      );
+      return json(500, { error: 'complete_failed', retryable: true, transferAcceleration: accelerated });
+    }
   }
 
   if (action === 'abort_multipart') {

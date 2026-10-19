@@ -21,10 +21,14 @@ object MultipartComplete {
                 api.completeMultipart(shootId, sha256, key, uploadId, parts, transferAcceleration)
                 return
             } catch (e: ApiRequestException) {
-                val retryable = e.httpCode == 500 || e.httpCode == 502 || e.httpCode == 503 || e.httpCode == 504
+                val retryable = e.httpCode == 429 ||
+                    e.httpCode == 500 ||
+                    e.httpCode == 502 ||
+                    e.httpCode == 503 ||
+                    e.httpCode == 504
                 if (!retryable) throw e
                 attempt++
-                if (attempt > 5) throw e
+                if (attempt > 8) throw e
                 delay(RetryPolicy.backoffMs(attempt))
                 val head = runCatching {
                     api.headObject(shootId, key, transferAcceleration)
