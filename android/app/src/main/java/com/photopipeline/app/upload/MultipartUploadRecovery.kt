@@ -13,4 +13,7 @@ object MultipartUploadRecovery {
         val code = e.ec2ErrorCode ?: return false
         return code in recoverableCompleteErrors
     }
+
+    fun isStaleMultipartError(e: ApiRequestException): Boolean =
+        StaleMultipartRecovery.isStaleMultipartError(e)
 }

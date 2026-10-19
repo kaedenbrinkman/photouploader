@@ -22,6 +22,7 @@ import com.photopipeline.app.mtp.UsbCameraManager
 import com.photopipeline.app.mtp.UsbDebugLog
 import com.photopipeline.app.media.MediaKinds
 import com.photopipeline.app.upload.MultipartPlanner
+import com.photopipeline.app.upload.StaleMultipartRecovery
 import com.photopipeline.app.upload.UploadServerReconcile
 import com.photopipeline.app.upload.UploadPart
 import com.photopipeline.app.upload.UploadParts
@@ -747,6 +748,53 @@ class Repository(
      * When local Room state lags S3/DynamoDB (e.g. 373/374 shown while server has all UPLOADED),
      * align local file rows and return how many were fixed.
      */
+    suspend fun tryMarkIfAlreadyOnServer(shootId: String, file: FileEntity): Boolean {
+        if (file.uploadState == "UPLOADED") return true
+        val accel = uploadPreferences.transferAcceleration
+        val serverFiles = if (canUseBackendApi()) {
+            runCatching { api.fetchStatus(shootId).files }.getOrNull()
+        } else {
+            null
+        }
+        if (!serverFiles.isNullOrEmpty()) {
+            cacheServerFileStatuses(shootId, serverFiles)
+            if (StaleMultipartRecovery.shouldMarkFromServer(file, serverFiles)) {
+                markFileUploadedLocally(file.identityKey)
+                PipelineLog.i("upload", "Marked ${file.originalName} UPLOADED from server status")
+                return true
+            }
+        }
+        val key = StaleMultipartRecovery.s3KeyForFile(shootId, file)
+        val head = runCatching { api.headObject(shootId, key, accel) }.getOrNull()
+        if (head?.exists == true && head.contentLength == file.sizeBytes) {
+            markFileUploadedLocally(file.identityKey)
+            PipelineLog.i("upload", "Marked ${file.originalName} UPLOADED from S3 HEAD")
+            return true
+        }
+        return false
+    }
+
+    suspend fun resolveStaleMultipartUpload(shootId: String, file: FileEntity): Pair<StaleMultipartRecovery.Outcome, FileEntity> {
+        if (tryMarkIfAlreadyOnServer(shootId, file)) {
+            val latest = db.fileDao().getFile(file.identityKey) ?: file
+            return StaleMultipartRecovery.Outcome.AlreadyOnServer to latest
+        }
+        val cleared = resetMultipartUploadState(file.identityKey, shootId)
+        PipelineLog.w("upload", "Reset stale multipart for ${file.originalName}")
+        return StaleMultipartRecovery.Outcome.FreshMultipart to cleared
+    }
+
+    private suspend fun markFileUploadedLocally(identityKey: String) {
+        patchFile(identityKey) {
+            it.copy(
+                uploadState = "UPLOADED",
+                uploadedBytes = it.sizeBytes,
+                lastError = null,
+                uploadSpeedBps = 0L,
+            )
+        }
+    }
+
     suspend fun reconcileLocalUploadsWithServer(shootId: String): Int {
         if (!canUseBackendApi()) return 0
         val status = api.fetchStatus(shootId)
@@ -775,14 +823,7 @@ class Repository(
             if (!markAll && !UploadServerReconcile.shouldMarkLocalUploaded(file, uploadedShas, remote)) {
                 continue
             }
-            patchFile(file.identityKey) {
-                it.copy(
-                    uploadState = "UPLOADED",
-                    uploadedBytes = it.sizeBytes,
-                    lastError = null,
-                    uploadSpeedBps = 0L,
-                )
-            }
+            markFileUploadedLocally(file.identityKey)
             updated++
         }
         if (updated > 0) {

@@ -14,7 +14,7 @@ import type { APIGatewayProxyHandlerV2 } from 'aws-lambda';
 import { randomUUID } from 'crypto';
 import { json, userIdFromEvent } from './http';
 import { rawExtensionForName } from './media-kind';
-import { completeShootMultipart, invalidPartErrorCode } from './presign-complete';
+import { completeShootMultipart, invalidPartErrorCode, isNoSuchUpload } from './presign-complete';
 
 const s3Standard = new S3Client({});
 const s3Accelerated = new S3Client({ useAccelerateEndpoint: true });
@@ -108,14 +108,21 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
   if (action === 'list_parts') {
     const { uploadId, key } = body;
     if (!uploadId || !key) return json(400, { error: 'missing fields' });
-    const listed = await s3For(body).send(
-      new ListPartsCommand({ Bucket: process.env.BUCKET_NAME!, Key: key, UploadId: uploadId }),
-    );
-    const parts = (listed.Parts ?? []).map((p) => ({
-      partNumber: p.PartNumber,
-      eTag: p.ETag?.replace(/"/g, '') ?? '',
-    }));
-    return json(200, { parts, transferAcceleration: accelerated });
+    try {
+      const listed = await s3For(body).send(
+        new ListPartsCommand({ Bucket: process.env.BUCKET_NAME!, Key: key, UploadId: uploadId }),
+      );
+      const parts = (listed.Parts ?? []).map((p) => ({
+        partNumber: p.PartNumber,
+        eTag: p.ETag?.replace(/"/g, '') ?? '',
+      }));
+      return json(200, { parts, transferAcceleration: accelerated });
+    } catch (err) {
+      if (isNoSuchUpload(err)) {
+        return json(409, { error: 'NoSuchUpload', uploadId, transferAcceleration: accelerated });
+      }
+      throw err;
+    }
   }
 
   if (action === 'presign_manifest') {

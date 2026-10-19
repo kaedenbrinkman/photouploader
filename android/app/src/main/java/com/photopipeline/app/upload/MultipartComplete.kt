@@ -21,6 +21,17 @@ object MultipartComplete {
                 api.completeMultipart(shootId, sha256, key, uploadId, parts, transferAcceleration)
                 return
             } catch (e: ApiRequestException) {
+                if (StaleMultipartRecovery.isStaleMultipartError(e)) {
+                    val head = runCatching {
+                        api.headObject(shootId, key, transferAcceleration)
+                    }.getOrNull()
+                    if (head?.exists == true) {
+                        if (expectedSizeBytes == null || head.contentLength == expectedSizeBytes) {
+                            return
+                        }
+                    }
+                    throw e
+                }
                 val retryable = e.httpCode == 429 ||
                     e.httpCode == 500 ||
                     e.httpCode == 502 ||

@@ -61,10 +61,8 @@ class StreamingCameraUploader(
             "file start name=${file.originalName} key=$key size=${file.sizeBytes} parts=${plans.size}",
         )
         if (parts.isEmpty()) {
-            runCatching {
-                parts = api.listParts(shootId, uploadId!!, key!!, prefs.transferAcceleration)
-                    .map { UploadPart(it.first, it.second) }
-            }
+            parts = api.listParts(shootId, uploadId!!, key!!, prefs.transferAcceleration)
+                .map { UploadPart(it.first, it.second) }
         }
         onProgress(
             0,
@@ -127,6 +125,11 @@ class StreamingCameraUploader(
                     response.use { resp ->
                         if (resp.code == 403 || resp.code == 400) {
                             throw PresignExpiredException("presign expired")
+                        }
+                        if (resp.code == 404) {
+                            throw StaleMultipartUploadException(
+                                "part ${plan.partNumber} HTTP 404 (stale uploadId or object already finalized)",
+                            )
                         }
                         if (!resp.isSuccessful) throw IOException("part ${plan.partNumber} HTTP ${resp.code}")
                         val eTag = resp.header("ETag")?.trim()?.trim('"')

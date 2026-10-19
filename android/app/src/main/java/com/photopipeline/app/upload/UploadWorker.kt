@@ -129,7 +129,15 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             }
             return try {
                 var entity = repo.ensureValidMultipartPlan(shootId, file)
+                if (repo.tryMarkIfAlreadyOnServer(shootId, entity)) {
+                    repo.markFileUploaded(entity.identityKey)
+                    UploadMetricsStore.update {
+                        it.copy(filesDone = it.filesDone + 1, network = network.snapshot())
+                    }
+                    return true
+                }
                 var remultipartRecovery = false
+                var staleRecoveryPasses = 0
                 while (true) {
                     try {
                         if (!entity.localPath.isNullOrBlank() && File(entity.localPath).exists()) {
@@ -139,7 +147,26 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         }
                         break
                     } catch (e: ApiRequestException) {
-                        if (!remultipartRecovery && MultipartUploadRecovery.isRecoverableCompleteError(e)) {
+                        when {
+                            StaleMultipartRecovery.isStaleMultipartFailure(e) && staleRecoveryPasses < 3 -> {
+                                staleRecoveryPasses++
+                                val (outcome, updated) = repo.resolveStaleMultipartUpload(shootId, entity)
+                                when (outcome) {
+                                    StaleMultipartRecovery.Outcome.AlreadyOnServer -> {
+                                        entity = updated
+                                        repo.markFileUploaded(entity.identityKey)
+                                        UploadMetricsStore.update {
+                                            it.copy(filesDone = it.filesDone + 1, network = network.snapshot())
+                                        }
+                                        return true
+                                    }
+                                    StaleMultipartRecovery.Outcome.FreshMultipart -> {
+                                        entity = updated
+                                        continue
+                                    }
+                                }
+                            }
+                            !remultipartRecovery && MultipartUploadRecovery.isRecoverableCompleteError(e) -> {
                             remultipartRecovery = true
                             PipelineLog.w(
                                 "upload",
@@ -148,8 +175,27 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                             )
                             entity = repo.resetMultipartUploadState(entity.identityKey, shootId)
                             continue
+                            }
+                            else -> throw e
                         }
-                        throw e
+                    } catch (e: StaleMultipartUploadException) {
+                        if (staleRecoveryPasses >= 3) throw e
+                        staleRecoveryPasses++
+                        val (outcome, updated) = repo.resolveStaleMultipartUpload(shootId, entity)
+                        when (outcome) {
+                            StaleMultipartRecovery.Outcome.AlreadyOnServer -> {
+                                entity = updated
+                                repo.markFileUploaded(entity.identityKey)
+                                UploadMetricsStore.update {
+                                    it.copy(filesDone = it.filesDone + 1, network = network.snapshot())
+                                }
+                                return true
+                            }
+                            StaleMultipartRecovery.Outcome.FreshMultipart -> {
+                                entity = updated
+                                continue
+                            }
+                        }
                     }
                 }
                 repo.markFileUploaded(file.identityKey)
